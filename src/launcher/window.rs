@@ -78,6 +78,10 @@ impl LauncherWindowHost {
 
         let (x, y, w, h) = app.resolve_initial_or_updated_launcher_rect();
         let dpi = app.launcher_dpi;
+        log_info(
+            "startup",
+            &format!("Launcher bounds resolved: rect=({x}, {y}, {w}, {h}), dpi={dpi}"),
+        );
         let layout = app.compute_layout(dpi);
 
         unsafe {
@@ -179,6 +183,7 @@ impl LauncherWindowHost {
             host.check_startup_recovery_prompt();
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            log_info("startup", "Launcher window created and ready");
             Ok(host)
         }
     }

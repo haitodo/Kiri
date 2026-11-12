@@ -17,7 +17,7 @@
 use crate::config::{TitleRule, TitleRuleType, WindowBinding, WindowMatch};
 use crate::platform::WindowInstance;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 static REGEX_CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
@@ -185,12 +185,24 @@ impl BindingResolver {
         self.runtime_cache.get(binding_id)
     }
 
-    /// Resolve a `WindowBinding` against currently enumerated windows and `target_monitor_id`.
+    /// Resolve a `WindowBinding` against currently enumerated windows and a single `target_monitor_id`.
     pub fn resolve_binding(
         &mut self,
         binding: &WindowBinding,
         all_windows: &[WindowInstance],
         target_monitor_id: &str,
+    ) -> BindingResolution {
+        let empty_claimed = HashSet::new();
+        self.resolve_binding_single_monitor(binding, all_windows, target_monitor_id, &empty_claimed)
+    }
+
+    /// Resolve a `WindowBinding` on a single `target_monitor_id`, excluding any `claimed_hwnds`.
+    pub fn resolve_binding_single_monitor(
+        &mut self,
+        binding: &WindowBinding,
+        all_windows: &[WindowInstance],
+        target_monitor_id: &str,
+        claimed_hwnds: &HashSet<u64>,
     ) -> BindingResolution {
         if !binding.enabled {
             return BindingResolution::NotFound;
@@ -213,10 +225,37 @@ impl BindingResolver {
             }
         }
 
+        // Also check persisted `last_hwnd + last_pid + last_start_time` for live window before rule matching
+        if let Some(ref hint) = binding.instance_hint {
+            if let (Some(h_hwnd), Some(h_pid), Some(h_start)) =
+                (hint.last_hwnd, hint.last_pid, hint.last_start_time)
+            {
+                if let Some(live) = all_windows.iter().find(|w| {
+                    !claimed_hwnds.contains(&w.hwnd)
+                        && w.matches_runtime_identity(h_hwnd, h_pid, h_start)
+                        && (binding.match_rule.exe_path.is_empty()
+                            || exe_paths_equal(&binding.match_rule.exe_path, &w.exe_path))
+                }) {
+                    self.bind_explicit(&binding.id, live);
+                    if live.monitor_id == target_monitor_id {
+                        return BindingResolution::Resolved(live.clone());
+                    } else {
+                        return BindingResolution::MovedToOtherMonitor(live.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(ref req_mon) = binding.match_rule.monitor_id {
+            if req_mon != target_monitor_id {
+                return BindingResolution::NotFound;
+            }
+        }
+
         // Stage 2 (Section 4.2 #2): Match by rule across all candidate windows
         let matching: Vec<&WindowInstance> = all_windows
             .iter()
-            .filter(|w| matches_window_rule(&binding.match_rule, w))
+            .filter(|w| !claimed_hwnds.contains(&w.hwnd) && matches_window_rule(&binding.match_rule, w))
             .collect();
 
         if matching.is_empty() {
@@ -261,6 +300,13 @@ impl BindingResolver {
             }
         }
 
+        // If `match_rule.monitor_id` explicitly pins this binding to `target_monitor_id` and there is 1 match on it
+        if binding.match_rule.monitor_id.as_deref() == Some(target_monitor_id) && on_target.len() == 1 {
+            let chosen = on_target.into_iter().next().unwrap();
+            self.bind_explicit(&binding.id, &chosen);
+            return BindingResolution::Resolved(chosen);
+        }
+
         // Multiple candidates on target monitor -> Never guess! (Section 4.2 #3, AT-10)
         if on_target.len() > 1 {
             return BindingResolution::AmbiguousSameMonitor(on_target);
@@ -278,6 +324,161 @@ impl BindingResolver {
         self.bind_explicit(&binding.id, &target_candidate);
         BindingResolution::Resolved(target_candidate)
     }
+
+    /// Resolve a `WindowBinding` in multi-monitor mode (`MonitorPolicy::AllMonitors`).
+    ///
+    /// - While a registered window remains open, tracks its exact `(hwnd, pid, process_start_time)`.
+    /// - When an app is closed and reopened, re-identifies the window using:
+    ///   1. `exe_path`, `window_class`, `aumid`, and `title_rule` (e.g. tab/site keyword)
+    ///   2. Target monitor placement (`match_rule.monitor_id` or `instance_hint.last_monitor_id`, e.g. left vs right monitor)
+    ///   3. Exclusion of `claimed_hwnds` already resolved by more specific bindings in the same switch pass.
+    pub fn resolve_binding_multi_monitor(
+        &mut self,
+        binding: &WindowBinding,
+        all_windows: &[WindowInstance],
+        connected_monitor_ids: &[String],
+        claimed_hwnds: &HashSet<u64>,
+    ) -> BindingResolution {
+        if !binding.enabled {
+            return BindingResolution::NotFound;
+        }
+
+        // Stage 1a: Re-validate existing cached runtime identity `(hwnd, pid, process_start_time)`
+        if let Some(cached) = self.runtime_cache.get(&binding.id).cloned() {
+            if let Some(live) = all_windows.iter().find(|w| {
+                !claimed_hwnds.contains(&w.hwnd)
+                    && w.matches_runtime_identity(cached.hwnd, cached.pid, cached.process_start_time)
+            }) {
+                return BindingResolution::Resolved(live.clone());
+            } else {
+                self.runtime_cache.remove(&binding.id);
+            }
+        }
+
+        // Stage 1b: Check persisted `(last_hwnd, last_pid, last_start_time)` from registration if window is still alive
+        if let Some(ref hint) = binding.instance_hint {
+            if let (Some(h_hwnd), Some(h_pid), Some(h_start)) =
+                (hint.last_hwnd, hint.last_pid, hint.last_start_time)
+            {
+                if let Some(live) = all_windows.iter().find(|w| {
+                    !claimed_hwnds.contains(&w.hwnd)
+                        && w.matches_runtime_identity(h_hwnd, h_pid, h_start)
+                        && (binding.match_rule.exe_path.is_empty()
+                            || exe_paths_equal(&binding.match_rule.exe_path, &w.exe_path))
+                }) {
+                    self.bind_explicit(&binding.id, live);
+                    return BindingResolution::Resolved(live.clone());
+                }
+            }
+        }
+
+        // Stage 2: App was closed and reopened (or had no HWND hint) -> match by rule & monitor placement
+        let matching: Vec<WindowInstance> = all_windows
+            .iter()
+            .filter(|w| !claimed_hwnds.contains(&w.hwnd) && matches_window_rule(&binding.match_rule, w))
+            .cloned()
+            .collect();
+
+        if matching.is_empty() {
+            return BindingResolution::NotFound;
+        }
+
+        // Determine expected monitor (explicit `match_rule.monitor_id` or fallback `instance_hint.last_monitor_id`)
+        let explicit_mon = binding.match_rule.monitor_id.as_deref();
+        let hint_mon = binding
+            .instance_hint
+            .as_ref()
+            .and_then(|h| h.last_monitor_id.as_deref());
+
+        if let Some(req_mon) = explicit_mon {
+            let on_mon: Vec<WindowInstance> = matching
+                .iter()
+                .filter(|w| w.monitor_id == req_mon)
+                .cloned()
+                .collect();
+
+            if on_mon.len() == 1 {
+                let chosen = on_mon.into_iter().next().unwrap();
+                self.bind_explicit(&binding.id, &chosen);
+                return BindingResolution::Resolved(chosen);
+            }
+            if on_mon.len() > 1 {
+                if let Some(ref hint) = binding.instance_hint {
+                    if let (Some(h_pid), Some(h_start)) = (hint.last_pid, hint.last_start_time) {
+                        let hinted: Vec<&WindowInstance> = on_mon
+                            .iter()
+                            .filter(|w| w.pid == h_pid && w.process_start_time == h_start)
+                            .collect();
+                        if hinted.len() == 1 {
+                            let chosen = hinted[0].clone();
+                            self.bind_explicit(&binding.id, &chosen);
+                            return BindingResolution::Resolved(chosen);
+                        }
+                    }
+                }
+                return BindingResolution::AmbiguousSameMonitor(on_mon);
+            }
+
+            // `on_mon` is empty: if `req_mon` is currently connected, do not steal a window from another monitor.
+            // Only fallback if `req_mon` itself is disconnected and there's a single unambiguous match.
+            let mon_is_connected = connected_monitor_ids.iter().any(|m| m == req_mon);
+            if mon_is_connected {
+                return BindingResolution::NotFound;
+            }
+        } else if let Some(h_mon) = hint_mon {
+            let on_mon: Vec<WindowInstance> = matching
+                .iter()
+                .filter(|w| w.monitor_id == h_mon)
+                .cloned()
+                .collect();
+            if on_mon.len() == 1 {
+                let chosen = on_mon.into_iter().next().unwrap();
+                self.bind_explicit(&binding.id, &chosen);
+                return BindingResolution::Resolved(chosen);
+            }
+            if on_mon.len() > 1 {
+                return BindingResolution::AmbiguousSameMonitor(on_mon);
+            }
+        }
+
+        // Monitor-agnostic or disconnected monitor fallback
+        if matching.len() == 1 {
+            let chosen = matching.into_iter().next().unwrap();
+            self.bind_explicit(&binding.id, &chosen);
+            return BindingResolution::Resolved(chosen);
+        }
+
+        BindingResolution::AmbiguousSameMonitor(matching)
+    }
+}
+
+/// Extract a clean leading keyword (e.g. tab/site name or project name) from a window title
+/// to help distinguish multiple windows of the same executable (such as Microsoft Edge) after restart.
+pub fn extract_smart_title_keyword(title: &str) -> Option<String> {
+    let cleaned = title.replace('\u{200b}', "");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Split on common browser/editor separators (` - ` or ` — `) and take the leading page/document segment
+    let first_seg = trimmed
+        .split(" - ")
+        .next()
+        .and_then(|s| s.split(" — ").next())
+        .map(|s| s.trim())
+        .unwrap_or(trimmed);
+
+    if first_seg.is_empty() {
+        return None;
+    }
+
+    // Avoid pure account numbers (4+ digits only)
+    if first_seg.chars().all(|c| c.is_ascii_digit()) && first_seg.len() >= 4 {
+        return None;
+    }
+
+    Some(first_seg.to_string())
 }
 
 /// Evaluate safety warnings when a user selects `win` for registration in the Settings UI (Section 2.4).

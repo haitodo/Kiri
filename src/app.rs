@@ -206,24 +206,41 @@ impl AppController {
             log_warn("layout", "Cannot save layout when scene state is Unknown");
             return false;
         };
-        let launcher_mon = if self.launcher_monitor_id.is_empty() {
-            None
-        } else {
-            Some(self.launcher_monitor_id.as_str())
-        };
-        let Some(target_mon) = resolve_effective_target_monitor_id(&self.config, launcher_mon)
-        else {
-            return false;
-        };
 
-        if let Some(snapshot) = capture_scene_layout(
-            &scene_id,
-            &target_mon,
-            &self.config,
-            &mut self.resolver,
-            &*self.sys,
-        ) {
-            save_layout_into_config(&mut self.config, snapshot);
+        let target_monitors: Vec<String> =
+            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
+                self.sys
+                    .monitors()
+                    .into_iter()
+                    .map(|m| m.monitor_id)
+                    .collect()
+            } else {
+                let launcher_mon = if self.launcher_monitor_id.is_empty() {
+                    None
+                } else {
+                    Some(self.launcher_monitor_id.as_str())
+                };
+                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
+                    Some(mon) => vec![mon],
+                    None => return false,
+                }
+            };
+
+        let mut any_saved = false;
+        for target_mon in target_monitors {
+            if let Some(snapshot) = capture_scene_layout(
+                &scene_id,
+                &target_mon,
+                &self.config,
+                &mut self.resolver,
+                &*self.sys,
+            ) {
+                save_layout_into_config(&mut self.config, snapshot);
+                any_saved = true;
+            }
+        }
+
+        if any_saved {
             let _ = self.config_mgr.save(&self.config);
             log_info(
                 "layout",
@@ -240,23 +257,37 @@ impl AppController {
         let Some(scene_id) = self.state_mgr.active_scene_id().map(|s| s.to_string()) else {
             return 0;
         };
-        let launcher_mon = if self.launcher_monitor_id.is_empty() {
-            None
-        } else {
-            Some(self.launcher_monitor_id.as_str())
-        };
-        let Some(target_mon) = resolve_effective_target_monitor_id(&self.config, launcher_mon)
-        else {
-            return 0;
-        };
 
-        apply_saved_scene_layout(
-            &scene_id,
-            &target_mon,
-            &self.config,
-            &mut self.resolver,
-            &mut *self.sys,
-        )
+        let target_monitors: Vec<String> =
+            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
+                self.sys
+                    .monitors()
+                    .into_iter()
+                    .map(|m| m.monitor_id)
+                    .collect()
+            } else {
+                let launcher_mon = if self.launcher_monitor_id.is_empty() {
+                    None
+                } else {
+                    Some(self.launcher_monitor_id.as_str())
+                };
+                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
+                    Some(mon) => vec![mon],
+                    None => return 0,
+                }
+            };
+
+        let mut total = 0;
+        for target_mon in target_monitors {
+            total += apply_saved_scene_layout(
+                &scene_id,
+                &target_mon,
+                &self.config,
+                &mut self.resolver,
+                &mut *self.sys,
+            );
+        }
+        total
     }
 
     /// Returns true if the currently active scene is in the `⋯` overflow list (Section 2.3).

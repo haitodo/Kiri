@@ -96,10 +96,36 @@ pub fn resolve_effective_target_monitor_id(
     launcher_monitor_id: Option<&str>,
 ) -> Option<String> {
     match config.target.monitor_policy {
+        crate::config::MonitorPolicy::AllMonitors => launcher_monitor_id
+            .map(|s| s.to_string())
+            .or_else(|| config.target.monitor_id.clone())
+            .or_else(|| Some("ALL_MONITORS".to_string())),
         crate::config::MonitorPolicy::Fixed => config.target.monitor_id.clone(),
         crate::config::MonitorPolicy::LauncherMonitor => launcher_monitor_id
             .map(|s| s.to_string())
             .or_else(|| config.target.monitor_id.clone()),
+    }
+}
+
+/// Rank a binding by specificity so that specific rules (cached HWND, title keyword, monitor ID)
+/// are resolved before catch-all (`TitleRuleType::Any`) bindings of the same executable.
+fn binding_specificity_rank(binding: &crate::config::WindowBinding, resolver: &BindingResolver) -> u8 {
+    let has_cached = resolver.cached_identity(&binding.id).is_some();
+    let has_hwnd_hint = binding
+        .instance_hint
+        .as_ref()
+        .and_then(|h| h.last_hwnd)
+        .is_some();
+    let has_specific_title =
+        binding.match_rule.title_rule.rule_type != crate::config::TitleRuleType::Any;
+    let has_monitor = binding.match_rule.monitor_id.is_some();
+
+    match (has_cached || has_hwnd_hint, has_specific_title, has_monitor) {
+        (true, _, _) => 0,
+        (false, true, true) => 1,
+        (false, true, false) => 2,
+        (false, false, true) => 3,
+        (false, false, false) => 4,
     }
 }
 
@@ -130,68 +156,107 @@ pub fn execute_scene_switch(
         };
     }
 
-    // Step 1: If `state == Active(next)`, do nothing (idempotent, AT-03).
-    // Note: When `state == Unknown`, never treat as a no-op (FR-19, AT-21).
-    if state_mgr.is_already_active(next_scene_id) {
-        return SwitchOutcome {
-            was_noop_same_scene: true,
-            switched: false,
-            minimized_hwnds: Vec::new(),
-            restored_hwnds: Vec::new(),
-            warnings,
-            verification: None,
-        };
-    }
-
-    let Some(target_mon_id) = resolve_effective_target_monitor_id(config, launcher_monitor_id) else {
-        warnings.push(SwitchWarning::TargetMonitorNotConfigured);
-        return SwitchOutcome {
-            was_noop_same_scene: false,
-            switched: false,
-            minimized_hwnds: Vec::new(),
-            restored_hwnds: Vec::new(),
-            warnings,
-            verification: None,
-        };
-    };
+    let already_active = state_mgr.is_already_active(next_scene_id);
+    let is_all_monitors =
+        config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors;
 
     let monitors = sys.monitors();
-    if !monitors.iter().any(|m| m.monitor_id == target_mon_id) {
-        warnings.push(SwitchWarning::TargetMonitorDisconnected {
-            monitor_id: target_mon_id,
-        });
-        return SwitchOutcome {
-            was_noop_same_scene: false,
-            switched: false,
-            minimized_hwnds: Vec::new(),
-            restored_hwnds: Vec::new(),
-            warnings,
-            verification: None,
-        };
-    }
+    let connected_monitor_ids: Vec<String> =
+        monitors.iter().map(|m| m.monitor_id.clone()).collect();
 
-    // Step 2: Enumerate and re-validate registered windows on `target_monitor`
+    let target_mon_id = if is_all_monitors {
+        "ALL_MONITORS".to_string()
+    } else {
+        let Some(mon_id) = resolve_effective_target_monitor_id(config, launcher_monitor_id) else {
+            if already_active {
+                return SwitchOutcome {
+                    was_noop_same_scene: true,
+                    switched: false,
+                    minimized_hwnds: Vec::new(),
+                    restored_hwnds: Vec::new(),
+                    warnings,
+                    verification: None,
+                };
+            }
+            warnings.push(SwitchWarning::TargetMonitorNotConfigured);
+            return SwitchOutcome {
+                was_noop_same_scene: false,
+                switched: false,
+                minimized_hwnds: Vec::new(),
+                restored_hwnds: Vec::new(),
+                warnings,
+                verification: None,
+            };
+        };
+
+        if !monitors.iter().any(|m| m.monitor_id == mon_id) {
+            if already_active {
+                return SwitchOutcome {
+                    was_noop_same_scene: true,
+                    switched: false,
+                    minimized_hwnds: Vec::new(),
+                    restored_hwnds: Vec::new(),
+                    warnings,
+                    verification: None,
+                };
+            }
+            warnings.push(SwitchWarning::TargetMonitorDisconnected {
+                monitor_id: mon_id,
+            });
+            return SwitchOutcome {
+                was_noop_same_scene: false,
+                switched: false,
+                minimized_hwnds: Vec::new(),
+                restored_hwnds: Vec::new(),
+                warnings,
+                verification: None,
+            };
+        }
+        mon_id
+    };
+
+    // Step 2: Enumerate and re-validate registered windows
     let all_windows = sys.enumerate_windows();
 
     // First, determine which HWNDs are protected in `next_scene_id` (either belonging to `next` or `always_visible`).
     // This guarantees common windows shared across scenes are never minimized (FR-07, AT-07).
     let mut protected_hwnds_in_next: HashSet<u64> = HashSet::new();
     let mut resolved_bindings: Vec<(String, WindowInstance, bool, bool)> = Vec::new(); // (binding_id, win, in_next, always_visible)
+    let mut claimed_hwnds: HashSet<u64> = HashSet::new();
 
-    for binding in &config.bindings {
-        if !binding.enabled {
-            continue;
-        }
+    // Resolve bindings in order of specificity so keyword/monitor-pinned bindings claim their windows first
+    let mut ordered_bindings: Vec<&crate::config::WindowBinding> =
+        config.bindings.iter().filter(|b| b.enabled).collect();
+    ordered_bindings.sort_by_key(|b| binding_specificity_rank(b, resolver));
+
+    for binding in ordered_bindings {
         let in_next = binding.scene_ids.iter().any(|id| id == next_scene_id);
-        match resolver.resolve_binding(binding, &all_windows, &target_mon_id) {
+        let resolution = if is_all_monitors {
+            resolver.resolve_binding_multi_monitor(
+                binding,
+                &all_windows,
+                &connected_monitor_ids,
+                &claimed_hwnds,
+            )
+        } else {
+            resolver.resolve_binding_single_monitor(
+                binding,
+                &all_windows,
+                &target_mon_id,
+                &claimed_hwnds,
+            )
+        };
+
+        match resolution {
             BindingResolution::Resolved(win) => {
+                claimed_hwnds.insert(win.hwnd);
                 if in_next || binding.always_visible {
                     protected_hwnds_in_next.insert(win.hwnd);
                 }
                 resolved_bindings.push((binding.id.clone(), win, in_next, binding.always_visible));
             }
             BindingResolution::MovedToOtherMonitor(_win) => {
-                // User manually moved window to another monitor; do not touch it (Section 8.2)
+                // User manually moved window to another monitor in single-monitor mode; do not touch it (Section 8.2)
             }
             BindingResolution::AmbiguousSameMonitor(candidates) => {
                 warnings.push(SwitchWarning::AmbiguousBindingSameMonitor {
@@ -211,7 +276,7 @@ pub fn execute_scene_switch(
         }
     }
 
-    // Step 3 & Step 5: Compute `to_minimize` = visible, non-iconic registered windows on `target_monitor`
+    // Step 3 & Step 5: Compute `to_minimize` = visible, non-iconic registered windows on target monitor(s)
     // minus `next` scene windows minus `always_visible`, filtering out modal disabled windows (FR-17) and elevated windows.
     let mut to_minimize: Vec<(String, WindowInstance)> = Vec::new();
     let mut seen_minimize_hwnds: HashSet<u64> = HashSet::new();
@@ -220,7 +285,12 @@ pub fn execute_scene_switch(
         if *in_next || *always_visible || protected_hwnds_in_next.contains(&win.hwnd) {
             continue;
         }
-        if win.monitor_id != target_mon_id || !win.is_visible || win.is_iconic {
+        let on_valid_monitor = if is_all_monitors {
+            connected_monitor_ids.iter().any(|m| m == &win.monitor_id)
+        } else {
+            win.monitor_id == target_mon_id
+        };
+        if !on_valid_monitor || !win.is_visible || win.is_iconic {
             continue;
         }
         if !seen_minimize_hwnds.insert(win.hwnd) {
@@ -270,11 +340,43 @@ pub fn execute_scene_switch(
         to_minimize.push((binding_id.clone(), win.clone()));
     }
 
-    // Step 4: Compute `to_restore` = windows belonging to `next` (not `always_visible`) whose
-    // `ManagedAction` is `MinimizedByUs` (or `Pending`), recorded on `target_monitor`, and currently `IsIconic`.
+    // Step 4: Compute `to_restore` = windows belonging to `next` (not `always_visible`)
+    // that are currently `IsIconic`.
     let mut to_restore: Vec<(String, WindowInstance, usize)> = Vec::new();
     let mut seen_restore_hwnds: HashSet<u64> = HashSet::new();
 
+    if config.launcher.restore_all_on_switch {
+        // Mode A (Default): Restore ALL windows registered to `next` that are currently iconic,
+        // regardless of whether they were minimized by Kiri or manually by the user.
+        for (binding_id, win, in_next, always_visible) in &resolved_bindings {
+            if !*in_next || *always_visible {
+                continue;
+            }
+            let on_valid_monitor = if is_all_monitors {
+                connected_monitor_ids.iter().any(|m| m == &win.monitor_id)
+            } else {
+                win.monitor_id == target_mon_id
+            };
+            if on_valid_monitor && win.is_iconic {
+                if seen_restore_hwnds.insert(win.hwnd) {
+                    if win.is_hung {
+                        warnings.push(SwitchWarning::HungWindowDetected {
+                            binding_id: binding_id.clone(),
+                            hwnd: win.hwnd,
+                        });
+                    }
+                    let z = recovery
+                        .actions()
+                        .get(&win.hwnd)
+                        .map(|a| a.z_order_at_minimize)
+                        .unwrap_or(win.z_order);
+                    to_restore.push((binding_id.clone(), win.clone(), z));
+                }
+            }
+        }
+    }
+
+    // Also include any recovery actions recorded on target monitor(s) that are still iconic
     for binding in &config.bindings {
         if !binding.enabled || binding.always_visible {
             continue;
@@ -289,8 +391,8 @@ pub fn execute_scene_switch(
             .values()
             .filter(|a| {
                 a.binding_id == binding.id
-                    && a.is_restorable_by_scene_switch()
-                    && a.monitor_id == target_mon_id
+                    && (config.launcher.restore_all_on_switch || a.is_restorable_by_scene_switch())
+                    && (is_all_monitors || a.monitor_id == target_mon_id)
             })
             .cloned()
             .collect();
@@ -300,12 +402,17 @@ pub fn execute_scene_switch(
                 continue;
             }
             if let Some(live) = sys.query_window(action.hwnd) {
+                let on_valid_monitor = if is_all_monitors {
+                    connected_monitor_ids.iter().any(|m| m == &live.monitor_id)
+                } else {
+                    live.monitor_id == target_mon_id
+                };
                 // Verify runtime identity `(hwnd, pid, process_start_time)`, monitor attribution, and `is_iconic`
                 if live.matches_runtime_identity(
                     action.hwnd,
                     action.pid,
                     action.process_start_time,
-                ) && live.monitor_id == target_mon_id
+                ) && on_valid_monitor
                     && live.is_iconic
                 {
                     if live.is_hung {
@@ -324,6 +431,19 @@ pub fn execute_scene_switch(
                 }
             }
         }
+    }
+
+    // Step 1 idempotency check (AT-03): If `state == Active(next)` and no newly reopened windows need
+    // minimizing/restoring, return a clean no-op without issuing any OS commands.
+    if already_active && to_minimize.is_empty() && to_restore.is_empty() {
+        return SwitchOutcome {
+            was_noop_same_scene: true,
+            switched: false,
+            minimized_hwnds: Vec::new(),
+            restored_hwnds: Vec::new(),
+            warnings: Vec::new(),
+            verification: None,
+        };
     }
 
     // Sort `to_restore` by recorded Z-order descending (bottom-most window restored first, Section 5.3)

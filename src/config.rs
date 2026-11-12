@@ -54,6 +54,10 @@ pub struct LauncherConfig {
     pub snap_to_edges: bool,
     #[serde(default)]
     pub focus_on_switch: bool,
+    /// When switching to a scene, restore ALL registered windows that are currently iconic,
+    /// regardless of whether they were minimized by Kiri or manually by the user.
+    #[serde(default = "default_true")]
+    pub restore_all_on_switch: bool,
     #[serde(default)]
     pub position: Option<SavedPosition>,
 }
@@ -81,6 +85,7 @@ impl Default for LauncherConfig {
             always_on_top: true,
             snap_to_edges: false,
             focus_on_switch: false,
+            restore_all_on_switch: true,
             position: None,
         }
     }
@@ -89,13 +94,14 @@ impl Default for LauncherConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MonitorPolicy {
+    AllMonitors,
     Fixed,
     LauncherMonitor,
 }
 
 impl Default for MonitorPolicy {
     fn default() -> Self {
-        MonitorPolicy::Fixed
+        MonitorPolicy::AllMonitors
     }
 }
 
@@ -110,7 +116,7 @@ pub struct TargetConfig {
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
-            monitor_policy: MonitorPolicy::Fixed,
+            monitor_policy: MonitorPolicy::AllMonitors,
             monitor_id: None,
         }
     }
@@ -180,14 +186,22 @@ pub struct WindowMatch {
     pub title_rule: TitleRule,
     #[serde(default)]
     pub aumid: Option<String>,
+    /// Optional monitor placement rule (e.g. left vs right monitor).
+    /// When set, re-matching after process restart matches windows on this monitor.
+    #[serde(default)]
+    pub monitor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InstanceHint {
     #[serde(default)]
+    pub last_hwnd: Option<u64>,
+    #[serde(default)]
     pub last_pid: Option<u32>,
     #[serde(default)]
     pub last_start_time: Option<u64>,
+    #[serde(default)]
+    pub last_monitor_id: Option<String>,
     #[serde(default)]
     pub disambiguator: Option<String>,
 }
@@ -339,6 +353,7 @@ impl AppConfig {
                     window_class: "ExampleClass".to_string(),
                     title_rule: TitleRule::contains("MetaTrader 5"),
                     aumid: None,
+                    monitor_id: None,
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string()],
@@ -467,6 +482,12 @@ impl ConfigManager {
                 if cfg.schema_version < CURRENT_SCHEMA_VERSION {
                     self.preserve_pre_migration_copy(cfg.schema_version);
                     cfg.schema_version = CURRENT_SCHEMA_VERSION;
+                }
+                if cfg.target.monitor_policy == MonitorPolicy::Fixed
+                    && cfg.target.monitor_id.is_none()
+                    && !cfg.bindings.iter().any(|b| b.enabled)
+                {
+                    cfg.target.monitor_policy = MonitorPolicy::AllMonitors;
                 }
                 self.last_status = ConfigLoadStatus::LoadedNormally;
                 cfg

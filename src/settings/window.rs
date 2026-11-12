@@ -45,6 +45,9 @@ const IDC_WIN_UNBIND: usize = 304;
 const IDC_WIN_ALWAYS_VISIBLE: usize = 305;
 const IDC_WIN_REFRESH: usize = 306;
 const IDC_WIN_DETAILS: usize = 307;
+const IDC_WIN_TITLE_KEYWORD: usize = 308;
+const IDC_WIN_MATCH_MONITOR: usize = 309;
+const IDC_WIN_UNBIND_SCENE: usize = 310;
 
 // Tab 2 (Launcher)
 const IDC_LCH_ORIENT_COMBO: usize = 401;
@@ -62,6 +65,7 @@ const IDC_BEH_AUTOSTART: usize = 502;
 const IDC_BEH_VERBOSE_TITLE: usize = 503;
 const IDC_BEH_RESTORE_ALL: usize = 504;
 const IDC_BEH_OPEN_FOLDER: usize = 505;
+const IDC_BEH_RESTORE_ALL_ON_SWITCH: usize = 506;
 
 #[cfg(windows)]
 pub struct SettingsWindow {
@@ -304,15 +308,17 @@ impl SettingsWindow {
 
         // ===================== Tab 1: Windows =====================
         let mut t1 = Vec::new();
-        t1.push(create_ctrl(w!("STATIC"), w!("開いているトップレベルウィンドウ一覧:"), 0, 25, 45, 300, 20, 0));
+        t1.push(create_ctrl(w!("STATIC"), w!("開いているトップレベルウィンドウ一覧 (左右モニター対応):"), 0, 25, 44, 420, 20, 0));
+        t1.push(create_ctrl(w!("BUTTON"), w!("一覧更新"), BS_PUSHBUTTON as u32, 645, 38, 90, 26, IDC_WIN_REFRESH));
+
         let win_list = create_ctrl(
             w!("LISTBOX"),
             w!(""),
             WS_BORDER.0 | WS_VSCROLL.0 | (LBS_NOTIFY as u32),
             25,
-            70,
+            68,
             710,
-            220,
+            190,
             IDC_WIN_LIST,
         );
         t1.push(win_list);
@@ -322,27 +328,58 @@ impl SettingsWindow {
             w!(""),
             WS_BORDER.0 | (ES_MULTILINE as u32) | (ES_READONLY as u32) | WS_VSCROLL.0,
             25,
-            300,
+            265,
             710,
-            90,
+            88,
             IDC_WIN_DETAILS,
         ));
 
-        t1.push(create_ctrl(w!("STATIC"), w!("登録先シーン:"), 0, 25, 405, 90, 20, 0));
-        t1.push(create_ctrl(w!("COMBOBOX"), w!(""), CBS_DROPDOWNLIST as u32, 115, 402, 160, 200, IDC_WIN_SCENE_COMBO));
+        t1.push(create_ctrl(
+            w!("STATIC"),
+            w!("再起動時の識別キーワード (空欄=タイトル不問):"),
+            0,
+            25,
+            364,
+            255,
+            20,
+            0,
+        ));
+        t1.push(create_ctrl(
+            w!("EDIT"),
+            w!(""),
+            WS_BORDER.0 | (ES_AUTOHSCROLL as u32),
+            282,
+            360,
+            215,
+            24,
+            IDC_WIN_TITLE_KEYWORD,
+        ));
         t1.push(create_ctrl(
             w!("BUTTON"),
-            w!("常時表示 (always_visible)"),
+            w!("配置モニター(左/右)で識別する"),
             BS_AUTOCHECKBOX as u32,
-            290,
+            510,
+            360,
+            225,
+            24,
+            IDC_WIN_MATCH_MONITOR,
+        ));
+
+        t1.push(create_ctrl(w!("STATIC"), w!("対象シーン:"), 0, 25, 405, 78, 20, 0));
+        t1.push(create_ctrl(w!("COMBOBOX"), w!(""), CBS_DROPDOWNLIST as u32, 105, 402, 150, 200, IDC_WIN_SCENE_COMBO));
+        t1.push(create_ctrl(
+            w!("BUTTON"),
+            w!("常時表示"),
+            BS_AUTOCHECKBOX as u32,
+            265,
             404,
-            190,
+            90,
             24,
             IDC_WIN_ALWAYS_VISIBLE,
         ));
-        t1.push(create_ctrl(w!("BUTTON"), w!("シーンに登録"), BS_PUSHBUTTON as u32, 490, 400, 110, 28, IDC_WIN_BIND));
-        t1.push(create_ctrl(w!("BUTTON"), w!("登録解除"), BS_PUSHBUTTON as u32, 610, 400, 90, 28, IDC_WIN_UNBIND));
-        t1.push(create_ctrl(w!("BUTTON"), w!("一覧更新"), BS_PUSHBUTTON as u32, 25, 435, 90, 28, IDC_WIN_REFRESH));
+        t1.push(create_ctrl(w!("BUTTON"), w!("シーンに追加/更新"), BS_PUSHBUTTON as u32, 360, 400, 130, 28, IDC_WIN_BIND));
+        t1.push(create_ctrl(w!("BUTTON"), w!("選択シーンから解除"), BS_PUSHBUTTON as u32, 498, 400, 135, 28, IDC_WIN_UNBIND_SCENE));
+        t1.push(create_ctrl(w!("BUTTON"), w!("全解除"), BS_PUSHBUTTON as u32, 640, 400, 95, 28, IDC_WIN_UNBIND));
         self.tab_controls[1] = t1;
 
         // ===================== Tab 2: Launcher =====================
@@ -408,10 +445,21 @@ impl SettingsWindow {
 
         t3.push(create_ctrl(
             w!("BUTTON"),
+            w!("シーン切替時に登録アプリを確実にすべて表示する (手動最小化されたアプリも復元)"),
+            BS_AUTOCHECKBOX as u32,
+            30,
+            105,
+            550,
+            24,
+            IDC_BEH_RESTORE_ALL_ON_SWITCH,
+        ));
+
+        t3.push(create_ctrl(
+            w!("BUTTON"),
             w!("Windows ログオン時に自動起動する (HKCU\\Run)"),
             BS_AUTOCHECKBOX as u32,
             30,
-            110,
+            140,
             380,
             24,
             IDC_BEH_AUTOSTART,
@@ -422,7 +470,7 @@ impl SettingsWindow {
             w!("ログにウィンドウタイトル全文を記録する (口座番号等のマスクを解除)"),
             BS_AUTOCHECKBOX as u32,
             30,
-            145,
+            175,
             480,
             24,
             IDC_BEH_VERBOSE_TITLE,
@@ -433,7 +481,7 @@ impl SettingsWindow {
             w!("Kiri が最小化した全ウィンドウを復元"),
             BS_PUSHBUTTON as u32,
             30,
-            200,
+            225,
             280,
             32,
             IDC_BEH_RESTORE_ALL,
@@ -444,7 +492,7 @@ impl SettingsWindow {
             w!("設定保存先フォルダを開く"),
             BS_PUSHBUTTON as u32,
             30,
-            245,
+            270,
             180,
             30,
             IDC_BEH_OPEN_FOLDER,
@@ -501,26 +549,50 @@ impl SettingsWindow {
                 } else {
                     row.bound_scene_ids.join(",")
                 };
+                let mon_label = self.vm.format_monitor_short_label(&row.instance.monitor_id);
+                let exe_name = std::path::Path::new(&row.instance.exe_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&row.instance.exe_path);
                 let text = format!(
                     "[{}] [シーン: {}] {} ({}){}",
-                    row.instance.pid, bound_str, row.instance.title, row.instance.exe_path, warn_tag
+                    mon_label, bound_str, row.instance.title, exe_name, warn_tag
                 );
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SendMessageW(h_win_list, LB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
             }
             if !self.vm.candidate_windows.is_empty() {
-                let _ = SendMessageW(h_win_list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-                self.selected_window_idx = Some(0);
-                self.load_selected_window_details(0);
+                let target_idx = self
+                    .selected_window_idx
+                    .unwrap_or(0)
+                    .min(self.vm.candidate_windows.len().saturating_sub(1));
+                let _ = SendMessageW(h_win_list, LB_SETCURSEL, WPARAM(target_idx), LPARAM(0));
+                self.selected_window_idx = Some(target_idx);
+                self.load_selected_window_details(target_idx);
             }
 
             let h_combo = dlg_item(self.hwnd, IDC_WIN_SCENE_COMBO);
+            let prev_scene_sel = SendMessageW(
+                h_combo,
+                windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .0;
             let _ = SendMessageW(h_combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
             for scene in &self.vm.config_draft.scenes {
-                let wide: Vec<u16> = scene.name.encode_utf16().chain(std::iter::once(0)).collect();
+                let label = format!("{} [{}]", scene.name, scene.id);
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SendMessageW(h_combo, CB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
             }
-            let _ = SendMessageW(h_combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            let next_scene_sel = if prev_scene_sel >= 0
+                && (prev_scene_sel as usize) < self.vm.config_draft.scenes.len()
+            {
+                prev_scene_sel as usize
+            } else {
+                0
+            };
+            let _ = SendMessageW(h_combo, CB_SETCURSEL, WPARAM(next_scene_sel), LPARAM(0));
 
             // Tab 2: Launcher options
             let h_orient = dlg_item(self.hwnd, IDC_LCH_ORIENT_COMBO);
@@ -556,23 +628,34 @@ impl SettingsWindow {
             // Tab 3: Behavior
             let h_mon_combo = dlg_item(self.hwnd, IDC_BEH_MONITOR_COMBO);
             let _ = SendMessageW(h_mon_combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            let mut cur_mon_sel = 0;
+
+            let s_all: Vec<u16> = "すべてのモニター (左右/全画面の登録ウィンドウを切替)"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let _ = SendMessageW(h_mon_combo, CB_ADDSTRING, WPARAM(0), LPARAM(s_all.as_ptr() as isize));
+
+            let mut cur_mon_sel = 0; // Index 0 = AllMonitors
             for (idx, mon) in self.vm.monitors.iter().enumerate() {
                 let prim = if mon.is_primary { " (プライマリ)" } else { "" };
-                let txt = format!("{}: {}{}", mon.monitor_id, mon.friendly_name, prim);
+                let pos_label = self.vm.format_monitor_short_label(&mon.monitor_id);
+                let txt = format!("単一固定 [{}]: {} ({}){}", pos_label, mon.friendly_name, mon.monitor_id, prim);
                 let w_txt: Vec<u16> = txt.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SendMessageW(h_mon_combo, CB_ADDSTRING, WPARAM(0), LPARAM(w_txt.as_ptr() as isize));
-                if self.vm.config_draft.target.monitor_id.as_deref() == Some(&mon.monitor_id) {
-                    cur_mon_sel = idx;
+                if self.vm.config_draft.target.monitor_policy == MonitorPolicy::Fixed
+                    && self.vm.config_draft.target.monitor_id.as_deref() == Some(&mon.monitor_id)
+                {
+                    cur_mon_sel = idx + 1;
                 }
             }
             let s_follow: Vec<u16> = "ランチャー所在モニターに自動追従".encode_utf16().chain(std::iter::once(0)).collect();
             let _ = SendMessageW(h_mon_combo, CB_ADDSTRING, WPARAM(0), LPARAM(s_follow.as_ptr() as isize));
             if self.vm.config_draft.target.monitor_policy == MonitorPolicy::LauncherMonitor {
-                cur_mon_sel = self.vm.monitors.len();
+                cur_mon_sel = self.vm.monitors.len() + 1;
             }
             let _ = SendMessageW(h_mon_combo, CB_SETCURSEL, WPARAM(cur_mon_sel), LPARAM(0));
 
+            set_chk(IDC_BEH_RESTORE_ALL_ON_SWITCH, self.vm.config_draft.launcher.restore_all_on_switch);
             set_chk(IDC_BEH_AUTOSTART, self.vm.autostart_enabled);
             set_chk(IDC_BEH_VERBOSE_TITLE, crate::diagnostics::is_verbose_title_logging());
         }
@@ -607,40 +690,99 @@ impl SettingsWindow {
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetWindowTextW, BM_SETCHECK};
 
         if let Some(row) = self.vm.candidate_windows.get(idx) {
+            let mon_label = self.vm.format_monitor_short_label(&row.instance.monitor_id);
+
+            let existing_binding = row.existing_binding_id.as_ref().and_then(|bid| {
+                self.vm
+                    .config_draft
+                    .bindings
+                    .iter()
+                    .find(|b| &b.id == bid)
+            });
+
+            let (kw_text, match_mon_checked, rule_summary) = if let Some(b) = existing_binding {
+                let kw = b
+                    .match_rule
+                    .title_rule
+                    .value
+                    .clone()
+                    .unwrap_or_default();
+                let pin_mon = b.match_rule.monitor_id.is_some();
+                let mon_desc = match &b.match_rule.monitor_id {
+                    Some(m) => format!("{} ({})", self.vm.format_monitor_short_label(m), m),
+                    None => "モニター不問 (全画面)".to_string(),
+                };
+                let title_desc = if kw.is_empty() {
+                    "タイトル不問 (Any)".to_string()
+                } else {
+                    format!("{:?} (\"{}\")", b.match_rule.title_rule.rule_type, kw)
+                };
+                (
+                    kw,
+                    pin_mon,
+                    format!("再起動時の識別条件: [モニター: {}] / [タイトル: {}]", mon_desc, title_desc),
+                )
+            } else {
+                let suggested = self
+                    .vm
+                    .suggest_default_title_keyword(&row.instance)
+                    .unwrap_or_default();
+                (
+                    suggested,
+                    true,
+                    "未登録 (下の[シーンに追加/更新]で登録できます)".to_string(),
+                )
+            };
+
             let mut details = format!(
-                "PID: {}\r\nEXEパス: {}\r\nクラス名: {}\r\n所在モニター: {}\r\n状態: {} / {}\r\n",
+                "HWND: 0x{:X} / PID: {} / 所在: {} ({})\r\nEXE: {} (Class: {})\r\n所属シーン: {} / {}\r\n",
+                row.instance.hwnd,
                 row.instance.pid,
+                mon_label,
+                row.instance.monitor_id,
                 row.instance.exe_path,
                 row.instance.window_class,
-                row.instance.monitor_id,
-                if row.instance.is_visible { "可視" } else { "非表示" },
-                if row.instance.is_iconic { "最小化中" } else { "通常表示" }
+                if row.bound_scene_ids.is_empty() {
+                    "なし".to_string()
+                } else {
+                    row.bound_scene_ids.join(", ")
+                },
+                rule_summary
             );
 
             if !row.warnings.is_empty() {
-                details.push_str("\r\n【登録に関する警告】\r\n");
+                details.push_str("【注意】");
                 for w in &row.warnings {
                     match w {
                         crate::scenes::bindings::RegistrationWarning::NoTaskbarButton => {
-                            details.push_str("・⚠️ タスクバーボタンがありません (最小化後の手動復旧経路が制限されます)\r\n");
+                            details.push_str(" ⚠️タスクバーボタンなし ");
                         }
                         crate::scenes::bindings::RegistrationWarning::ElevatedProcess => {
-                            details.push_str("・⚠️ 管理者権限プロセスです (UIPI制限により操作できない場合があります)\r\n");
+                            details.push_str(" ⚠️管理者権限プロセス ");
                         }
                         crate::scenes::bindings::RegistrationWarning::OutsideTargetMonitor { window_monitor } => {
-                            details.push_str(&format!("・⚠️ 制御対象外モニター ({}) に配置されています\r\n", window_monitor));
+                            details.push_str(&format!(" ⚠️対象外モニター({}) ", window_monitor));
                         }
                         crate::scenes::bindings::RegistrationWarning::TitleMayContainSensitiveOrDynamicText => {
-                            details.push_str("・⚠️ タイトルに動的情報（口座番号・銘柄等）が含まれている可能性があります\r\n");
+                            details.push_str(" ℹ️動的タイトル ");
                         }
                     }
                 }
+                details.push_str("\r\n");
             }
 
             unsafe {
                 let h_det = dlg_item(self.hwnd, IDC_WIN_DETAILS);
                 let w: Vec<u16> = details.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(h_det, PCWSTR(w.as_ptr()));
+
+                let h_kw = dlg_item(self.hwnd, IDC_WIN_TITLE_KEYWORD);
+                let w_kw: Vec<u16> = kw_text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = SetWindowTextW(h_kw, PCWSTR(w_kw.as_ptr()));
+
+                let h_mon_chk = dlg_item(self.hwnd, IDC_WIN_MATCH_MONITOR);
+                let st_mon = if match_mon_checked { BST_CHECKED } else { BST_UNCHECKED };
+                let _ = SendMessageW(h_mon_chk, BM_SETCHECK, WPARAM(st_mon), LPARAM(0));
 
                 let h_av = dlg_item(self.hwnd, IDC_WIN_ALWAYS_VISIBLE);
                 let st = if row.always_visible { BST_CHECKED } else { BST_UNCHECKED };
@@ -689,13 +831,17 @@ impl SettingsWindow {
             self.vm.config_draft.launcher.always_on_top = get_chk(IDC_LCH_TOPMOST);
             self.vm.config_draft.launcher.snap_to_edges = get_chk(IDC_LCH_SNAP);
             self.vm.config_draft.launcher.focus_on_switch = get_chk(IDC_LCH_FOCUS);
+            self.vm.config_draft.launcher.restore_all_on_switch = get_chk(IDC_BEH_RESTORE_ALL_ON_SWITCH);
 
             // Read Behavior controls
             let h_mon = dlg_item(self.hwnd, IDC_BEH_MONITOR_COMBO);
             let mon_sel = SendMessageW(h_mon, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-            if mon_sel < self.vm.monitors.len() {
+            if mon_sel == 0 {
+                self.vm.config_draft.target.monitor_policy = MonitorPolicy::AllMonitors;
+            } else if mon_sel <= self.vm.monitors.len() {
                 self.vm.config_draft.target.monitor_policy = MonitorPolicy::Fixed;
-                self.vm.config_draft.target.monitor_id = Some(self.vm.monitors[mon_sel].monitor_id.clone());
+                self.vm.config_draft.target.monitor_id =
+                    Some(self.vm.monitors[mon_sel - 1].monitor_id.clone());
             } else {
                 self.vm.config_draft.target.monitor_policy = MonitorPolicy::LauncherMonitor;
             }
@@ -886,16 +1032,50 @@ unsafe extern "system" fn settings_wndproc(
                             let always_visible =
                                 SendMessageW(h_av, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
                                     == BST_CHECKED as isize;
+
+                            let h_mon_chk = dlg_item(hwnd, IDC_WIN_MATCH_MONITOR);
+                            let pin_to_monitor =
+                                SendMessageW(h_mon_chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                                    == BST_CHECKED as isize;
+
+                            let h_kw = dlg_item(hwnd, IDC_WIN_TITLE_KEYWORD);
+                            let mut kw_buf = [0u16; 256];
+                            let kw_len = GetWindowTextW(h_kw, &mut kw_buf);
+                            let custom_kw = if kw_len > 0 {
+                                Some(String::from_utf16_lossy(&kw_buf[..kw_len as usize]))
+                            } else {
+                                None
+                            };
+
                             if let Some(scene) = win.vm.config_draft.scenes.get(scene_sel) {
                                 let scene_id = scene.id.clone();
                                 if let Some(row) = win.vm.candidate_windows.get(idx) {
                                     let win_instance = row.instance.clone();
-                                    win.vm.bind_window_to_scene(
+                                    win.vm.bind_window_to_scene_with_options(
                                         &win_instance,
                                         &scene_id,
                                         always_visible,
+                                        custom_kw,
+                                        pin_to_monitor,
                                     );
                                     win.populate_data();
+                                }
+                            }
+                        }
+                        LRESULT(0)
+                    }
+                    IDC_WIN_UNBIND_SCENE => {
+                        if let Some(idx) = win.selected_window_idx {
+                            let h_combo = dlg_item(hwnd, IDC_WIN_SCENE_COMBO);
+                            let scene_sel = SendMessageW(h_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
+                            if let Some(scene) = win.vm.config_draft.scenes.get(scene_sel) {
+                                let scene_id = scene.id.clone();
+                                if let Some(row) = win.vm.candidate_windows.get(idx) {
+                                    if let Some(ref bid) = row.existing_binding_id {
+                                        let bid_owned = bid.clone();
+                                        win.vm.unbind_window_from_scene(&bid_owned, &scene_id);
+                                        win.populate_data();
+                                    }
                                 }
                             }
                         }

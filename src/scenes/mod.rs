@@ -80,6 +80,7 @@ mod tests {
                     window_class: "MetaQuotes::MetaTrader::5.00".to_string(),
                     title_rule: TitleRule::any(),
                     aumid: None,
+                    monitor_id: None,
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string()],
@@ -93,6 +94,7 @@ mod tests {
                     window_class: "Chrome_WidgetWin_1".to_string(),
                     title_rule: TitleRule::contains("Visual Studio Code"),
                     aumid: None,
+                    monitor_id: None,
                 },
                 instance_hint: None,
                 scene_ids: vec!["code".to_string()],
@@ -106,6 +108,7 @@ mod tests {
                     window_class: "SharedClass".to_string(),
                     title_rule: TitleRule::any(),
                     aumid: None,
+                    monitor_id: None,
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string(), "code".to_string()],
@@ -226,7 +229,8 @@ mod tests {
 
     #[test]
     fn test_at09_and_at23_user_manual_minimize_and_manual_restore_reminimize_never_auto_restored() {
-        let cfg = setup_standard_config();
+        let mut cfg = setup_standard_config();
+        cfg.launcher.restore_all_on_switch = false; // Test strict mode
         let mut sys = FakeWindowSystem::new_dual_monitor();
         sys.add_window(make_win(
             20,
@@ -313,6 +317,100 @@ mod tests {
         );
         assert!(out_trade.restored_hwnds.is_empty());
         assert!(sys.query_window(20).unwrap().is_iconic);
+
+        let _ = std::fs::remove_file(jpath);
+    }
+
+    #[test]
+    fn test_restore_all_on_switch_restores_manually_iconic_window() {
+        let mut cfg = setup_standard_config();
+        // Add App B (70) registered only to "trade"
+        cfg.bindings.push(WindowBinding {
+            id: "trade-app-b".to_string(),
+            match_rule: WindowMatch {
+                exe_path: r"C:\Apps\AppB\app_b.exe".to_string(),
+                window_class: "AppBClass".to_string(),
+                title_rule: TitleRule::any(),
+                aumid: None,
+                monitor_id: None,
+            },
+            instance_hint: None,
+            scene_ids: vec!["trade".to_string()],
+            always_visible: false,
+            enabled: true,
+        });
+
+        // Default is true: when switching to a scene, restore ALL registered windows regardless of prior state!
+        assert!(cfg.launcher.restore_all_on_switch);
+
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        // App A (MT5, 20) and App B (AppB, 70) are both registered to "trade"
+        sys.add_window(make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5",
+            "MON-2-TARGET",
+        ));
+        sys.add_window(make_win(
+            70,
+            700,
+            r"C:\Apps\AppB\app_b.exe",
+            "AppBClass",
+            "App B",
+            "MON-2-TARGET",
+        ));
+        sys.add_window(make_win(
+            30,
+            300,
+            r"C:\Apps\VSCode\Code.exe",
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+            "MON-2-TARGET",
+        ));
+
+        let mut state_mgr = SceneStateManager::new(None);
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("restore_all_iconic");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+
+        // User leaves App A (20) minimized and App B (70) visible
+        sys.simulate_user_minimize(20);
+        assert!(sys.query_window(20).unwrap().is_iconic);
+        assert!(!sys.query_window(70).unwrap().is_iconic);
+
+        // Switch to "code" -> App B (70) is minimized, VSCode (30) is restored
+        let out_code = execute_scene_switch(
+            "code",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert!(out_code.switched);
+        assert!(sys.query_window(70).unwrap().is_iconic);
+
+        // Now switch BACK to "trade" -> BOTH App A (20) and App B (70) must be restored and visible!
+        let out_trade = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert!(out_trade.switched);
+        assert_eq!(out_trade.restored_hwnds.len(), 2);
+        assert!(out_trade.restored_hwnds.contains(&20));
+        assert!(out_trade.restored_hwnds.contains(&70));
+
+        // Both App A and App B are now restored!
+        assert!(!sys.query_window(20).unwrap().is_iconic);
+        assert!(!sys.query_window(70).unwrap().is_iconic);
 
         let _ = std::fs::remove_file(jpath);
     }
@@ -458,6 +556,7 @@ mod tests {
                 window_class: "Chrome_WidgetWin_1".to_string(),
                 title_rule: TitleRule::any(),
                 aumid: None,
+                monitor_id: None,
             },
             instance_hint: None,
             scene_ids: vec!["web".to_string()],
@@ -725,6 +824,119 @@ mod tests {
         assert!(!restored_win.is_iconic);
         // Maximized status must be preserved (AT-24)
         assert!(restored_win.is_maximized);
+
+        let _ = std::fs::remove_file(jpath);
+    }
+
+    #[test]
+    fn test_dual_monitor_workspaces_abc_and_app_restart_reidentification() {
+        let mut cfg = AppConfig::default_initial();
+        // Default policy is now AllMonitors (dual-monitor coordinated switching)
+        assert_eq!(cfg.target.monitor_policy, MonitorPolicy::AllMonitors);
+
+        cfg.scenes = vec![
+            Scene { id: "workspaceA".to_string(), name: "Workspace A".to_string(), icon: "chart".to_string(), order: 1, pinned: true },
+            Scene { id: "workspaceB".to_string(), name: "Workspace B".to_string(), icon: "code".to_string(), order: 2, pinned: true },
+            Scene { id: "workspaceC".to_string(), name: "Workspace C".to_string(), icon: "globe".to_string(), order: 3, pinned: true },
+        ];
+
+        // Dual monitor setup: MON-1-PRIMARY (Left) and MON-2-TARGET (Right)
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        // Left monitor: Chart (101), TradeApp (102), DevEditor (103), Edge Left for C (104)
+        sys.add_window(make_win(101, 1001, r"C:\Apps\Chart\chart.exe", "ChartWnd", "FX Chart", "MON-1-PRIMARY"));
+        sys.add_window(make_win(102, 1002, r"C:\Apps\Trade\trade.exe", "TradeWnd", "Order Terminal", "MON-1-PRIMARY"));
+        sys.add_window(make_win(103, 1003, r"C:\Apps\VSCode\Code.exe", "Chrome_WidgetWin_1", "Kiri - Visual Studio Code", "MON-1-PRIMARY"));
+        // Note: all Edge windows share the same browser PID (2000) in real life!
+        sys.add_window(make_win(104, 2000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "Portal - Microsoft Edge", "MON-1-PRIMARY"));
+        // Right monitor: Edge shared by A & B (201), Edge for C (202)
+        sys.add_window(make_win(201, 2000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "MarketDocs - Microsoft Edge", "MON-2-TARGET"));
+        sys.add_window(make_win(202, 2000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "YouTube - Microsoft Edge", "MON-2-TARGET"));
+
+        // Register via SettingsViewModel just like user does in the UI
+        let mut vm = crate::settings::SettingsViewModel::build(&cfg, &sys, Some("MON-1-PRIMARY"));
+        // Workspace A: Left = Chart(101) + Trade(102), Right = Edge(201)
+        let w101 = sys.query_window(101).unwrap();
+        let w102 = sys.query_window(102).unwrap();
+        let w103 = sys.query_window(103).unwrap();
+        let w104 = sys.query_window(104).unwrap();
+        let w201 = sys.query_window(201).unwrap();
+        let w202 = sys.query_window(202).unwrap();
+
+        vm.bind_window_to_scene(&w101, "workspaceA", false);
+        vm.bind_window_to_scene(&w102, "workspaceA", false);
+        vm.bind_window_to_scene(&w201, "workspaceA", false);
+
+        // Workspace B: Left = DevEditor(103), Right = Browser(201 shared with A -> only left monitor changes between A and B!)
+        vm.bind_window_to_scene(&w103, "workspaceB", false);
+        vm.bind_window_to_scene(&w201, "workspaceB", false);
+
+        // Workspace C: Left = Edge(104), Right = Edge(202) -> both monitors change!
+        vm.bind_window_to_scene(&w104, "workspaceC", false);
+        vm.bind_window_to_scene(&w202, "workspaceC", false);
+
+        cfg = vm.config_draft;
+
+        let mut state_mgr = SceneStateManager::new(None);
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("dual_abc");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+
+        // 1. Activate workspaceA: minimizes 103, 104 (left) and 202 (right); keeps 101, 102 (left) and 201 (right)
+        let out_a = execute_scene_switch("workspaceA", &cfg, &mut state_mgr, &mut resolver, &mut recovery, &mut sys, None);
+        assert!(out_a.switched);
+        assert!(!sys.query_window(101).unwrap().is_iconic);
+        assert!(!sys.query_window(102).unwrap().is_iconic);
+        assert!(!sys.query_window(201).unwrap().is_iconic);
+        assert!(sys.query_window(103).unwrap().is_iconic);
+        assert!(sys.query_window(104).unwrap().is_iconic);
+        assert!(sys.query_window(202).unwrap().is_iconic);
+
+        // 2. Switch workspaceA -> workspaceB: ONLY left monitor switches (101,102 minimized; 103 restored); right monitor 201 stays untouched!
+        let out_b = execute_scene_switch("workspaceB", &cfg, &mut state_mgr, &mut resolver, &mut recovery, &mut sys, None);
+        assert!(out_b.switched);
+        assert!(sys.query_window(101).unwrap().is_iconic);
+        assert!(sys.query_window(102).unwrap().is_iconic);
+        assert!(!sys.query_window(103).unwrap().is_iconic);
+        assert!(!sys.query_window(201).unwrap().is_iconic); // Right monitor untouched!
+
+        // 3. Switch workspaceB -> workspaceC: BOTH monitors switch (103 and 201 minimized; 104 and 202 restored)!
+        let out_c = execute_scene_switch("workspaceC", &cfg, &mut state_mgr, &mut resolver, &mut recovery, &mut sys, None);
+        assert!(out_c.switched);
+        assert!(sys.query_window(103).unwrap().is_iconic);
+        assert!(sys.query_window(201).unwrap().is_iconic);
+        assert!(!sys.query_window(104).unwrap().is_iconic);
+        assert!(!sys.query_window(202).unwrap().is_iconic);
+
+        // 4. Now simulate closing apps and reopening them with brand new HWNDs and PIDs!
+        sys.windows.clear();
+        // Reopened with new HWNDs (501..506) and new PIDs (5001..)
+        sys.add_window(make_win(501, 5001, r"C:\Apps\Chart\chart.exe", "ChartWnd", "FX Chart New Session", "MON-1-PRIMARY"));
+        sys.add_window(make_win(502, 5002, r"C:\Apps\Trade\trade.exe", "TradeWnd", "Order Terminal v2", "MON-1-PRIMARY"));
+        sys.add_window(make_win(503, 5003, r"C:\Apps\VSCode\Code.exe", "Chrome_WidgetWin_1", "other_file.rs - Visual Studio Code", "MON-1-PRIMARY"));
+        // Reopened Edge on Left Monitor (even with a different tab title, since it's the only Edge on Left Monitor!)
+        sys.add_window(make_win(504, 6000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "Different Tab - Microsoft Edge", "MON-1-PRIMARY"));
+        // Reopened Edges on Right Monitor (distinguished by their title keywords "MarketDocs" and "YouTube")
+        sys.add_window(make_win(601, 6000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "MarketDocs - Live - Microsoft Edge", "MON-2-TARGET"));
+        sys.add_window(make_win(602, 6000, r"C:\Program Files\Microsoft\Edge\msedge.exe", "Chrome_WidgetWin_1", "YouTube - Music - Microsoft Edge", "MON-2-TARGET"));
+
+        // Switch to workspaceA -> automatically recognizes all reopened windows across both monitors!
+        let out_reopen_a = execute_scene_switch("workspaceA", &cfg, &mut state_mgr, &mut resolver, &mut recovery, &mut sys, None);
+        assert!(out_reopen_a.switched);
+        assert!(!sys.query_window(501).unwrap().is_iconic);
+        assert!(!sys.query_window(502).unwrap().is_iconic);
+        assert!(!sys.query_window(601).unwrap().is_iconic);
+        assert!(sys.query_window(503).unwrap().is_iconic);
+        assert!(sys.query_window(504).unwrap().is_iconic);
+        assert!(sys.query_window(602).unwrap().is_iconic);
+
+        // Switch to workspaceC -> restores 504 (Left Edge) and 602 (Right Edge), minimizes 501, 502, 601!
+        let out_reopen_c = execute_scene_switch("workspaceC", &cfg, &mut state_mgr, &mut resolver, &mut recovery, &mut sys, None);
+        assert!(out_reopen_c.switched);
+        assert!(!sys.query_window(504).unwrap().is_iconic);
+        assert!(!sys.query_window(602).unwrap().is_iconic);
+        assert!(sys.query_window(501).unwrap().is_iconic);
+        assert!(sys.query_window(502).unwrap().is_iconic);
+        assert!(sys.query_window(601).unwrap().is_iconic);
 
         let _ = std::fs::remove_file(jpath);
     }
