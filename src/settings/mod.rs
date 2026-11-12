@@ -3,11 +3,12 @@
 //! Per Section 2.4 & 11 of spec.md:
 //! - The Settings window is a normal top-level window opened on demand ("右クリック → 設定" or 2nd instance activation).
 //! - When closed, the window and all its GDI/Win32 control resources are destroyed so resident memory stays minimal.
-//! - Provides `SettingsViewModel` and helper methods for the 4 tabs:
+//! - Provides `SettingsViewModel` and helper methods for the settings tabs:
 //!   1. Scenes (`SceneTab`): create/delete/rename scenes, icon, order, `pinned`.
 //!   2. Windows (`WindowsTab`): live open window list with `RegistrationWarning` badges & safe `TitleRule` suggestion.
 //!   3. Launcher (`LauncherTab`): orientation, button/grip size, visible slots, always-on-top, snap, reset position.
 //!   4. Behavior (`BehaviorTab`): target monitor selector, focus_on_switch, hotkeys, autostart registry, recovery.
+//!   5. Shortcuts: register and reorder folders, files, and sites.
 
 pub mod window;
 
@@ -25,6 +26,7 @@ pub enum SettingsTab {
     Windows,
     Launcher,
     Behavior,
+    Shortcuts,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +58,7 @@ pub struct AppBindingRow {
     pub warnings: Vec<RegistrationWarning>,
 }
 
-/// Snapshot of data needed to render and edit the 4 tabs of the Settings window.
+/// Snapshot of data needed to render and edit the Settings window.
 #[derive(Debug, Clone)]
 pub struct SettingsViewModel {
     pub active_tab: SettingsTab,

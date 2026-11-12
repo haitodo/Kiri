@@ -10,7 +10,7 @@
 - **非干渉性（Strict Non-Interference）**: 制御対象外モニターのウィンドウ（例: モニター1のブラウザ）や未登録ウィンドウには一切干渉しません（FR-05）。
 - **非アクティブ（Focus Steal Prevention）**: `WS_EX_NOACTIVATE` および `WM_MOUSEACTIVATE` (`MA_NOACTIVATE`) を採用し、ランチャー操作時にアクティブな作業ウィンドウのキーボードフォーカスを奪いません（FR-19）。
 - **仮想デスクトップ不使用**: Windows仮想デスクトップ（切替アニメーションや全画面再描画）を用いず、同一デスクトップ上で既存ウィンドウの最小化／復元のみを即座に実行します。
-- **イベント駆動・省リソース**: 待機時の定期ポーリングタイマーを一切排除。ネイティブWin32メッセージループ（`GetMessageW`）と、必要最小限のWinEventフック（`EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND`）のみで動作し、待機時CPU使用率0.0%、メモリ約11MBを実現します。
+- **イベント駆動・省リソース**。ネイティブWin32メッセージループ（`GetMessageW`）、最小化通知と入力フックで動作します。カーソル付近のランチャーもイベントに応じて描画します。
 - **安全第一の設計**:
   - モーダルダイアログ表示中（親窓 `!IsWindowEnabled`）のウィンドウは最小化せずスキップし警告を出力（FR-17）。
   - 切替直前に文字入力中だった前景ウィンドウは最後尾に `SW_MINIMIZE` で最小化し、不可視ウィンドウに入力が残る事故を防止（FR-18）。
@@ -32,7 +32,7 @@
 | **Win32 ウィンドウシステム** | [src/platform/windows.rs](file:///d:/dev/Kiri/src/platform/windows.rs) | `EnumWindows`（Z順）、`DWMWA_CLOAKED` クローク除外、`IVirtualDesktopManager` 別仮想デスクトップ除外、所有窓除外、`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` によるEXEパス・開始時刻・昇格状態取得、`PKEY_AppUserModel_ID` 取得、最小化窓の `rcNormalPosition` モニター帰属判定、同期 `SendMessage` 完全排除 |
 | **WinEventフック・トレイ** | [src/platform/hooks.rs](file:///d:/dev/Kiri/src/platform/hooks.rs), [src/platform/tray.rs](file:///d:/dev/Kiri/src/platform/tray.rs) | `EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND` 限定の `WINEVENT_OUTOFCONTEXT` フック、`Shell_NotifyIconW` システムトレイアイコン＋エクスプローラー再起動時（`TaskbarCreated`）自動再登録 |
 | **常駐ランチャーUI** | [src/launcher/window.rs](file:///d:/dev/Kiri/src/launcher/window.rs), [src/launcher/paint.rs](file:///d:/dev/Kiri/src/launcher/paint.rs), [src/launcher/overflow.rs](file:///d:/dev/Kiri/src/launcher/overflow.rs), [src/launcher/input.rs](file:///d:/dev/Kiri/src/launcher/input.rs) | `WS_EX_NOACTIVATE` + `MA_NOACTIVATE`、専用グリップ `HTCAPTION` ドラッグ、グリップダブルクリック位置リセット、右クリックコンテキストメニュー、GDIダブルバッファ＋ブラシ/ペンキャッシュ描画、内蔵ベクターアイコン（chart/code/globe）および外部 `.ico` ファイルロード・キャッシュ、トラッキングツールチップ（`TOOLTIPS_CLASSW`）、フォーカス非奪取 `⋯` ポップアップ、FFI境界 `catch_unwind` パニック保護 |
-| **4タブ ネイティブ設定画面** | [src/settings/window.rs](file:///d:/dev/Kiri/src/settings/window.rs), [src/settings/mod.rs](file:///d:/dev/Kiri/src/settings/mod.rs) | Win32標準コントロール（`WC_TABCONTROLW`, `LISTBOX`, `EDIT`, `BUTTON`, `COMBOBOX`）による4タブ構成（シーン／ウィンドウ／ランチャー／動作）。候補ウィンドウ列挙・警告表示、自動起動レジストリ（`HKCU\...\Run`）連携、アトミック保存 |
+| **ネイティブ設定画面** | [src/settings/window.rs](file:///d:/dev/Kiri/src/settings/window.rs), [src/settings/mod.rs](file:///d:/dev/Kiri/src/settings/mod.rs) | Win32標準コントロールによる5タブ構成（シーン／アプリとシーン／ランチャー／動作／ショートカット）。候補ウィンドウ列挙・警告表示、自動起動レジストリ（`HKCU\...\Run`）連携、アトミック保存 |
 | **単一インスタンス・DPIマニフェスト** | [src/main.rs](file:///d:/dev/Kiri/src/main.rs), [app.manifest](file:///d:/dev/Kiri/app.manifest), [build.rs](file:///d:/dev/Kiri/build.rs) | `CreateMutexW("Local\\Kiri-...")` によるセッション単一インスタンス化、多重起動時の `AllowSetForegroundWindow` + 既存インスタンス設定画面起動通知、Per-Monitor DPI Awareness V2 マニフェスト埋め込み |
 | **構造化ログ・タイトルマスク** | [src/diagnostics.rs](file:///d:/dev/Kiri/src/diagnostics.rs) | 口座番号等を含むウィンドウタイトルの既定マスク出力（`mask_title`）、GDI/USERオブジェクト計測ヘルパー |
 | **テスト用ダミーアプリ** | [tools/testwin/src/main.rs](file:///d:/dev/Kiri/tools/testwin/src/main.rs) | 複数窓、モーダル表示中、応答なし、最小化時トレイ非表示、タスクバーボタンなし、最大化、動的タイトル変化を再現する検証用Win32アプリ |
@@ -126,6 +126,8 @@ cargo build --release --workspace
 # ランチャー本体の起動
 .\target\release\kiri.exe
 ```
+- **Ctrl の二度押し**で、作業中のウィンドウにフォーカスを残したままカーソル付近にランチャーを開きます。シーンやショートカットをクリックすると実行して閉じます。もう一度 Ctrl を二度押しするか、外側をクリックすると閉じます。
+- **トレイアイコンの左クリック**でもカーソル付近のランチャーを開けます。右クリックから設定や復旧に進めます。
 - **左クリック**: シーンアイコンをクリックしてシーン切替。
 - **グリップドラッグ**: 左端（横型時）または上端（縦型時）の専用グリップをドラッグして移動。
 - **グリップダブルクリック**: ランチャーを画面内の規定位置へリセット。
@@ -134,9 +136,9 @@ cargo build --release --workspace
 
 ---
 
-## 7. 設定画面（4タブ）の使い方
+## 7. 設定画面の使い方
 
-ランチャーを右クリック →「設定」を選択すると、Win32ネイティブ標準コントロールによる4タブ設定ダイアログが開きます。
+固定バーまたはトレイアイコンを右クリックして「設定」を開きます。
 
 1. **シーン（Scenes）タブ**:
    - シーンの追加（ID / 表示名 / アイコン種別 `chart` / `code` / `globe` または外部 `.ico` パス / 固定表示ピン）。
@@ -150,12 +152,16 @@ cargo build --release --workspace
    - 横型／縦型の切替。
    - ボタンサイズ（既定 32 DIP）、グリップ幅（既定 18 DIP）、固定表示スロット数（既定 3）。
    - 常時最前面（Topmost）、画面端スナップ（12 DIP）、位置リセット。
+   - 固定バーの表示と Ctrl の二度押しを個別に切り替えられます。どちらも既定で有効です。
 4. **動作（Behavior）タブ**:
    - 制御対象モニターの指定（既定: **「すべてのモニター (左右/全画面の登録ウィンドウを切替)」**、または特定モニターの単一固定、ランチャー所在モニターへの自動追従）。
    - **登録アプリの全復元保証**: 「シーン切替時に登録アプリを確実にすべて表示する (手動最小化されたアプリも復元)」オプション（既定有効）。手動で最小化していたアプリも含め、シーン選択時に登録アプリを100%確実に画面に復元・表示します。
    - Windowsログオン時の自動起動（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`）の有効化／無効化。
    - 詳細タイトルログ出力のON/OFF。
    - フェイルセーフ「最小化した全ウィンドウを今すぐ復元」ボタン。
+5. **ショートカット**
+   - 表示名、種類、場所を入力し、［リストに反映］から［適用］へ進みます。フォルダーとファイルは［参照…］で選択でき、サイトには `https://` または `http://` で始まる URL を指定します。
+   - ［上へ］と［下へ］で、カーソル付近のランチャーに表示する順番を変更できます。
 
 ---
 

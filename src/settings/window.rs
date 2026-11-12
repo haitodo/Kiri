@@ -1,14 +1,15 @@
 //! Win32 Settings Window implementation.
 //!
-//! Provides an on-demand dialog window with 4 tabs:
+//! Provides an on-demand dialog window with five tabs:
 //! 1. Scenes: Add, remove, rename, order, icon, and pinned status
 //! 2. Windows: Enumerate open candidate windows, warnings, and scene binding
 //! 3. Launcher: Orientation, button/grip size, visible slots, topmost, snap, focus
 //! 4. Behavior: Target monitor selector, Windows autostart, verbose logging, full restore
+//! 5. Shortcuts: Folders, files, and websites opened by the cursor launcher
 
 use crate::app::AppController;
-use crate::config::{MonitorPolicy, Orientation, Scene};
-use crate::settings::{set_autostart_enabled, SettingsViewModel};
+use crate::config::{MonitorPolicy, Orientation, Scene, Shortcut, ShortcutKind};
+use crate::settings::{set_autostart_enabled, SettingsTab, SettingsViewModel};
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -19,6 +20,7 @@ use windows::Win32::UI::Controls::{
 };
 
 pub const WM_APP_SETTINGS_SAVED: u32 = 0x8000 + 5;
+const WM_APP_SHOW_SETTINGS_TAB: u32 = 0x8000 + 10;
 
 static ACTIVE_SETTINGS_HWND: AtomicUsize = AtomicUsize::new(0);
 
@@ -66,6 +68,8 @@ const IDC_LCH_TOPMOST: usize = 405;
 const IDC_LCH_SNAP: usize = 406;
 const IDC_LCH_FOCUS: usize = 407;
 const IDC_LCH_RESET_POS: usize = 408;
+const IDC_LCH_SHOW_BAR: usize = 409;
+const IDC_LCH_CTRL_DOUBLE_TAP: usize = 410;
 
 // Tab 3 (Behavior)
 const IDC_BEH_MONITOR_COMBO: usize = 501;
@@ -83,6 +87,18 @@ const IDC_ADDWIN_PIN_MONITOR: usize = 604;
 const IDC_ADDWIN_KEYWORD: usize = 605;
 const IDC_ADDWIN_BTN_ADD: usize = 606;
 const IDC_ADDWIN_BTN_CLOSE: usize = 607;
+
+// Tab 4 (Shortcuts)
+const IDC_SHORTCUT_LIST: usize = 701;
+const IDC_SHORTCUT_NEW: usize = 702;
+const IDC_SHORTCUT_DELETE: usize = 703;
+const IDC_SHORTCUT_UP: usize = 704;
+const IDC_SHORTCUT_DOWN: usize = 705;
+const IDC_SHORTCUT_NAME: usize = 706;
+const IDC_SHORTCUT_KIND: usize = 707;
+const IDC_SHORTCUT_TARGET: usize = 708;
+const IDC_SHORTCUT_BROWSE: usize = 709;
+const IDC_SHORTCUT_UPDATE: usize = 710;
 
 const SETTINGS_CLIENT_W_DIP: i32 = 820;
 const SETTINGS_CLIENT_H_DIP: i32 = 560;
@@ -114,7 +130,8 @@ pub struct SettingsWindow {
     pub vm: SettingsViewModel,
     pub selected_scene_idx: Option<usize>,
     pub selected_app_idx: Option<usize>,
-    pub tab_controls: [Vec<windows::Win32::Foundation::HWND>; 4],
+    selected_shortcut_idx: Option<usize>,
+    pub tab_controls: [Vec<windows::Win32::Foundation::HWND>; 5],
     pub control_layouts: Vec<ControlDipLayout>,
     pub hfont: windows::Win32::Graphics::Gdi::HFONT,
     pub dpi: u32,
@@ -208,10 +225,10 @@ fn dlg_item(hwnd: windows::Win32::Foundation::HWND, id: usize) -> windows::Win32
 
 #[cfg(windows)]
 impl SettingsWindow {
-    pub fn show(parent_hwnd: windows::Win32::Foundation::HWND, app: &AppController) {
+    pub fn show(parent_hwnd: windows::Win32::Foundation::HWND, app: &AppController, tab: Option<SettingsTab>) {
         use std::sync::Once;
         use windows::core::w;
-        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH};
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::Controls::{
@@ -220,7 +237,7 @@ impl SettingsWindow {
         };
         use windows::Win32::UI::HiDpi::GetDpiForWindow;
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, IsIconic, LoadCursorW, RegisterClassW, SetForegroundWindow,
+            CreateWindowExW, IsIconic, LoadCursorW, PostMessageW, RegisterClassW, SetForegroundWindow,
             SetWindowLongPtrW, ShowWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
             SW_RESTORE, SW_SHOW, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
         };
@@ -234,6 +251,9 @@ impl SettingsWindow {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
                 let _ = SetForegroundWindow(hwnd);
+                if let Some(tab) = tab {
+                    let _ = PostMessageW(hwnd, WM_APP_SHOW_SETTINGS_TAB, WPARAM(tab as usize), LPARAM(0));
+                }
             }
             return;
         }
@@ -314,7 +334,8 @@ impl SettingsWindow {
                 vm,
                 selected_scene_idx: None,
                 selected_app_idx: None,
-                tab_controls: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+                selected_shortcut_idx: None,
+                tab_controls: std::array::from_fn(|_| Vec::new()),
                 control_layouts: Vec::with_capacity(48),
                 hfont: windows::Win32::Graphics::Gdi::HFONT::default(),
                 dpi: actual_win_dpi,
@@ -324,7 +345,7 @@ impl SettingsWindow {
             let ptr = &mut *win as *mut Self as isize;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr);
 
-            win.init_controls(hinstance);
+            win.init_controls(hinstance, tab.unwrap_or(SettingsTab::Scenes));
             win.clamp_to_current_monitor_work_area();
 
             // Box is intentionally leaked while the window is alive; dropped in WM_NCDESTROY
@@ -335,14 +356,14 @@ impl SettingsWindow {
         }
     }
 
-    unsafe fn init_controls(&mut self, hinstance: windows::Win32::Foundation::HMODULE) {
+    unsafe fn init_controls(&mut self, hinstance: windows::Win32::Foundation::HMODULE, tab: SettingsTab) {
         use crate::platform::monitors::dip_to_px;
         use windows::core::{w, PCWSTR};
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::Controls::{TCIF_TEXT, TCITEMW, TCM_INSERTITEMW, WC_TABCONTROLW};
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, SendMessageW, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
-            ES_AUTOHSCROLL, ES_MULTILINE, ES_READONLY, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WS_BORDER,
+            CB_ADDSTRING, ES_AUTOHSCROLL, ES_MULTILINE, ES_READONLY, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WS_BORDER,
             WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
         };
 
@@ -405,7 +426,7 @@ impl SettingsWindow {
             ControlKind::TabControl,
         );
 
-        let tab_titles = [w!("シーン"), w!("アプリとシーン"), w!("ランチャー"), w!("動作")];
+        let tab_titles = [w!("シーン"), w!("アプリとシーン"), w!("ランチャー"), w!("動作"), w!("ショートカット")];
         for (i, title) in tab_titles.iter().enumerate() {
             let mut item = TCITEMW {
                 mask: TCIF_TEXT,
@@ -924,6 +945,14 @@ impl SettingsWindow {
             IDC_LCH_RESET_POS,
             ControlKind::Standard,
         ));
+        t2.push(create_ctrl(
+            w!("BUTTON"), w!("固定バーを表示する"), BS_AUTOCHECKBOX as u32,
+            32, 407, 440, 28, IDC_LCH_SHOW_BAR, ControlKind::Standard,
+        ));
+        t2.push(create_ctrl(
+            w!("BUTTON"), w!("Ctrl の二度押しでカーソル付近にランチャーを開く"), BS_AUTOCHECKBOX as u32,
+            32, 445, 550, 28, IDC_LCH_CTRL_DOUBLE_TAP, ControlKind::Standard,
+        ));
         self.tab_controls[2] = t2;
 
         // ===================== Tab 3: Behavior =====================
@@ -1011,11 +1040,49 @@ impl SettingsWindow {
             ControlKind::Standard,
         ));
         self.tab_controls[3] = t3;
+
+        let shortcut_kind = create_ctrl(
+            w!("COMBOBOX"), w!(""), CBS_DROPDOWNLIST as u32,
+            330, 160, 180, 140, IDC_SHORTCUT_KIND, ControlKind::ComboBox,
+        );
+        self.tab_controls[4] = vec![
+            create_ctrl(w!("STATIC"), w!("登録済みショートカット"), 0, 28, 50, 280, 22, 0, ControlKind::Standard),
+            create_ctrl(w!("LISTBOX"), w!(""),
+                WS_BORDER.0 | WS_VSCROLL.0 | LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32,
+                28, 76, 280, 330, IDC_SHORTCUT_LIST, ControlKind::ListBox),
+            create_ctrl(w!("BUTTON"), w!("新規"), BS_PUSHBUTTON as u32,
+                28, 420, 64, 32, IDC_SHORTCUT_NEW, ControlKind::Standard),
+            create_ctrl(w!("BUTTON"), w!("削除"), BS_PUSHBUTTON as u32,
+                100, 420, 64, 32, IDC_SHORTCUT_DELETE, ControlKind::Standard),
+            create_ctrl(w!("BUTTON"), w!("上へ"), BS_PUSHBUTTON as u32,
+                172, 420, 64, 32, IDC_SHORTCUT_UP, ControlKind::Standard),
+            create_ctrl(w!("BUTTON"), w!("下へ"), BS_PUSHBUTTON as u32,
+                244, 420, 64, 32, IDC_SHORTCUT_DOWN, ControlKind::Standard),
+            create_ctrl(w!("STATIC"), w!("表示名"), 0, 330, 50, 210, 22, 0, ControlKind::Standard),
+            create_ctrl(w!("EDIT"), w!(""), WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+                330, 76, 454, 28, IDC_SHORTCUT_NAME, ControlKind::Standard),
+            create_ctrl(w!("STATIC"), w!("種類"), 0, 330, 134, 210, 22, 0, ControlKind::Standard),
+            shortcut_kind,
+            create_ctrl(w!("STATIC"), w!("場所（絶対パスまたは URL）"), 0,
+                330, 214, 420, 22, 0, ControlKind::Standard),
+            create_ctrl(w!("EDIT"), w!(""), WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+                330, 240, 368, 28, IDC_SHORTCUT_TARGET, ControlKind::Standard),
+            create_ctrl(w!("BUTTON"), w!("参照…"), BS_PUSHBUTTON as u32,
+                706, 240, 78, 28, IDC_SHORTCUT_BROWSE, ControlKind::Standard),
+            create_ctrl(w!("BUTTON"), w!("リストに反映"), BS_PUSHBUTTON as u32,
+                330, 290, 144, 32, IDC_SHORTCUT_UPDATE, ControlKind::Standard),
+        ];
+        for kind in ShortcutKind::ALL {
+            let text: Vec<u16> = kind.label().encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = SendMessageW(shortcut_kind, CB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+        }
+
         self.control_layouts = layouts;
 
         self.apply_dpi_and_layout(dpi);
         self.populate_data();
-        self.switch_tab(0);
+        self.select_shortcut(None);
+        self.select_tab(tab as usize);
     }
 
     pub unsafe fn apply_dpi_and_layout(&mut self, new_dpi: u32) {
@@ -1181,6 +1248,17 @@ impl SettingsWindow {
                 }
             }
         }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Controls::TCM_SETCURSEL;
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        unsafe {
+            let _ = SendMessageW(dlg_item(self.hwnd, IDC_TAB_CONTROL), TCM_SETCURSEL, WPARAM(index), LPARAM(0));
+        }
+        self.switch_tab(index);
     }
 
     pub fn populate_data(&mut self) {
@@ -1612,7 +1690,85 @@ impl SettingsWindow {
             set_chk(IDC_LCH_TOPMOST, self.vm.config_draft.launcher.always_on_top);
             set_chk(IDC_LCH_SNAP, self.vm.config_draft.launcher.snap_to_edges);
             set_chk(IDC_LCH_FOCUS, self.vm.config_draft.launcher.focus_on_switch);
+            set_chk(IDC_LCH_SHOW_BAR, self.vm.config_draft.launcher.show_bar);
+            set_chk(IDC_LCH_CTRL_DOUBLE_TAP, self.vm.config_draft.launcher.ctrl_double_tap);
         }
+    }
+
+    unsafe fn populate_shortcut_list(&self) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, LB_ADDSTRING, LB_RESETCONTENT, LB_SETCURSEL,
+        };
+
+        let list = dlg_item(self.hwnd, IDC_SHORTCUT_LIST);
+        let _ = SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+        let shortcuts = &self.vm.config_draft.shortcuts;
+        for shortcut in shortcuts {
+            let text: Vec<u16> = format!("{}  ·  {}", shortcut.name, shortcut.kind.label())
+                .encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+        }
+        let index = self.selected_shortcut_idx;
+        let _ = SendMessageW(list, LB_SETCURSEL, WPARAM(index.unwrap_or(usize::MAX)), LPARAM(0));
+        let _ = EnableWindow(dlg_item(self.hwnd, IDC_SHORTCUT_DELETE), index.is_some());
+        let _ = EnableWindow(dlg_item(self.hwnd, IDC_SHORTCUT_UP), index.is_some_and(|i| i > 0));
+        let _ = EnableWindow(dlg_item(self.hwnd, IDC_SHORTCUT_DOWN), index.is_some_and(|i| i + 1 < shortcuts.len()));
+    }
+
+    unsafe fn select_shortcut(&mut self, index: Option<usize>) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, CB_SETCURSEL};
+
+        self.selected_shortcut_idx = index;
+        let (name, kind, target) = index.and_then(|i| self.vm.config_draft.shortcuts.get(i))
+            .map(|shortcut| (shortcut.name.as_str(), shortcut.kind, shortcut.target.as_str()))
+            .unwrap_or(("", ShortcutKind::Folder, ""));
+        set_edit_text(self.hwnd, IDC_SHORTCUT_NAME, name);
+        set_edit_text(self.hwnd, IDC_SHORTCUT_TARGET, target);
+        let _ = SendMessageW(dlg_item(self.hwnd, IDC_SHORTCUT_KIND), CB_SETCURSEL, WPARAM(kind as usize), LPARAM(0));
+        self.update_shortcut_browse_button();
+        self.populate_shortcut_list();
+    }
+
+    unsafe fn shortcut_kind(&self) -> ShortcutKind {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, CB_GETCURSEL};
+
+        let combo = dlg_item(self.hwnd, IDC_SHORTCUT_KIND);
+        let index = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
+        ShortcutKind::ALL.get(index).copied().unwrap_or(ShortcutKind::Folder)
+    }
+
+    unsafe fn update_shortcut_browse_button(&self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+        let _ = EnableWindow(dlg_item(self.hwnd, IDC_SHORTCUT_BROWSE), self.shortcut_kind() != ShortcutKind::Website);
+    }
+
+    unsafe fn save_shortcut_fields(&mut self, required: bool) -> Result<(), &'static str> {
+        let name = edit_text(self.hwnd, IDC_SHORTCUT_NAME).trim().to_owned();
+        let target = edit_text(self.hwnd, IDC_SHORTCUT_TARGET);
+        let target = target.trim();
+        if !required && self.selected_shortcut_idx.is_none() && name.is_empty() && target.is_empty() {
+            return Ok(());
+        }
+
+        let kind = self.shortcut_kind();
+        // Explorer's Copy as path command surrounds the path with quotes.
+        let target = if kind == ShortcutKind::Website { target } else {
+            target.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(target)
+        };
+        let shortcut = Shortcut { name, kind, target: target.to_owned() };
+        shortcut.validate()?;
+        let shortcuts = &mut self.vm.config_draft.shortcuts;
+        if let Some(index) = self.selected_shortcut_idx {
+            shortcuts[index] = shortcut;
+        } else {
+            self.selected_shortcut_idx = Some(shortcuts.len());
+            shortcuts.push(shortcut);
+        }
+        Ok(())
     }
 
     pub fn populate_behavior_tab(&mut self) {
@@ -1672,6 +1828,8 @@ impl SettingsWindow {
         self.save_current_app_rule();
 
         unsafe {
+            self.save_shortcut_fields(false)?;
+            self.populate_shortcut_list();
             // Read Launcher controls
             let h_orient = dlg_item(self.hwnd, IDC_LCH_ORIENT_COMBO);
             let orient_sel = SendMessageW(h_orient, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
@@ -1705,6 +1863,8 @@ impl SettingsWindow {
             self.vm.config_draft.launcher.always_on_top = get_chk(IDC_LCH_TOPMOST);
             self.vm.config_draft.launcher.snap_to_edges = get_chk(IDC_LCH_SNAP);
             self.vm.config_draft.launcher.focus_on_switch = get_chk(IDC_LCH_FOCUS);
+            self.vm.config_draft.launcher.show_bar = get_chk(IDC_LCH_SHOW_BAR);
+            self.vm.config_draft.launcher.ctrl_double_tap = get_chk(IDC_LCH_CTRL_DOUBLE_TAP);
             self.vm.config_draft.launcher.restore_all_on_switch = get_chk(IDC_BEH_RESTORE_ALL_ON_SWITCH);
 
             // Read Behavior controls
@@ -1731,6 +1891,47 @@ impl SettingsWindow {
     }
 }
 
+unsafe fn edit_text(hwnd: windows::Win32::Foundation::HWND, id: usize) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    let control = dlg_item(hwnd, id);
+    let mut wide = vec![0; GetWindowTextLengthW(control).max(0) as usize + 1];
+    let length = GetWindowTextW(control, &mut wide).max(0) as usize;
+    String::from_utf16_lossy(&wide[..length])
+}
+
+unsafe fn set_edit_text(hwnd: windows::Win32::Foundation::HWND, id: usize, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = SetWindowTextW(dlg_item(hwnd, id), windows::core::PCWSTR(wide.as_ptr()));
+}
+
+unsafe fn choose_shortcut_path(hwnd: windows::Win32::Foundation::HWND, kind: ShortcutKind) -> windows::core::Result<Option<String>> {
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+        SIGDN_FILESYSPATH,
+    };
+
+    let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+    let mode = if kind == ShortcutKind::Folder { FOS_PICKFOLDERS } else { FOS_FILEMUSTEXIST };
+    dialog.SetOptions(dialog.GetOptions()? | FOS_FORCEFILESYSTEM | mode)?;
+    if let Err(error) = dialog.Show(hwnd) {
+        return if error.code() == ERROR_CANCELLED.to_hresult() { Ok(None) } else { Err(error) };
+    }
+    let path = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+    let text = path.to_string();
+    CoTaskMemFree(Some(path.0.cast()));
+    Ok(Some(text?))
+}
+
+unsafe fn show_settings_error(hwnd: windows::Win32::Foundation::HWND, text: &str) {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = MessageBoxW(hwnd, PCWSTR(wide.as_ptr()), w!("Kiri 設定"), MB_OK | MB_ICONWARNING);
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn settings_wndproc(
     hwnd: windows::Win32::Foundation::HWND,
@@ -1743,7 +1944,7 @@ unsafe extern "system" fn settings_wndproc(
     use windows::Win32::UI::Controls::NMHDR;
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, DestroyWindow, GetWindowLongPtrW, MessageBoxW, PostMessageW,
-        SendMessageW, SetWindowLongPtrW, GWLP_USERDATA, LBN_SELCHANGE, LB_GETCURSEL,
+        SendMessageW, SetWindowLongPtrW, BM_GETCHECK, CBN_SELCHANGE, GWLP_USERDATA, LBN_SELCHANGE, LB_GETCURSEL,
         MB_ICONINFORMATION, MB_OK, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
         WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NOTIFY,
     };
@@ -1756,6 +1957,13 @@ unsafe extern "system" fn settings_wndproc(
         let win = &mut *ptr;
 
         match msg {
+            WM_APP_SHOW_SETTINGS_TAB if wparam.0 < win.tab_controls.len() => {
+                win.save_current_scene_fields();
+                win.save_current_app_rule();
+                win.select_tab(wparam.0);
+                win.populate_data();
+                LRESULT(0)
+            }
             WM_DPICHANGED => {
                 let new_dpi = ((wparam.0 & 0xFFFF) as u32).max(96);
                 if !win.applying_dpi {
@@ -1859,25 +2067,19 @@ unsafe extern "system" fn settings_wndproc(
                 let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
                 match id {
-                    IDC_BTN_OK => {
-                        let _ = win.save_changes_to_config();
-                        let _ = PostMessageW(
-                            win.parent_hwnd,
-                            WM_APP_SETTINGS_SAVED,
-                            WPARAM(Box::into_raw(Box::new(win.vm.config_draft.clone())) as usize),
-                            LPARAM(0),
-                        );
-                        let _ = DestroyWindow(hwnd);
-                        LRESULT(0)
-                    }
-                    IDC_BTN_APPLY => {
-                        let _ = win.save_changes_to_config();
-                        let _ = PostMessageW(
-                            win.parent_hwnd,
-                            WM_APP_SETTINGS_SAVED,
-                            WPARAM(Box::into_raw(Box::new(win.vm.config_draft.clone())) as usize),
-                            LPARAM(0),
-                        );
+                    IDC_BTN_OK | IDC_BTN_APPLY => {
+                        if let Err(error) = win.save_changes_to_config() {
+                            win.select_tab(SettingsTab::Shortcuts as usize);
+                            show_settings_error(hwnd, &error);
+                            return LRESULT(0);
+                        }
+                        let config = Box::into_raw(Box::new(win.vm.config_draft.clone()));
+                        if PostMessageW(win.parent_hwnd, WM_APP_SETTINGS_SAVED, WPARAM(config as usize), LPARAM(0)).is_err() {
+                            drop(Box::from_raw(config));
+                            show_settings_error(hwnd, "設定を適用できませんでした。");
+                        } else if id == IDC_BTN_OK {
+                            let _ = DestroyWindow(hwnd);
+                        }
                         LRESULT(0)
                     }
                     IDC_BTN_CANCEL => {
@@ -2014,6 +2216,84 @@ unsafe extern "system" fn settings_wndproc(
                     IDC_LCH_RESET_POS => {
                         win.vm.config_draft.launcher.position = None;
                         let _ = MessageBoxW(hwnd, w!("ランチャー位置を初期化しました。[適用] または [OK] で反映されます。"), w!("Kiri"), MB_OK | MB_ICONINFORMATION);
+                        LRESULT(0)
+                    }
+                    IDC_LCH_SHOW_BAR | IDC_LCH_CTRL_DOUBLE_TAP => {
+                        let checked = SendMessageW(dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize;
+                        if id == IDC_LCH_SHOW_BAR {
+                            win.vm.config_draft.launcher.show_bar = checked;
+                        } else {
+                            win.vm.config_draft.launcher.ctrl_double_tap = checked;
+                        }
+                        LRESULT(0)
+                    }
+
+                    IDC_SHORTCUT_KIND if code == CBN_SELCHANGE => {
+                        win.update_shortcut_browse_button();
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_LIST if code == LBN_SELCHANGE => {
+                        let index = SendMessageW(dlg_item(hwnd, IDC_SHORTCUT_LIST), LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+                        if let Err(error) = win.save_shortcut_fields(false) {
+                            win.populate_shortcut_list();
+                            show_settings_error(hwnd, error);
+                        } else {
+                            win.select_shortcut(usize::try_from(index).ok());
+                        }
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_NEW => {
+                        win.select_shortcut(None);
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(
+                            dlg_item(hwnd, IDC_SHORTCUT_NAME),
+                        );
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_UPDATE => {
+                        match win.save_shortcut_fields(true) {
+                            Ok(()) => win.populate_shortcut_list(),
+                            Err(error) => show_settings_error(hwnd, error),
+                        }
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_DELETE => {
+                        if let Some(index) = win.selected_shortcut_idx {
+                            win.vm.config_draft.shortcuts.remove(index);
+                            let len = win.vm.config_draft.shortcuts.len();
+                            win.select_shortcut(len.checked_sub(1).map(|last| index.min(last)));
+                        }
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_UP | IDC_SHORTCUT_DOWN => {
+                        if let Some(index) = win.selected_shortcut_idx {
+                            let to = if id == IDC_SHORTCUT_UP { index.checked_sub(1) } else { Some(index + 1) };
+                            if let Some(to) = to.filter(|&i| i < win.vm.config_draft.shortcuts.len()) {
+                                match win.save_shortcut_fields(true) {
+                                    Ok(()) => {
+                                        win.vm.config_draft.shortcuts.swap(index, to);
+                                        win.select_shortcut(Some(to));
+                                    }
+                                    Err(error) => show_settings_error(hwnd, error),
+                                }
+                            }
+                        }
+                        LRESULT(0)
+                    }
+                    IDC_SHORTCUT_BROWSE => {
+                        let kind = win.shortcut_kind();
+                        if kind != ShortcutKind::Website {
+                            match choose_shortcut_path(hwnd, kind) {
+                                Ok(Some(path)) => {
+                                    set_edit_text(hwnd, IDC_SHORTCUT_TARGET, &path);
+                                    if edit_text(hwnd, IDC_SHORTCUT_NAME).trim().is_empty() {
+                                        let name = std::path::Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path);
+                                        set_edit_text(hwnd, IDC_SHORTCUT_NAME, name);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => show_settings_error(hwnd, &error.to_string()),
+                            }
+                        }
                         LRESULT(0)
                     }
 

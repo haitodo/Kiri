@@ -14,11 +14,16 @@
 
 use crate::app::AppController;
 use crate::diagnostics::{log_error, log_info, log_warn};
+use crate::launcher::cursor_popup::{CursorPopup, PopupAction, WM_APP_CURSOR_POPUP_ACTION};
 use crate::launcher::input::{HitTarget, LauncherLayout};
 use crate::launcher::menu::{show_context_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
+use crate::platform::cursor_input::{
+    CursorInput, WM_APP_DISMISS_CURSOR_POPUP, WM_APP_TOGGLE_CURSOR_POPUP,
+};
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
+use crate::platform::monitors::find_monitor_for_point;
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
 use crate::scenes::switch::SwitchWarning;
 use windows::core::PWSTR;
@@ -63,6 +68,8 @@ pub struct LauncherWindowHost {
     pub hovered: HitTarget,
     pub theme: GdiThemeCache,
     pub overflow_popup: Option<Box<OverflowPopup>>,
+    cursor_input: CursorInput,
+    cursor_popup: Option<Box<CursorPopup>>,
     pub tray: Option<TrayIcon>,
     pub win_event_hook: Option<WinEventHookGuard>,
     pub registered_hotkey_count: usize,
@@ -79,8 +86,8 @@ impl LauncherWindowHost {
             WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, LoadCursorW, RegisterClassW, SetWindowLongPtrW, ShowWindow,
-            CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, SW_SHOWNOACTIVATE,
+            CreateWindowExW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
+            CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
             WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         };
 
@@ -184,6 +191,8 @@ impl LauncherWindowHost {
                 hovered: HitTarget::None,
                 theme: GdiThemeCache::new(dpi),
                 overflow_popup,
+                cursor_input: CursorInput::new(hwnd),
+                cursor_popup: None,
                 tray,
                 win_event_hook,
                 registered_hotkey_count: 0,
@@ -195,7 +204,7 @@ impl LauncherWindowHost {
             host.register_configured_hotkeys();
             host.check_startup_recovery_prompt();
 
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            host.apply_launcher_settings();
             log_info("startup", "Launcher window created and ready");
             Ok(host)
         }
@@ -258,6 +267,75 @@ impl LauncherWindowHost {
                 }
                 self.registered_hotkey_count = idx + 1;
             }
+        }
+    }
+
+    fn apply_launcher_settings(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
+
+        if let Err(error) = self.cursor_input.set_ctrl_enabled(self.app.config.launcher.ctrl_double_tap) {
+            log_warn("hotkey", &format!("Could not enable Ctrl double-tap: {error}"));
+        }
+        let command = if self.app.config.launcher.show_bar {
+            SW_SHOWNOACTIVATE
+        } else {
+            self.hide_tooltip();
+            if let Some(overflow) = &mut self.overflow_popup {
+                overflow.hide();
+            }
+            SW_HIDE
+        };
+        unsafe { let _ = ShowWindow(self.hwnd, command); }
+    }
+
+    fn toggle_cursor_popup(&mut self) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        if self.cursor_popup.as_ref().is_some_and(|popup| popup.visible) {
+            self.hide_cursor_popup();
+            return;
+        }
+        let mut cursor = POINT::default();
+        if self.drag_state.is_some() || unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            return;
+        }
+        let monitors = self.app.sys.monitors();
+        let Some(monitor) = find_monitor_for_point(cursor.x, cursor.y, &monitors) else {
+            return;
+        };
+        self.hide_tooltip();
+        if let Some(overflow) = &mut self.overflow_popup {
+            overflow.hide();
+        }
+        if self.cursor_popup.is_none() {
+            match CursorPopup::create(self.hwnd, self.theme.gdiplus.clone()) {
+                Ok(popup) => self.cursor_popup = Some(popup),
+                Err(error) => {
+                    log_error("launcher", &format!("Could not create cursor popup: {error}"));
+                    return;
+                }
+            }
+        }
+        if let Some(popup) = &mut self.cursor_popup {
+            match popup.show(cursor, monitor, &self.app.config, self.app.state_mgr.active_scene_id()) {
+                Ok(bounds) => {
+                    if let Err(error) = self.cursor_input.set_popup_bounds(Some(bounds)) {
+                        log_warn("launcher", &format!("Could not observe outside clicks: {error}"));
+                    }
+                }
+                Err(error) => {
+                    self.hide_cursor_popup();
+                    log_error("launcher", &format!("Could not show cursor popup: {error}"));
+                }
+            }
+        }
+    }
+
+    fn hide_cursor_popup(&mut self) {
+        if let Some(popup) = &mut self.cursor_popup {
+            let _ = self.cursor_input.set_popup_bounds(None);
+            popup.hide();
         }
     }
 
@@ -425,6 +503,7 @@ impl LauncherWindowHost {
             KillTimer, MessageBoxW, SetTimer, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
         };
 
+        self.hide_cursor_popup();
         let outcome = self.app.switch_to_scene(scene_id);
 
         if outcome
@@ -474,6 +553,7 @@ impl LauncherWindowHost {
         }
 
         match cmd {
+            MenuCommand::OpenCursorPopup => self.toggle_cursor_popup(),
             MenuCommand::OpenSettings => {
                 self.open_settings_dialog();
             }
@@ -510,7 +590,8 @@ impl LauncherWindowHost {
     }
 
     pub fn open_settings_dialog(&mut self) {
-        crate::settings::window::SettingsWindow::show(self.hwnd, &self.app);
+        self.hide_cursor_popup();
+        crate::settings::window::SettingsWindow::show(self.hwnd, &self.app, None);
     }
 }
 
@@ -599,6 +680,7 @@ unsafe extern "system" fn launcher_wndproc(
 
             // Section 2.1: Right-clicking anywhere on the launcher opens our context menu
             WM_NCRBUTTONUP => {
+                host.hide_cursor_popup();
                 host.hide_tooltip();
                 let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -617,6 +699,7 @@ unsafe extern "system" fn launcher_wndproc(
                 if host.drag_state.take().is_some() {
                     let _ = ReleaseCapture();
                 }
+                host.hide_cursor_popup();
                 host.hide_tooltip();
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -838,13 +921,44 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_APP_TRAYICON => {
                 let mouse_msg = (lparam.0 & 0xFFFF) as u32;
-                if mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU {
+                if mouse_msg == WM_LBUTTONUP {
+                    host.toggle_cursor_popup();
+                } else if mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU {
+                    host.hide_cursor_popup();
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     if let Some(cmd) =
                         show_context_menu(hwnd, pt.x, pt.y, host.app.config.launcher.orientation)
                     {
                         host.handle_menu_command(cmd);
+                    }
+                }
+                LRESULT(0)
+            }
+
+            WM_APP_TOGGLE_CURSOR_POPUP => {
+                if host.app.config.launcher.ctrl_double_tap {
+                    host.toggle_cursor_popup();
+                }
+                LRESULT(0)
+            }
+
+            WM_APP_DISMISS_CURSOR_POPUP => {
+                host.hide_cursor_popup();
+                LRESULT(0)
+            }
+
+            WM_APP_CURSOR_POPUP_ACTION => {
+                if let Some(action) = host.cursor_popup.as_mut().and_then(|p| p.pending_action.take()) {
+                    host.hide_cursor_popup();
+                    match action {
+                        PopupAction::SwitchScene(scene_id) => host.trigger_scene_switch(&scene_id),
+                        PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
+                        PopupAction::OpenSettings => crate::settings::window::SettingsWindow::show(
+                            hwnd,
+                            &host.app,
+                            Some(crate::settings::SettingsTab::Shortcuts),
+                        ),
                     }
                 }
                 LRESULT(0)
@@ -858,18 +972,21 @@ unsafe extern "system" fn launcher_wndproc(
             WM_APP_SETTINGS_SAVED => {
                 let ptr = wparam.0 as *mut crate::config::AppConfig;
                 if !ptr.is_null() {
+                    host.hide_cursor_popup();
                     let new_cfg = *Box::from_raw(ptr);
                     host.app.config = new_cfg;
                     let _ = host.app.config_mgr.save(&host.app.config);
                     let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                     host.apply_window_bounds(x, y, w, h);
                     host.register_configured_hotkeys();
+                    host.apply_launcher_settings();
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
             }
 
             WM_APP_RESTORE_ALL => {
+                host.hide_cursor_popup();
                 host.app.restore_all_minimized_windows();
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
@@ -889,6 +1006,10 @@ unsafe extern "system" fn launcher_wndproc(
             // Section 7.2: Aggregate rapid DPI / display / power / session change notifications via one-shot timer
             // when not actively dragging or programmatically applying bounds.
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
+                host.hide_cursor_popup();
+                if msg == WM_WTSSESSION_CHANGE || msg == WM_POWERBROADCAST {
+                    host.cursor_input.reset_gesture();
+                }
                 if host.drag_state.is_none() && !host.applying_bounds {
                     let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
                     let _ = SetTimer(hwnd, TIMER_DISPLAY_DEBOUNCE, 200, None);

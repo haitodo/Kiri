@@ -10,6 +10,7 @@ use crate::config::Orientation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
+    OpenCursorPopup,
     OpenSettings,
     ToggleOrientation,
     ResetPosition,
@@ -26,6 +27,7 @@ const IDM_SAVE_LAYOUT: usize = 2004;
 const IDM_RESTORE_LAYOUT: usize = 2005;
 const IDM_RESTORE_ALL_MINIMIZED: usize = 2006;
 const IDM_EXIT: usize = 2007;
+const IDM_CURSOR_POPUP: usize = 2008;
 
 #[cfg(windows)]
 pub fn show_context_menu(
@@ -45,6 +47,7 @@ pub fn show_context_menu(
     unsafe {
         let hmenu = CreatePopupMenu().ok()?;
 
+        let _ = AppendMenuW(hmenu, MF_STRING, IDM_CURSOR_POPUP, w!("ランチャーを開く(&K)"));
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, w!("設定(&S)..."));
         let orient_label = match current_orientation {
             Orientation::Horizontal => w!("縦型へ切替(&O)"),
@@ -93,6 +96,7 @@ pub fn show_context_menu(
         let _ = DestroyMenu(hmenu);
 
         match cmd_id.0 as usize {
+            IDM_CURSOR_POPUP => Some(MenuCommand::OpenCursorPopup),
             IDM_SETTINGS => Some(MenuCommand::OpenSettings),
             IDM_TOGGLE_ORIENTATION => Some(MenuCommand::ToggleOrientation),
             IDM_RESET_POSITION => Some(MenuCommand::ResetPosition),

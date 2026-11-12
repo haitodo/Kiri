@@ -4,6 +4,8 @@
 //! the scene switching engine, window matching, ambiguity detection, and recovery journal
 //! remain 100% pure logic testable with `FakeWindowSystem`.
 
+#[cfg(windows)]
+pub mod cursor_input;
 pub mod fake;
 pub mod hooks;
 pub mod monitors;

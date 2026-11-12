@@ -40,6 +40,10 @@ fn default_dpi() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LauncherConfig {
+    #[serde(default = "default_true")]
+    pub show_bar: bool,
+    #[serde(default = "default_true")]
+    pub ctrl_double_tap: bool,
     #[serde(default)]
     pub orientation: Orientation,
     #[serde(default = "default_button_size_dip")]
@@ -78,6 +82,8 @@ fn default_true() -> bool {
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
+            show_bar: true,
+            ctrl_double_tap: true,
             orientation: Orientation::Horizontal,
             button_size_dip: 32,
             grip_size_dip: 18,
@@ -129,6 +135,58 @@ pub struct Scene {
     pub icon: String,
     pub order: i32,
     pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutKind {
+    Folder,
+    File,
+    Website,
+}
+
+impl ShortcutKind {
+    pub const ALL: [Self; 3] = [Self::Folder, Self::File, Self::Website];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "フォルダー",
+            Self::File => "ファイル",
+            Self::Website => "サイト",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shortcut {
+    pub name: String,
+    pub kind: ShortcutKind,
+    pub target: String,
+}
+
+impl Shortcut {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() || self.name.chars().any(char::is_control) {
+            return Err("ショートカットの表示名を入力してください。");
+        }
+        if self.target.chars().any(char::is_control) {
+            return Err("場所に改行などの制御文字は使えません。");
+        }
+        match self.kind {
+            ShortcutKind::Folder | ShortcutKind::File if !Path::new(&self.target).is_absolute() => {
+                Err("フォルダーまたはファイルの絶対パスを入力してください。")
+            }
+            ShortcutKind::Website => {
+                let valid = self.target.split_once("://").is_some_and(|(scheme, rest)| {
+                    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                        && !rest.split(['/', '?', '#']).next().unwrap_or_default().is_empty()
+                        && !self.target.chars().any(char::is_whitespace)
+                });
+                valid.then_some(()).ok_or("http:// または https:// で始まる URL を入力してください。")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +359,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub scenes: Vec<Scene>,
     #[serde(default)]
+    pub shortcuts: Vec<Shortcut>,
+    #[serde(default)]
     pub bindings: Vec<WindowBinding>,
     #[serde(default)]
     pub hotkeys: Vec<HotkeyBinding>,
@@ -346,6 +406,7 @@ impl AppConfig {
                     pinned: true,
                 },
             ],
+            shortcuts: Vec::new(),
             bindings: vec![WindowBinding {
                 id: "example-mt5".to_string(),
                 match_rule: WindowMatch {
@@ -600,6 +661,7 @@ impl ConfigManager {
             "launcher",
             "target",
             "scenes",
+            "shortcuts",
             "bindings",
             "hotkeys",
             "layouts",
@@ -772,6 +834,34 @@ mod tests {
         assert!(mgr.save(&loaded).is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortcut_settings_round_trip_with_legacy_launcher_defaults() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{"schema_version":1,"launcher":{"orientation":"vertical"}}"#,
+        ).unwrap();
+        assert!(config.launcher.show_bar);
+        assert!(config.launcher.ctrl_double_tap);
+        assert_eq!(config.launcher.orientation, Orientation::Vertical);
+        assert!(config.shortcuts.is_empty());
+
+        config.launcher.show_bar = false;
+        config.launcher.ctrl_double_tap = false;
+        config.shortcuts = vec![Shortcut {
+            name: "プロジェクト".to_owned(),
+            kind: ShortcutKind::Folder,
+            target: r"D:\作業\Kiri Project".to_owned(),
+        }, Shortcut {
+            name: "GitHub".to_owned(),
+            kind: ShortcutKind::Website,
+            target: "https://github.com/".to_owned(),
+        }];
+        #[cfg(windows)]
+        assert!(config.shortcuts[0].validate().is_ok());
+        assert!(config.shortcuts[1].validate().is_ok());
+        let saved = serde_json::to_vec(&config).unwrap();
+        assert_eq!(serde_json::from_slice::<AppConfig>(&saved).unwrap(), config);
     }
 
     #[test]

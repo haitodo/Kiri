@@ -23,6 +23,14 @@
       ],
       "additionalProperties": true,
       "properties": {
+        "show_bar": {
+          "type": "boolean",
+          "default": true
+        },
+        "ctrl_double_tap": {
+          "type": "boolean",
+          "default": true
+        },
         "orientation": {
           "type": "string",
           "enum": ["horizontal", "vertical"]
@@ -104,6 +112,19 @@
           "icon": { "type": "string" },
           "order": { "type": "integer" },
           "pinned": { "type": "boolean" }
+        }
+      }
+    },
+    "shortcuts": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "target"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["folder", "file", "website"] },
+          "target": { "type": "string", "minLength": 1 }
         }
       }
     },
