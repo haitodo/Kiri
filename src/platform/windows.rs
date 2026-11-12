@@ -105,7 +105,7 @@ impl WindowSystem for Win32WindowSystem {
     fn show_window_async(&mut self, hwnd_val: u64, cmd: ShowCmd) -> Result<(), PlatformError> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindow, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE,
+            IsWindow, ShowWindow, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE,
             SW_SHOWNOACTIVATE,
         };
 
@@ -122,7 +122,17 @@ impl WindowSystem for Win32WindowSystem {
                 ShowCmd::RestoreActivate => SW_RESTORE,
             };
 
-            let _ = ShowWindowAsync(hwnd, n_cmd);
+            // For restore operations, use ShowWindow synchronously so the window immediately
+            // exits iconic state before subsequent bring_to_top / set_foreground_window calls.
+            // For minimize operations, use ShowWindowAsync to prevent blocking if an app is slow.
+            match cmd {
+                ShowCmd::RestoreActivate | ShowCmd::RestoreNoActivate => {
+                    let _ = ShowWindow(hwnd, n_cmd);
+                }
+                _ => {
+                    let _ = ShowWindowAsync(hwnd, n_cmd);
+                }
+            }
             Ok(())
         }
     }
@@ -130,11 +140,15 @@ impl WindowSystem for Win32WindowSystem {
     fn bring_to_top(&mut self, hwnd_val: u64) -> bool {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-            SWP_SHOWWINDOW,
+            BringWindowToTop, IsIconic, SetWindowPos, ShowWindow, HWND_TOP, SW_RESTORE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
         };
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
+            // If the window is still iconic, restore it immediately so SetWindowPos succeeds
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
             let _ = SetWindowPos(
                 hwnd,
                 HWND_TOP,
@@ -142,7 +156,7 @@ impl WindowSystem for Win32WindowSystem {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             );
             BringWindowToTop(hwnd).is_ok()
         }
@@ -170,6 +184,12 @@ impl WindowSystem for Win32WindowSystem {
 
         let target_hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
+            if windows::Win32::UI::WindowsAndMessaging::IsIconic(target_hwnd).as_bool() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    target_hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+                );
+            }
             let _ = SetWindowPos(
                 target_hwnd,
                 HWND_TOP,

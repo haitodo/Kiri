@@ -1084,4 +1084,132 @@ mod tests {
 
         let _ = std::fs::remove_file(jpath);
     }
+
+    #[test]
+    fn test_switch_trading_environment_maximized_main_window_with_overlay_tools() {
+        let mut cfg = setup_standard_config();
+        // Add QuickOrder (70) and TickScope (80) to "trade"
+        cfg.bindings.push(WindowBinding {
+            id: "quick_order".to_string(),
+            match_rule: WindowMatch {
+                exe_path: r"C:\Program Files\QuickOrder\quick.exe".to_string(),
+                window_class: "SunAwtFrame".to_string(),
+                title_rule: TitleRule::any(),
+                aumid: None,
+                monitor_id: None,
+            },
+            instance_hint: None,
+            scene_ids: vec!["trade".to_string()],
+            always_visible: false,
+            enabled: true,
+        });
+        cfg.bindings.push(WindowBinding {
+            id: "tick_scope".to_string(),
+            match_rule: WindowMatch {
+                exe_path: r"C:\Apps\TickScope\tick.exe".to_string(),
+                window_class: "Window Class".to_string(),
+                title_rule: TitleRule::any(),
+                aumid: None,
+                monitor_id: None,
+            },
+            instance_hint: None,
+            scene_ids: vec!["trade".to_string()],
+            always_visible: false,
+            enabled: true,
+        });
+
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+
+        // Pre-switch state on MON-2-TARGET:
+        // In real Win32 Z-order, topmost is index 0.
+        // In trade scene, TickScope (80) is topmost tool, QuickOrder (70) is under it,
+        // MT5 (20) is maximized under tools, and Chrome (99) was opened while in another scene.
+        let mut ts = make_win(
+            80,
+            800,
+            r"C:\Apps\TickScope\tick.exe",
+            "Window Class",
+            "TickScope Live",
+            "MON-2-TARGET",
+        );
+        ts.is_iconic = true;
+        sys.add_window(ts); // z=0
+
+        let mut qo = make_win(
+            70,
+            700,
+            r"C:\Program Files\QuickOrder\quick.exe",
+            "SunAwtFrame",
+            "Quick Order Panel",
+            "MON-2-TARGET",
+        );
+        qo.is_iconic = true;
+        sys.add_window(qo); // z=1
+
+        let mut mt5 = make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5 - Maximized Chart",
+            "MON-2-TARGET",
+        );
+        mt5.is_iconic = true;
+        mt5.is_maximized = true;
+        sys.add_window(mt5); // z=2
+
+        let chrome = make_win(
+            99,
+            999,
+            r"C:\Program Files\Google\Chrome\chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Google Chrome",
+            "MON-2-TARGET",
+        );
+        sys.add_window(chrome); // z=3
+
+        // Chrome (99) is foreground
+        sys.foreground_hwnd = Some(99);
+
+        let mut state_mgr = SceneStateManager::new(Some("code".to_string()));
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("trade_env_test");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+
+        // Switch to "trade"
+        let out = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+
+        assert!(out.switched);
+        assert_eq!(out.restored_hwnds.len(), 3);
+        assert!(!sys.query_window(20).unwrap().is_iconic);
+        assert!(!sys.query_window(70).unwrap().is_iconic);
+        assert!(!sys.query_window(80).unwrap().is_iconic);
+
+        // All 3 trading windows (20, 70, 80) must be brought in front of Chrome (99)!
+        let z_mt5 = sys.windows.iter().position(|w| w.hwnd == 20).unwrap();
+        let z_qo = sys.windows.iter().position(|w| w.hwnd == 70).unwrap();
+        let z_ts = sys.windows.iter().position(|w| w.hwnd == 80).unwrap();
+        let z_chrome = sys.windows.iter().position(|w| w.hwnd == 99).unwrap();
+
+        assert!(z_mt5 < z_chrome, "MT5 (z={}) must be in front of Chrome (z={})", z_mt5, z_chrome);
+        assert!(z_qo < z_chrome, "QuickOrder (z={}) must be in front of Chrome (z={})", z_qo, z_chrome);
+        assert!(z_ts < z_chrome, "TickScope (z={}) must be in front of Chrome (z={})", z_ts, z_chrome);
+
+        // MT5 is the background maximized window; tools (QO, TS) are in front of MT5!
+        assert!(z_ts < z_mt5, "TickScope (z={}) must be in front of MT5 (z={})", z_ts, z_mt5);
+        assert!(z_qo < z_mt5, "QuickOrder (z={}) must be in front of MT5 (z={})", z_qo, z_mt5);
+
+        // Topmost tool received foreground focus
+        assert_eq!(sys.get_foreground_window(), Some(80));
+
+        let _ = std::fs::remove_file(jpath);
+    }
 }

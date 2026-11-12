@@ -497,9 +497,8 @@ pub fn execute_scene_switch(
     // Step 8: Restore `to_restore` windows from bottom to top of Z-order
     let mut restored_hwnds = Vec::new();
     let mut verification_restored = Vec::new();
-    let total_restore = to_restore.len();
 
-    for (idx, (binding_id, win, _z)) in to_restore.iter().enumerate() {
+    for (binding_id, win, _z) in &to_restore {
         // Section 5.3: Always re-verify `is_iconic` immediately before sending restore command
         let still_iconic = sys
             .query_window(win.hwnd)
@@ -510,11 +509,9 @@ pub fn execute_scene_switch(
             continue;
         }
 
-        let is_topmost_restore = idx + 1 == total_restore;
-        let cmd = if config.launcher.focus_on_switch
-            && is_topmost_restore
-            && deferred_foreground_minimize.is_none()
-        {
+        let cmd = if config.launcher.focus_on_switch && deferred_foreground_minimize.is_none() {
+            // In normal switch, activate restored windows (especially maximized windows like MT5)
+            // so Windows DWM never pushes them behind previously open or active background windows.
             ShowCmd::RestoreActivate
         } else {
             ShowCmd::RestoreNoActivate
