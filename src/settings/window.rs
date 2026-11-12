@@ -12,12 +12,20 @@ use crate::settings::{set_autostart_enabled, SettingsViewModel};
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(windows)]
+use windows::Win32::UI::Controls::{
+    LVN_ITEMCHANGED, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
+    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMITEMACTIVATE, NMLISTVIEW, WC_LISTVIEWW,
+};
+
 pub const WM_APP_SETTINGS_SAVED: u32 = 0x8000 + 5;
 
 static ACTIVE_SETTINGS_HWND: AtomicUsize = AtomicUsize::new(0);
 
 const BST_UNCHECKED: usize = 0;
 const BST_CHECKED: usize = 1;
+
+const NM_CLICK: u32 = 0u32.wrapping_sub(2); // 0xFFFFFFFE
 
 // Control IDs
 const IDC_TAB_CONTROL: usize = 100;
@@ -36,18 +44,18 @@ const IDC_SCENE_NAME: usize = 207;
 const IDC_SCENE_ICON: usize = 208;
 const IDC_SCENE_PINNED: usize = 209;
 const IDC_SCENE_UPDATE: usize = 210;
+const IDC_SCENE_APPS_LIST: usize = 211;
+const IDC_SCENE_APP_UNBIND: usize = 212;
 
-// Tab 1 (Windows)
-const IDC_WIN_LIST: usize = 301;
-const IDC_WIN_SCENE_COMBO: usize = 302;
-const IDC_WIN_BIND: usize = 303;
-const IDC_WIN_UNBIND: usize = 304;
-const IDC_WIN_ALWAYS_VISIBLE: usize = 305;
-const IDC_WIN_REFRESH: usize = 306;
-const IDC_WIN_DETAILS: usize = 307;
-const IDC_WIN_TITLE_KEYWORD: usize = 308;
-const IDC_WIN_MATCH_MONITOR: usize = 309;
-const IDC_WIN_UNBIND_SCENE: usize = 310;
+// Tab 1 (Apps & Scenes Matrix)
+const IDC_APP_MATRIX_LIST: usize = 301;
+const IDC_APP_ADD_WINDOW: usize = 302;
+const IDC_APP_DELETE: usize = 303;
+const IDC_APP_REFRESH: usize = 304;
+const IDC_APP_TITLE_KEYWORD: usize = 305;
+const IDC_APP_MATCH_MONITOR: usize = 306;
+const IDC_APP_APPLY_RULE: usize = 307;
+const IDC_APP_DETAILS: usize = 308;
 
 // Tab 2 (Launcher)
 const IDC_LCH_ORIENT_COMBO: usize = 401;
@@ -67,6 +75,15 @@ const IDC_BEH_RESTORE_ALL: usize = 504;
 const IDC_BEH_OPEN_FOLDER: usize = 505;
 const IDC_BEH_RESTORE_ALL_ON_SWITCH: usize = 506;
 
+// Add Window Subdialog IDs
+const IDC_ADDWIN_LIST: usize = 601;
+const IDC_ADDWIN_SCENE_COMBO: usize = 602;
+const IDC_ADDWIN_ALWAYS_VISIBLE: usize = 603;
+const IDC_ADDWIN_PIN_MONITOR: usize = 604;
+const IDC_ADDWIN_KEYWORD: usize = 605;
+const IDC_ADDWIN_BTN_ADD: usize = 606;
+const IDC_ADDWIN_BTN_CLOSE: usize = 607;
+
 const SETTINGS_CLIENT_W_DIP: i32 = 820;
 const SETTINGS_CLIENT_H_DIP: i32 = 560;
 
@@ -76,6 +93,7 @@ pub enum ControlKind {
     ListBox,
     ComboBox,
     TabControl,
+    ListView,
 }
 
 #[cfg(windows)]
@@ -95,7 +113,7 @@ pub struct SettingsWindow {
     pub parent_hwnd: windows::Win32::Foundation::HWND,
     pub vm: SettingsViewModel,
     pub selected_scene_idx: Option<usize>,
-    pub selected_window_idx: Option<usize>,
+    pub selected_app_idx: Option<usize>,
     pub tab_controls: [Vec<windows::Win32::Foundation::HWND>; 4],
     pub control_layouts: Vec<ControlDipLayout>,
     pub hfont: windows::Win32::Graphics::Gdi::HFONT,
@@ -295,7 +313,7 @@ impl SettingsWindow {
                 parent_hwnd,
                 vm,
                 selected_scene_idx: None,
-                selected_window_idx: None,
+                selected_app_idx: None,
                 tab_controls: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
                 control_layouts: Vec::with_capacity(48),
                 hfont: windows::Win32::Graphics::Gdi::HFONT::default(),
@@ -387,7 +405,7 @@ impl SettingsWindow {
             ControlKind::TabControl,
         );
 
-        let tab_titles = [w!("シーン"), w!("ウィンドウ"), w!("ランチャー"), w!("動作")];
+        let tab_titles = [w!("シーン"), w!("アプリとシーン"), w!("ランチャー"), w!("動作")];
         for (i, title) in tab_titles.iter().enumerate() {
             let mut item = TCITEMW {
                 mask: TCIF_TEXT,
@@ -444,9 +462,9 @@ impl SettingsWindow {
             w!("登録済みシーン一覧:"),
             0,
             28,
-            50,
-            250,
-            24,
+            48,
+            260,
+            22,
             0,
             ControlKind::Standard,
         ));
@@ -455,9 +473,9 @@ impl SettingsWindow {
             w!(""),
             WS_BORDER.0 | WS_VSCROLL.0 | (LBS_NOTIFY as u32) | (LBS_NOINTEGRALHEIGHT as u32),
             28,
-            78,
+            74,
             260,
-            356,
+            360,
             IDC_SCENE_LIST,
             ControlKind::ListBox,
         );
@@ -468,7 +486,7 @@ impl SettingsWindow {
             w!("新規作成"),
             BS_PUSHBUTTON as u32,
             28,
-            444,
+            442,
             88,
             32,
             IDC_SCENE_ADD,
@@ -478,8 +496,8 @@ impl SettingsWindow {
             w!("BUTTON"),
             w!("削除"),
             BS_PUSHBUTTON as u32,
-            122,
-            444,
+            120,
+            442,
             72,
             32,
             IDC_SCENE_DEL,
@@ -489,9 +507,9 @@ impl SettingsWindow {
             w!("BUTTON"),
             w!("↑"),
             BS_PUSHBUTTON as u32,
-            200,
-            444,
-            42,
+            196,
+            442,
+            44,
             32,
             IDC_SCENE_UP,
             ControlKind::Standard,
@@ -500,9 +518,9 @@ impl SettingsWindow {
             w!("BUTTON"),
             w!("↓"),
             BS_PUSHBUTTON as u32,
-            246,
-            444,
-            42,
+            244,
+            442,
+            44,
             32,
             IDC_SCENE_DOWN,
             ControlKind::Standard,
@@ -513,10 +531,10 @@ impl SettingsWindow {
             w!("STATIC"),
             w!("シーンID:"),
             0,
-            312,
-            78,
-            200,
-            24,
+            308,
+            48,
+            140,
+            20,
             0,
             ControlKind::Standard,
         ));
@@ -524,9 +542,9 @@ impl SettingsWindow {
             w!("EDIT"),
             w!(""),
             WS_BORDER.0 | (ES_READONLY as u32),
-            312,
-            104,
-            280,
+            308,
+            70,
+            150,
             28,
             IDC_SCENE_ID,
             ControlKind::Standard,
@@ -536,10 +554,10 @@ impl SettingsWindow {
             w!("STATIC"),
             w!("表示名:"),
             0,
-            312,
-            146,
-            200,
-            24,
+            470,
+            48,
+            140,
+            20,
             0,
             ControlKind::Standard,
         ));
@@ -547,11 +565,23 @@ impl SettingsWindow {
             w!("EDIT"),
             w!(""),
             WS_BORDER.0 | (ES_AUTOHSCROLL as u32),
-            312,
-            172,
-            280,
+            470,
+            70,
+            170,
             28,
             IDC_SCENE_NAME,
+            ControlKind::Standard,
+        ));
+
+        t0.push(create_ctrl(
+            w!("BUTTON"),
+            w!("名前を更新"),
+            BS_PUSHBUTTON as u32,
+            650,
+            70,
+            138,
+            28,
+            IDC_SCENE_UPDATE,
             ControlKind::Standard,
         ));
 
@@ -559,10 +589,10 @@ impl SettingsWindow {
             w!("STATIC"),
             w!("アイコン (chart / code / globe または .ico パス):"),
             0,
-            312,
-            214,
-            470,
-            24,
+            308,
+            106,
+            480,
+            20,
             0,
             ControlKind::Standard,
         ));
@@ -570,9 +600,9 @@ impl SettingsWindow {
             w!("EDIT"),
             w!(""),
             WS_BORDER.0 | (ES_AUTOHSCROLL as u32),
-            312,
-            240,
-            470,
+            308,
+            128,
+            480,
             28,
             IDC_SCENE_ICON,
             ControlKind::Standard,
@@ -582,88 +612,130 @@ impl SettingsWindow {
             w!("BUTTON"),
             w!("ランチャーに固定表示する (pinned)"),
             BS_AUTOCHECKBOX as u32,
-            312,
-            286,
-            420,
-            28,
+            308,
+            166,
+            320,
+            26,
             IDC_SCENE_PINNED,
             ControlKind::Standard,
         ));
+
+        t0.push(create_ctrl(
+            w!("STATIC"),
+            w!("このシーンに登録されているアプリ:"),
+            0,
+            308,
+            202,
+            480,
+            20,
+            0,
+            ControlKind::Standard,
+        ));
+        let scene_apps_list = create_ctrl(
+            w!("LISTBOX"),
+            w!(""),
+            WS_BORDER.0 | WS_VSCROLL.0 | (LBS_NOTIFY as u32) | (LBS_NOINTEGRALHEIGHT as u32),
+            308,
+            226,
+            480,
+            208,
+            IDC_SCENE_APPS_LIST,
+            ControlKind::ListBox,
+        );
+        t0.push(scene_apps_list);
+
         t0.push(create_ctrl(
             w!("BUTTON"),
-            w!("変更を反映"),
+            w!("このシーンから外す"),
             BS_PUSHBUTTON as u32,
-            312,
-            330,
-            130,
-            34,
-            IDC_SCENE_UPDATE,
+            618,
+            442,
+            170,
+            32,
+            IDC_SCENE_APP_UNBIND,
             ControlKind::Standard,
         ));
         self.tab_controls[0] = t0;
 
-        // ===================== Tab 1: Windows =====================
+        // ===================== Tab 1: Apps & Scenes Matrix =====================
         let mut t1 = Vec::new();
         t1.push(create_ctrl(
             w!("STATIC"),
-            w!("開いているトップレベルウィンドウ一覧 (左右モニター対応):"),
+            w!("登録アプリとシーン対応表 (セルクリックで ☑/☐ 切替):"),
             0,
             28,
-            50,
-            540,
+            48,
+            380,
             24,
             0,
+            ControlKind::Standard,
+        ));
+        t1.push(create_ctrl(
+            w!("BUTTON"),
+            w!("＋ ウィンドウから追加…"),
+            BS_PUSHBUTTON as u32,
+            418,
+            44,
+            186,
+            30,
+            IDC_APP_ADD_WINDOW,
+            ControlKind::Standard,
+        ));
+        t1.push(create_ctrl(
+            w!("BUTTON"),
+            w!("登録解除"),
+            BS_PUSHBUTTON as u32,
+            614,
+            44,
+            90,
+            30,
+            IDC_APP_DELETE,
             ControlKind::Standard,
         ));
         t1.push(create_ctrl(
             w!("BUTTON"),
             w!("一覧更新"),
             BS_PUSHBUTTON as u32,
-            682,
+            712,
             44,
-            110,
+            80,
             30,
-            IDC_WIN_REFRESH,
+            IDC_APP_REFRESH,
             ControlKind::Standard,
         ));
 
-        let win_list = create_ctrl(
-            w!("LISTBOX"),
+        let matrix_list = create_ctrl(
+            WC_LISTVIEWW,
             w!(""),
             WS_BORDER.0
                 | WS_VSCROLL.0
                 | WS_HSCROLL.0
-                | (LBS_NOTIFY as u32)
-                | (LBS_NOINTEGRALHEIGHT as u32),
+                | (LVS_REPORT as u32)
+                | (LVS_SINGLESEL as u32)
+                | (LVS_SHOWSELALWAYS as u32),
             28,
-            78,
+            80,
             764,
-            192,
-            IDC_WIN_LIST,
-            ControlKind::ListBox,
+            256,
+            IDC_APP_MATRIX_LIST,
+            ControlKind::ListView,
         );
-        t1.push(win_list);
-
-        t1.push(create_ctrl(
-            w!("EDIT"),
-            w!(""),
-            WS_BORDER.0 | (ES_MULTILINE as u32) | (ES_READONLY as u32) | WS_VSCROLL.0,
-            28,
-            278,
-            764,
-            92,
-            IDC_WIN_DETAILS,
-            ControlKind::Standard,
-        ));
+        let _ = SendMessageW(
+            matrix_list,
+            LVM_SETEXTENDEDLISTVIEWSTYLE,
+            WPARAM(0),
+            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+        );
+        t1.push(matrix_list);
 
         t1.push(create_ctrl(
             w!("STATIC"),
             w!("再起動時の識別キーワード (空欄=タイトル不問):"),
             0,
             28,
-            386,
-            315,
-            24,
+            344,
+            320,
+            20,
             0,
             ControlKind::Standard,
         ));
@@ -671,89 +743,45 @@ impl SettingsWindow {
             w!("EDIT"),
             w!(""),
             WS_BORDER.0 | (ES_AUTOHSCROLL as u32),
-            346,
-            382,
-            200,
             28,
-            IDC_WIN_TITLE_KEYWORD,
+            366,
+            320,
+            28,
+            IDC_APP_TITLE_KEYWORD,
             ControlKind::Standard,
         ));
         t1.push(create_ctrl(
             w!("BUTTON"),
             w!("配置モニター(左/右)で識別する"),
             BS_AUTOCHECKBOX as u32,
-            556,
-            382,
-            236,
+            360,
+            366,
+            260,
             28,
-            IDC_WIN_MATCH_MONITOR,
+            IDC_APP_MATCH_MONITOR,
+            ControlKind::Standard,
+        ));
+        t1.push(create_ctrl(
+            w!("BUTTON"),
+            w!("条件を更新"),
+            BS_PUSHBUTTON as u32,
+            630,
+            366,
+            162,
+            28,
+            IDC_APP_APPLY_RULE,
             ControlKind::Standard,
         ));
 
         t1.push(create_ctrl(
-            w!("STATIC"),
-            w!("対象シーン:"),
-            0,
-            28,
-            430,
-            88,
-            24,
-            0,
-            ControlKind::Standard,
-        ));
-        t1.push(create_ctrl(
-            w!("COMBOBOX"),
+            w!("EDIT"),
             w!(""),
-            CBS_DROPDOWNLIST as u32,
-            118,
-            426,
-            156,
-            220,
-            IDC_WIN_SCENE_COMBO,
-            ControlKind::ComboBox,
-        ));
-        t1.push(create_ctrl(
-            w!("BUTTON"),
-            w!("常時表示"),
-            BS_AUTOCHECKBOX as u32,
-            282,
-            428,
-            96,
+            WS_BORDER.0 | (ES_MULTILINE as u32) | (ES_READONLY as u32) | WS_VSCROLL.0,
             28,
-            IDC_WIN_ALWAYS_VISIBLE,
-            ControlKind::Standard,
-        ));
-        t1.push(create_ctrl(
-            w!("BUTTON"),
-            w!("シーンに追加/更新"),
-            BS_PUSHBUTTON as u32,
-            382,
-            424,
-            146,
-            32,
-            IDC_WIN_BIND,
-            ControlKind::Standard,
-        ));
-        t1.push(create_ctrl(
-            w!("BUTTON"),
-            w!("選択シーンから解除"),
-            BS_PUSHBUTTON as u32,
-            534,
-            424,
-            150,
-            32,
-            IDC_WIN_UNBIND_SCENE,
-            ControlKind::Standard,
-        ));
-        t1.push(create_ctrl(
-            w!("BUTTON"),
-            w!("全解除"),
-            BS_PUSHBUTTON as u32,
-            690,
-            424,
-            102,
-            32,
-            IDC_WIN_UNBIND,
+            402,
+            764,
+            76,
+            IDC_APP_DETAILS,
             ControlKind::Standard,
         ));
         self.tab_controls[1] = t1;
@@ -1049,7 +1077,7 @@ impl SettingsWindow {
                         LPARAM(combo_item_h as isize),
                     );
                 }
-                ControlKind::TabControl | ControlKind::Standard => {}
+                ControlKind::TabControl | ControlKind::Standard | ControlKind::ListView => {}
             }
 
             let _ = SetWindowPos(
@@ -1156,85 +1184,405 @@ impl SettingsWindow {
     }
 
     pub fn populate_data(&mut self) {
-        use windows::core::PCWSTR;
+        self.populate_scenes_tab();
+        self.populate_app_matrix();
+        self.populate_launcher_tab();
+        self.populate_behavior_tab();
+    }
+
+    pub fn populate_scenes_tab(&mut self) {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SendMessageW, SetWindowTextW, BM_SETCHECK, CB_ADDSTRING, CB_RESETCONTENT, CB_SETCURSEL,
-            LB_ADDSTRING, LB_RESETCONTENT, LB_SETCURSEL,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{LB_ADDSTRING, LB_RESETCONTENT, LB_SETCURSEL, SendMessageW};
 
         unsafe {
-            // Tab 0: Scene list
             let h_list = dlg_item(self.hwnd, IDC_SCENE_LIST);
             let _ = SendMessageW(h_list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
             for scene in &self.vm.config_draft.scenes {
                 let pin_mark = if scene.pinned { "📌" } else { "  " };
-                let text = format!("{} #{}: {} [{}]", pin_mark, scene.order, scene.name, scene.id);
+                let app_count = self
+                    .vm
+                    .binding_rows
+                    .iter()
+                    .filter(|b| b.bound_scene_ids.iter().any(|id| id == &scene.id))
+                    .count();
+                let text = format!("{} #{}: {} ({}アプリ)", pin_mark, scene.order, scene.name, app_count);
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SendMessageW(h_list, LB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
             }
             if !self.vm.config_draft.scenes.is_empty() {
-                let _ = SendMessageW(h_list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-                self.selected_scene_idx = Some(0);
-                self.load_selected_scene_details(0);
+                let cur = self.selected_scene_idx.unwrap_or(0).min(self.vm.config_draft.scenes.len().saturating_sub(1));
+                let _ = SendMessageW(h_list, LB_SETCURSEL, WPARAM(cur), LPARAM(0));
+                self.selected_scene_idx = Some(cur);
+                self.load_selected_scene_details(cur);
             }
+        }
+    }
 
-            // Tab 1: Windows list & Scene combo
-            let h_win_list = dlg_item(self.hwnd, IDC_WIN_LIST);
-            let _ = SendMessageW(h_win_list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            for row in &self.vm.candidate_windows {
-                let warn_tag = if !row.warnings.is_empty() { " ⚠️警告あり" } else { "" };
-                let bound_str = if row.bound_scene_ids.is_empty() {
-                    "未登録".to_string()
-                } else {
-                    row.bound_scene_ids.join(",")
+    pub fn load_selected_scene_details(&mut self, idx: usize) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, SetWindowTextW, BM_SETCHECK, LB_ADDSTRING, LB_RESETCONTENT,
+        };
+
+        if let Some(scene) = self.vm.config_draft.scenes.get(idx) {
+            unsafe {
+                let set_txt = |id: usize, val: &str| {
+                    let h = dlg_item(self.hwnd, id);
+                    let w: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
+                    let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
                 };
-                let mon_label = self.vm.format_monitor_short_label(&row.instance.monitor_id);
-                let exe_name = std::path::Path::new(&row.instance.exe_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&row.instance.exe_path);
-                let text = format!(
-                    "[{}] [シーン: {}] {} ({}){}",
-                    mon_label, bound_str, row.instance.title, exe_name, warn_tag
+                set_txt(IDC_SCENE_ID, &scene.id);
+                set_txt(IDC_SCENE_NAME, &scene.name);
+                set_txt(IDC_SCENE_ICON, &scene.icon);
+
+                let h_chk = dlg_item(self.hwnd, IDC_SCENE_PINNED);
+                let st = if scene.pinned { BST_CHECKED } else { BST_UNCHECKED };
+                let _ = SendMessageW(h_chk, BM_SETCHECK, WPARAM(st), LPARAM(0));
+
+                // Populate scene apps list
+                let h_apps_list = dlg_item(self.hwnd, IDC_SCENE_APPS_LIST);
+                let _ = SendMessageW(h_apps_list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+                for b in &self.vm.binding_rows {
+                    if b.bound_scene_ids.iter().any(|id| id == &scene.id) {
+                        let run_mark = if b.is_running { "● 起動中" } else { "○ 未起動" };
+                        let av_mark = if b.always_visible { " [常時表示]" } else { "" };
+                        let txt = format!(
+                            "[{}] {} ({}) [所在: {}]{}",
+                            run_mark, b.window_title, b.exe_name, b.monitor_label, av_mark
+                        );
+                        let w_txt: Vec<u16> = txt.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = SendMessageW(h_apps_list, LB_ADDSTRING, WPARAM(0), LPARAM(w_txt.as_ptr() as isize));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn save_current_scene_fields(&mut self) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, SendMessageW, BM_GETCHECK};
+
+        if let Some(idx) = self.selected_scene_idx {
+            if let Some(scene) = self.vm.config_draft.scenes.get_mut(idx) {
+                unsafe {
+                    let get_text = |ctrl_id: usize| -> String {
+                        let h = dlg_item(self.hwnd, ctrl_id);
+                        let mut buf = [0u16; 256];
+                        let len = GetWindowTextW(h, &mut buf);
+                        if len > 0 {
+                            String::from_utf16_lossy(&buf[..len as usize])
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let name = get_text(IDC_SCENE_NAME).trim().to_string();
+                    let icon = get_text(IDC_SCENE_ICON).trim().to_string();
+                    let h_chk = dlg_item(self.hwnd, IDC_SCENE_PINNED);
+                    let pinned = SendMessageW(h_chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize;
+
+                    if !name.is_empty() {
+                        scene.name = name;
+                    }
+                    if !icon.is_empty() {
+                        scene.icon = icon;
+                    }
+                    scene.pinned = pinned;
+                }
+            }
+        }
+    }
+
+    pub fn populate_app_matrix(&mut self) {
+        use crate::platform::monitors::dip_to_px;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Controls::{
+            LVCFMT_CENTER, LVCFMT_LEFT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
+            LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
+            LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETITEMTEXTW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let dpi = self.dpi.max(72);
+        let h_matrix = dlg_item(self.hwnd, IDC_APP_MATRIX_LIST);
+
+        unsafe {
+            let _ = SendMessageW(h_matrix, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+            // Remove all existing columns
+            while SendMessageW(h_matrix, LVM_DELETECOLUMN, WPARAM(0), LPARAM(0)).0 != 0 {}
+
+            // Helper to insert column
+            let insert_col = |col_idx: i32, title: &str, width_dip: i32, fmt: windows::Win32::UI::Controls::LVCOLUMNW_FORMAT| {
+                let w_text: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                let col = LVCOLUMNW {
+                    mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT,
+                    fmt,
+                    cx: dip_to_px(width_dip, dpi),
+                    pszText: windows::core::PWSTR(w_text.as_ptr() as *mut u16),
+                    iSubItem: col_idx,
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    LVM_INSERTCOLUMNW,
+                    WPARAM(col_idx as usize),
+                    LPARAM(&col as *const _ as isize),
                 );
-                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = SendMessageW(h_win_list, LB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
-            }
-            if !self.vm.candidate_windows.is_empty() {
-                let target_idx = self
-                    .selected_window_idx
-                    .unwrap_or(0)
-                    .min(self.vm.candidate_windows.len().saturating_sub(1));
-                let _ = SendMessageW(h_win_list, LB_SETCURSEL, WPARAM(target_idx), LPARAM(0));
-                self.selected_window_idx = Some(target_idx);
-                self.load_selected_window_details(target_idx);
-            }
-
-            let h_combo = dlg_item(self.hwnd, IDC_WIN_SCENE_COMBO);
-            let prev_scene_sel = SendMessageW(
-                h_combo,
-                windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
-                WPARAM(0),
-                LPARAM(0),
-            )
-            .0;
-            let _ = SendMessageW(h_combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            for scene in &self.vm.config_draft.scenes {
-                let label = format!("{} [{}]", scene.name, scene.id);
-                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = SendMessageW(h_combo, CB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
-            }
-            let next_scene_sel = if prev_scene_sel >= 0
-                && (prev_scene_sel as usize) < self.vm.config_draft.scenes.len()
-            {
-                prev_scene_sel as usize
-            } else {
-                0
             };
-            let _ = SendMessageW(h_combo, CB_SETCURSEL, WPARAM(next_scene_sel), LPARAM(0));
 
-            // Tab 2: Launcher options
+            // Col 0: 状態
+            insert_col(0, "状態", 74, LVCFMT_LEFT);
+            // Col 1: アプリ / ウィンドウ
+            insert_col(1, "アプリ / ウィンドウ", 240, LVCFMT_LEFT);
+
+            // Col 2..N: 各シーン
+            let num_scenes = self.vm.config_draft.scenes.len();
+            for (s_idx, scene) in self.vm.config_draft.scenes.iter().enumerate() {
+                let col_idx = 2 + s_idx as i32;
+                insert_col(col_idx, &scene.name, 68, LVCFMT_CENTER);
+            }
+
+            // Col 2 + N: 常時表示
+            let col_av = 2 + num_scenes as i32;
+            insert_col(col_av, "常時表示", 72, LVCFMT_CENTER);
+
+            // Col 2 + N + 1: モニター
+            let col_mon = col_av + 1;
+            insert_col(col_mon, "モニター", 76, LVCFMT_LEFT);
+
+            // Insert rows
+            for (row_idx, row) in self.vm.binding_rows.iter().enumerate() {
+                let warn_sym = if !row.warnings.is_empty() { " ⚠️" } else { "" };
+                let run_sym = if row.is_running { "● 起動中" } else { "○ 未起動" };
+                let status_str = format!("{}{}", run_sym, warn_sym);
+                let w_status: Vec<u16> = status_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+                let mut item = LVITEMW {
+                    mask: LVIF_TEXT | LVIF_PARAM,
+                    iItem: row_idx as i32,
+                    iSubItem: 0,
+                    pszText: windows::core::PWSTR(w_status.as_ptr() as *mut u16),
+                    lParam: LPARAM(row_idx as isize),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    LVM_INSERTITEMW,
+                    WPARAM(0),
+                    LPARAM(&mut item as *mut _ as isize),
+                );
+
+                // Col 1: アプリ
+                let app_str = format!("{} ({})", row.window_title, row.exe_name);
+                let w_app: Vec<u16> = app_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut sub_app = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: row_idx as i32,
+                    iSubItem: 1,
+                    pszText: windows::core::PWSTR(w_app.as_ptr() as *mut u16),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    LVM_SETITEMTEXTW,
+                    WPARAM(row_idx),
+                    LPARAM(&mut sub_app as *mut _ as isize),
+                );
+
+                // Col 2..N: シーン
+                for (s_idx, scene) in self.vm.config_draft.scenes.iter().enumerate() {
+                    let is_bound = row.bound_scene_ids.iter().any(|id| id == &scene.id);
+                    let sym = if is_bound { "☑" } else { "☐" };
+                    let w_sym: Vec<u16> = sym.encode_utf16().chain(std::iter::once(0)).collect();
+                    let mut sub_s = LVITEMW {
+                        mask: LVIF_TEXT,
+                        iItem: row_idx as i32,
+                        iSubItem: 2 + s_idx as i32,
+                        pszText: windows::core::PWSTR(w_sym.as_ptr() as *mut u16),
+                        ..Default::default()
+                    };
+                    let _ = SendMessageW(
+                        h_matrix,
+                        LVM_SETITEMTEXTW,
+                        WPARAM(row_idx),
+                        LPARAM(&mut sub_s as *mut _ as isize),
+                    );
+                }
+
+                // Col 常時表示
+                let av_sym = if row.always_visible { "☑" } else { "☐" };
+                let w_av: Vec<u16> = av_sym.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut sub_av = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: row_idx as i32,
+                    iSubItem: col_av,
+                    pszText: windows::core::PWSTR(w_av.as_ptr() as *mut u16),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    LVM_SETITEMTEXTW,
+                    WPARAM(row_idx),
+                    LPARAM(&mut sub_av as *mut _ as isize),
+                );
+
+                // Col モニター
+                let w_mon: Vec<u16> = row.monitor_label.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut sub_mon = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: row_idx as i32,
+                    iSubItem: col_mon,
+                    pszText: windows::core::PWSTR(w_mon.as_ptr() as *mut u16),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    LVM_SETITEMTEXTW,
+                    WPARAM(row_idx),
+                    LPARAM(&mut sub_mon as *mut _ as isize),
+                );
+            }
+
+            if !self.vm.binding_rows.is_empty() {
+                let target_idx = self
+                    .selected_app_idx
+                    .unwrap_or(0)
+                    .min(self.vm.binding_rows.len().saturating_sub(1));
+                self.selected_app_idx = Some(target_idx);
+
+                // Set selection in ListView (LVM_SETITEMSTATE)
+                let mut state_item = LVITEMW {
+                    state: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+                        windows::Win32::UI::Controls::LVIS_SELECTED.0
+                            | windows::Win32::UI::Controls::LVIS_FOCUSED.0,
+                    ),
+                    stateMask: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+                        windows::Win32::UI::Controls::LVIS_SELECTED.0
+                            | windows::Win32::UI::Controls::LVIS_FOCUSED.0,
+                    ),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    h_matrix,
+                    windows::Win32::UI::Controls::LVM_SETITEMSTATE,
+                    WPARAM(target_idx),
+                    LPARAM(&mut state_item as *mut _ as isize),
+                );
+                self.load_selected_app_details(target_idx);
+            }
+        }
+    }
+
+    pub fn load_selected_app_details(&mut self, idx: usize) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetWindowTextW, BM_SETCHECK};
+
+        if let Some(row) = self.vm.binding_rows.get(idx) {
+            let match_mon_checked = row.monitor_id.is_some();
+            let kw_text = row.custom_title_keyword.clone();
+
+            let status_desc = if row.is_running {
+                format!(
+                    "【起動中】 HWND: 0x{:X} / PID: {} / 所在: {}",
+                    row.live_hwnd.unwrap_or(0),
+                    row.live_pid.unwrap_or(0),
+                    row.monitor_label
+                )
+            } else {
+                format!("【未起動】 再起動時に自動照合 / 設定モニター: {}", row.monitor_label)
+            };
+
+            let bound_desc = if row.bound_scene_ids.is_empty() {
+                "なし (どのシーンでも非表示)".to_string()
+            } else {
+                row.bound_scene_ids.join(", ")
+            };
+
+            let mut details = format!(
+                "{}\r\nEXE: {} (Class: {})\r\n所属シーン: {} | 常時表示: {}\r\n",
+                status_desc,
+                row.exe_path,
+                row.window_class,
+                bound_desc,
+                if row.always_visible { "有効" } else { "無効" }
+            );
+
+            if !row.warnings.is_empty() {
+                details.push_str("【警告】");
+                for w in &row.warnings {
+                    match w {
+                        crate::scenes::bindings::RegistrationWarning::NoTaskbarButton => {
+                            details.push_str(" ⚠️タスクバーボタンなし ");
+                        }
+                        crate::scenes::bindings::RegistrationWarning::ElevatedProcess => {
+                            details.push_str(" ⚠️管理者権限プロセス ");
+                        }
+                        crate::scenes::bindings::RegistrationWarning::OutsideTargetMonitor { window_monitor } => {
+                            details.push_str(&format!(" ⚠️対象外モニター({}) ", window_monitor));
+                        }
+                        crate::scenes::bindings::RegistrationWarning::TitleMayContainSensitiveOrDynamicText => {
+                            details.push_str(" ℹ️動的タイトル ");
+                        }
+                    }
+                }
+                details.push_str("\r\n");
+            }
+
+            unsafe {
+                let h_det = dlg_item(self.hwnd, IDC_APP_DETAILS);
+                let w: Vec<u16> = details.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = SetWindowTextW(h_det, PCWSTR(w.as_ptr()));
+
+                let h_kw = dlg_item(self.hwnd, IDC_APP_TITLE_KEYWORD);
+                let w_kw: Vec<u16> = kw_text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = SetWindowTextW(h_kw, PCWSTR(w_kw.as_ptr()));
+
+                let h_mon_chk = dlg_item(self.hwnd, IDC_APP_MATCH_MONITOR);
+                let st_mon = if match_mon_checked { BST_CHECKED } else { BST_UNCHECKED };
+                let _ = SendMessageW(h_mon_chk, BM_SETCHECK, WPARAM(st_mon), LPARAM(0));
+            }
+        }
+    }
+
+    pub fn save_current_app_rule(&mut self) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, SendMessageW, BM_GETCHECK};
+
+        if let Some(idx) = self.selected_app_idx {
+            if let Some(row) = self.vm.binding_rows.get(idx) {
+                let binding_id = row.binding_id.clone();
+                let mon_id = row.monitor_id.clone();
+                unsafe {
+                    let h_kw = dlg_item(self.hwnd, IDC_APP_TITLE_KEYWORD);
+                    let mut buf = [0u16; 256];
+                    let len = GetWindowTextW(h_kw, &mut buf);
+                    let custom_kw = if len > 0 {
+                        Some(String::from_utf16_lossy(&buf[..len as usize]))
+                    } else {
+                        None
+                    };
+
+                    let h_mon_chk = dlg_item(self.hwnd, IDC_APP_MATCH_MONITOR);
+                    let pin_to_monitor =
+                        SendMessageW(h_mon_chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                            == BST_CHECKED as isize;
+
+                    self.vm.update_binding_title_keyword(&binding_id, custom_kw);
+                    self.vm.update_binding_monitor_pin(&binding_id, pin_to_monitor, mon_id);
+                }
+            }
+        }
+    }
+
+    pub fn populate_launcher_tab(&mut self) {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, SetWindowTextW, BM_SETCHECK, CB_ADDSTRING, CB_RESETCONTENT, CB_SETCURSEL,
+        };
+
+        unsafe {
             let h_orient = dlg_item(self.hwnd, IDC_LCH_ORIENT_COMBO);
             let _ = SendMessageW(h_orient, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
             let s_h: Vec<u16> = "横型 (Horizontal)".encode_utf16().chain(std::iter::once(0)).collect();
@@ -1264,8 +1612,16 @@ impl SettingsWindow {
             set_chk(IDC_LCH_TOPMOST, self.vm.config_draft.launcher.always_on_top);
             set_chk(IDC_LCH_SNAP, self.vm.config_draft.launcher.snap_to_edges);
             set_chk(IDC_LCH_FOCUS, self.vm.config_draft.launcher.focus_on_switch);
+        }
+    }
 
-            // Tab 3: Behavior
+    pub fn populate_behavior_tab(&mut self) {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, BM_SETCHECK, CB_ADDSTRING, CB_RESETCONTENT, CB_SETCURSEL,
+        };
+
+        unsafe {
             let h_mon_combo = dlg_item(self.hwnd, IDC_BEH_MONITOR_COMBO);
             let _ = SendMessageW(h_mon_combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
 
@@ -1295,139 +1651,14 @@ impl SettingsWindow {
             }
             let _ = SendMessageW(h_mon_combo, CB_SETCURSEL, WPARAM(cur_mon_sel), LPARAM(0));
 
+            let set_chk = |id: usize, b: bool| {
+                let h = dlg_item(self.hwnd, id);
+                let state = if b { BST_CHECKED } else { BST_UNCHECKED };
+                let _ = SendMessageW(h, BM_SETCHECK, WPARAM(state), LPARAM(0));
+            };
             set_chk(IDC_BEH_RESTORE_ALL_ON_SWITCH, self.vm.config_draft.launcher.restore_all_on_switch);
             set_chk(IDC_BEH_AUTOSTART, self.vm.autostart_enabled);
             set_chk(IDC_BEH_VERBOSE_TITLE, crate::diagnostics::is_verbose_title_logging());
-        }
-    }
-
-    pub fn load_selected_scene_details(&mut self, idx: usize) {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetWindowTextW, BM_SETCHECK};
-
-        if let Some(scene) = self.vm.config_draft.scenes.get(idx) {
-            unsafe {
-                let set_txt = |id: usize, val: &str| {
-                    let h = dlg_item(self.hwnd, id);
-                    let w: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
-                    let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
-                };
-                set_txt(IDC_SCENE_ID, &scene.id);
-                set_txt(IDC_SCENE_NAME, &scene.name);
-                set_txt(IDC_SCENE_ICON, &scene.icon);
-
-                let h_chk = dlg_item(self.hwnd, IDC_SCENE_PINNED);
-                let st = if scene.pinned { BST_CHECKED } else { BST_UNCHECKED };
-                let _ = SendMessageW(h_chk, BM_SETCHECK, WPARAM(st), LPARAM(0));
-            }
-        }
-    }
-
-    pub fn load_selected_window_details(&mut self, idx: usize) {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SetWindowTextW, BM_SETCHECK};
-
-        if let Some(row) = self.vm.candidate_windows.get(idx) {
-            let mon_label = self.vm.format_monitor_short_label(&row.instance.monitor_id);
-
-            let existing_binding = row.existing_binding_id.as_ref().and_then(|bid| {
-                self.vm
-                    .config_draft
-                    .bindings
-                    .iter()
-                    .find(|b| &b.id == bid)
-            });
-
-            let (kw_text, match_mon_checked, rule_summary) = if let Some(b) = existing_binding {
-                let kw = b
-                    .match_rule
-                    .title_rule
-                    .value
-                    .clone()
-                    .unwrap_or_default();
-                let pin_mon = b.match_rule.monitor_id.is_some();
-                let mon_desc = match &b.match_rule.monitor_id {
-                    Some(m) => format!("{} ({})", self.vm.format_monitor_short_label(m), m),
-                    None => "モニター不問 (全画面)".to_string(),
-                };
-                let title_desc = if kw.is_empty() {
-                    "タイトル不問 (Any)".to_string()
-                } else {
-                    format!("{:?} (\"{}\")", b.match_rule.title_rule.rule_type, kw)
-                };
-                (
-                    kw,
-                    pin_mon,
-                    format!("再起動時の識別条件: [モニター: {}] / [タイトル: {}]", mon_desc, title_desc),
-                )
-            } else {
-                let suggested = self
-                    .vm
-                    .suggest_default_title_keyword(&row.instance)
-                    .unwrap_or_default();
-                (
-                    suggested,
-                    true,
-                    "未登録 (下の[シーンに追加/更新]で登録できます)".to_string(),
-                )
-            };
-
-            let mut details = format!(
-                "HWND: 0x{:X} / PID: {} / 所在: {} ({})\r\nEXE: {} (Class: {})\r\n所属シーン: {} / {}\r\n",
-                row.instance.hwnd,
-                row.instance.pid,
-                mon_label,
-                row.instance.monitor_id,
-                row.instance.exe_path,
-                row.instance.window_class,
-                if row.bound_scene_ids.is_empty() {
-                    "なし".to_string()
-                } else {
-                    row.bound_scene_ids.join(", ")
-                },
-                rule_summary
-            );
-
-            if !row.warnings.is_empty() {
-                details.push_str("【注意】");
-                for w in &row.warnings {
-                    match w {
-                        crate::scenes::bindings::RegistrationWarning::NoTaskbarButton => {
-                            details.push_str(" ⚠️タスクバーボタンなし ");
-                        }
-                        crate::scenes::bindings::RegistrationWarning::ElevatedProcess => {
-                            details.push_str(" ⚠️管理者権限プロセス ");
-                        }
-                        crate::scenes::bindings::RegistrationWarning::OutsideTargetMonitor { window_monitor } => {
-                            details.push_str(&format!(" ⚠️対象外モニター({}) ", window_monitor));
-                        }
-                        crate::scenes::bindings::RegistrationWarning::TitleMayContainSensitiveOrDynamicText => {
-                            details.push_str(" ℹ️動的タイトル ");
-                        }
-                    }
-                }
-                details.push_str("\r\n");
-            }
-
-            unsafe {
-                let h_det = dlg_item(self.hwnd, IDC_WIN_DETAILS);
-                let w: Vec<u16> = details.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = SetWindowTextW(h_det, PCWSTR(w.as_ptr()));
-
-                let h_kw = dlg_item(self.hwnd, IDC_WIN_TITLE_KEYWORD);
-                let w_kw: Vec<u16> = kw_text.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = SetWindowTextW(h_kw, PCWSTR(w_kw.as_ptr()));
-
-                let h_mon_chk = dlg_item(self.hwnd, IDC_WIN_MATCH_MONITOR);
-                let st_mon = if match_mon_checked { BST_CHECKED } else { BST_UNCHECKED };
-                let _ = SendMessageW(h_mon_chk, BM_SETCHECK, WPARAM(st_mon), LPARAM(0));
-
-                let h_av = dlg_item(self.hwnd, IDC_WIN_ALWAYS_VISIBLE);
-                let st = if row.always_visible { BST_CHECKED } else { BST_UNCHECKED };
-                let _ = SendMessageW(h_av, BM_SETCHECK, WPARAM(st), LPARAM(0));
-            }
         }
     }
 
@@ -1436,6 +1667,9 @@ impl SettingsWindow {
         use windows::Win32::UI::WindowsAndMessaging::{
             GetWindowTextW, SendMessageW, BM_GETCHECK, CB_GETCURSEL,
         };
+
+        self.save_current_scene_fields();
+        self.save_current_app_rule();
 
         unsafe {
             // Read Launcher controls
@@ -1508,10 +1742,10 @@ unsafe extern "system" fn settings_wndproc(
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Controls::NMHDR;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GetWindowTextW, MessageBoxW,
-        PostMessageW, SendMessageW, SetWindowLongPtrW, BM_GETCHECK, CB_GETCURSEL,
-        GWLP_USERDATA, LBN_SELCHANGE, LB_GETCURSEL, MB_ICONINFORMATION, MB_OK,
-        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NOTIFY,
+        DefWindowProcW, DestroyWindow, GetWindowLongPtrW, MessageBoxW, PostMessageW,
+        SendMessageW, SetWindowLongPtrW, GWLP_USERDATA, LBN_SELCHANGE, LB_GETCURSEL,
+        MB_ICONINFORMATION, MB_OK, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+        WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NOTIFY,
     };
 
     let result = std::panic::catch_unwind(|| {
@@ -1559,6 +1793,8 @@ unsafe extern "system" fn settings_wndproc(
                 if nmhdr.idFrom == IDC_TAB_CONTROL
                     && nmhdr.code == windows::Win32::UI::Controls::TCN_SELCHANGE
                 {
+                    win.save_current_scene_fields();
+                    win.save_current_app_rule();
                     let cur_tab = SendMessageW(
                         nmhdr.hwndFrom,
                         windows::Win32::UI::Controls::TCM_GETCURSEL,
@@ -1567,8 +1803,54 @@ unsafe extern "system" fn settings_wndproc(
                     )
                     .0 as usize;
                     win.switch_tab(cur_tab);
+                    win.populate_data();
                     return LRESULT(0);
                 }
+
+                if nmhdr.idFrom == IDC_APP_MATRIX_LIST
+                    && nmhdr.code == NM_CLICK
+                {
+                    let item_act = &*(lparam.0 as *const NMITEMACTIVATE);
+                    let row_idx = item_act.iItem;
+                    let col_idx = item_act.iSubItem;
+                    if row_idx >= 0 && (row_idx as usize) < win.vm.binding_rows.len() {
+                        let row_u = row_idx as usize;
+                        let binding_id = win.vm.binding_rows[row_u].binding_id.clone();
+                        let num_scenes = win.vm.config_draft.scenes.len();
+
+                        if col_idx >= 2 && (col_idx as usize) < 2 + num_scenes {
+                            let scene_idx = (col_idx - 2) as usize;
+                            if let Some(scene) = win.vm.config_draft.scenes.get(scene_idx) {
+                                let scene_id = scene.id.clone();
+                                win.vm.toggle_scene_binding(&binding_id, &scene_id);
+                                win.selected_app_idx = Some(row_u);
+                                win.populate_app_matrix();
+                                win.populate_scenes_tab();
+                            }
+                        } else if col_idx as usize == 2 + num_scenes {
+                            win.vm.toggle_always_visible(&binding_id);
+                            win.selected_app_idx = Some(row_u);
+                            win.populate_app_matrix();
+                            win.populate_scenes_tab();
+                        } else {
+                            win.selected_app_idx = Some(row_u);
+                            win.load_selected_app_details(row_u);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+
+                if nmhdr.idFrom == IDC_APP_MATRIX_LIST && nmhdr.code == LVN_ITEMCHANGED {
+                    let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                    if (nmlv.uNewState & windows::Win32::UI::Controls::LVIS_SELECTED.0) != 0 && nmlv.iItem >= 0 {
+                        let sel = nmlv.iItem as usize;
+                        if sel < win.vm.binding_rows.len() {
+                            win.selected_app_idx = Some(sel);
+                            win.load_selected_app_details(sel);
+                        }
+                    }
+                }
+
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
 
@@ -1605,6 +1887,7 @@ unsafe extern "system" fn settings_wndproc(
 
                     // Tab 0 Scene selection changed
                     IDC_SCENE_LIST if code == LBN_SELCHANGE => {
+                        win.save_current_scene_fields();
                         let h = dlg_item(hwnd, IDC_SCENE_LIST);
                         let sel = SendMessageW(h, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
                         win.selected_scene_idx = Some(sel);
@@ -1612,6 +1895,7 @@ unsafe extern "system" fn settings_wndproc(
                         LRESULT(0)
                     }
                     IDC_SCENE_ADD => {
+                        win.save_current_scene_fields();
                         let new_id = format!("scene-{}", win.vm.config_draft.scenes.len() + 1);
                         let new_order = win.vm.config_draft.scenes.len() as i32 + 1;
                         win.vm.config_draft.scenes.push(Scene {
@@ -1621,13 +1905,23 @@ unsafe extern "system" fn settings_wndproc(
                             order: new_order,
                             pinned: true,
                         });
+                        win.selected_scene_idx = Some(win.vm.config_draft.scenes.len() - 1);
                         win.populate_data();
                         LRESULT(0)
                     }
                     IDC_SCENE_DEL => {
                         if let Some(idx) = win.selected_scene_idx {
                             if win.vm.config_draft.scenes.len() > 1 && idx < win.vm.config_draft.scenes.len() {
+                                let del_id = win.vm.config_draft.scenes[idx].id.clone();
                                 win.vm.config_draft.scenes.remove(idx);
+                                for (i, s) in win.vm.config_draft.scenes.iter_mut().enumerate() {
+                                    s.order = i as i32 + 1;
+                                }
+                                for b in &mut win.vm.config_draft.bindings {
+                                    b.scene_ids.retain(|s| s != &del_id);
+                                }
+                                win.vm.sync_binding_rows();
+                                win.selected_scene_idx = Some(idx.saturating_sub(1));
                                 win.populate_data();
                             }
                         }
@@ -1636,10 +1930,12 @@ unsafe extern "system" fn settings_wndproc(
                     IDC_SCENE_UP => {
                         if let Some(idx) = win.selected_scene_idx {
                             if idx > 0 && idx < win.vm.config_draft.scenes.len() {
+                                win.save_current_scene_fields();
                                 win.vm.config_draft.scenes.swap(idx, idx - 1);
                                 for (i, s) in win.vm.config_draft.scenes.iter_mut().enumerate() {
                                     s.order = i as i32 + 1;
                                 }
+                                win.selected_scene_idx = Some(idx - 1);
                                 win.populate_data();
                             }
                         }
@@ -1648,104 +1944,36 @@ unsafe extern "system" fn settings_wndproc(
                     IDC_SCENE_DOWN => {
                         if let Some(idx) = win.selected_scene_idx {
                             if idx + 1 < win.vm.config_draft.scenes.len() {
+                                win.save_current_scene_fields();
                                 win.vm.config_draft.scenes.swap(idx, idx + 1);
                                 for (i, s) in win.vm.config_draft.scenes.iter_mut().enumerate() {
                                     s.order = i as i32 + 1;
                                 }
+                                win.selected_scene_idx = Some(idx + 1);
                                 win.populate_data();
                             }
                         }
                         LRESULT(0)
                     }
                     IDC_SCENE_UPDATE => {
-                        if let Some(idx) = win.selected_scene_idx {
-                            if let Some(scene) = win.vm.config_draft.scenes.get_mut(idx) {
-                                let get_text = |ctrl_id: usize| -> String {
-                                    let h = dlg_item(hwnd, ctrl_id);
-                                    let mut buf = [0u16; 256];
-                                    let len = GetWindowTextW(h, &mut buf);
-                                    if len > 0 {
-                                        String::from_utf16_lossy(&buf[..len as usize])
-                                    } else {
-                                        String::new()
-                                    }
-                                };
-                                let name = get_text(IDC_SCENE_NAME);
-                                let icon = get_text(IDC_SCENE_ICON);
-                                let h_chk = dlg_item(hwnd, IDC_SCENE_PINNED);
-                                let pinned = SendMessageW(h_chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize;
-
-                                if !name.is_empty() {
-                                    scene.name = name;
-                                }
-                                if !icon.is_empty() {
-                                    scene.icon = icon;
-                                }
-                                scene.pinned = pinned;
-                                win.populate_data();
-                            }
-                        }
+                        win.save_current_scene_fields();
+                        win.populate_data();
                         LRESULT(0)
                     }
-
-                    // Tab 1 Window selection changed
-                    IDC_WIN_LIST if code == LBN_SELCHANGE => {
-                        let h = dlg_item(hwnd, IDC_WIN_LIST);
-                        let sel = SendMessageW(h, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-                        win.selected_window_idx = Some(sel);
-                        win.load_selected_window_details(sel);
-                        LRESULT(0)
-                    }
-                    IDC_WIN_BIND => {
-                        if let Some(idx) = win.selected_window_idx {
-                            let h_combo = dlg_item(hwnd, IDC_WIN_SCENE_COMBO);
-                            let scene_sel = SendMessageW(h_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-                            let h_av = dlg_item(hwnd, IDC_WIN_ALWAYS_VISIBLE);
-                            let always_visible =
-                                SendMessageW(h_av, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                                    == BST_CHECKED as isize;
-
-                            let h_mon_chk = dlg_item(hwnd, IDC_WIN_MATCH_MONITOR);
-                            let pin_to_monitor =
-                                SendMessageW(h_mon_chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                                    == BST_CHECKED as isize;
-
-                            let h_kw = dlg_item(hwnd, IDC_WIN_TITLE_KEYWORD);
-                            let mut kw_buf = [0u16; 256];
-                            let kw_len = GetWindowTextW(h_kw, &mut kw_buf);
-                            let custom_kw = if kw_len > 0 {
-                                Some(String::from_utf16_lossy(&kw_buf[..kw_len as usize]))
-                            } else {
-                                None
-                            };
-
-                            if let Some(scene) = win.vm.config_draft.scenes.get(scene_sel) {
+                    IDC_SCENE_APP_UNBIND => {
+                        if let Some(s_idx) = win.selected_scene_idx {
+                            if let Some(scene) = win.vm.config_draft.scenes.get(s_idx) {
                                 let scene_id = scene.id.clone();
-                                if let Some(row) = win.vm.candidate_windows.get(idx) {
-                                    let win_instance = row.instance.clone();
-                                    win.vm.bind_window_to_scene_with_options(
-                                        &win_instance,
-                                        &scene_id,
-                                        always_visible,
-                                        custom_kw,
-                                        pin_to_monitor,
-                                    );
-                                    win.populate_data();
-                                }
-                            }
-                        }
-                        LRESULT(0)
-                    }
-                    IDC_WIN_UNBIND_SCENE => {
-                        if let Some(idx) = win.selected_window_idx {
-                            let h_combo = dlg_item(hwnd, IDC_WIN_SCENE_COMBO);
-                            let scene_sel = SendMessageW(h_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-                            if let Some(scene) = win.vm.config_draft.scenes.get(scene_sel) {
-                                let scene_id = scene.id.clone();
-                                if let Some(row) = win.vm.candidate_windows.get(idx) {
-                                    if let Some(ref bid) = row.existing_binding_id {
-                                        let bid_owned = bid.clone();
-                                        win.vm.unbind_window_from_scene(&bid_owned, &scene_id);
+                                let h_apps = dlg_item(hwnd, IDC_SCENE_APPS_LIST);
+                                let sel_app = SendMessageW(h_apps, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as isize;
+                                if sel_app >= 0 {
+                                    let matching_bids: Vec<String> = win.vm.binding_rows
+                                        .iter()
+                                        .filter(|b| b.bound_scene_ids.iter().any(|id| id == &scene_id))
+                                        .map(|b| b.binding_id.clone())
+                                        .collect();
+                                    if let Some(target_bid) = matching_bids.get(sel_app as usize) {
+                                        win.vm.unbind_window_from_scene(target_bid, &scene_id);
                                         win.populate_data();
                                     }
                                 }
@@ -1753,23 +1981,32 @@ unsafe extern "system" fn settings_wndproc(
                         }
                         LRESULT(0)
                     }
-                    IDC_WIN_UNBIND => {
-                        if let Some(idx) = win.selected_window_idx {
-                            if let Some(row) = win.vm.candidate_windows.get(idx) {
-                                if let Some(ref bid) = row.existing_binding_id {
-                                    let bid_owned = bid.clone();
-                                    win.vm.config_draft.bindings.retain(|b| b.id != bid_owned);
-                                    win.vm.sync_binding_annotations();
-                                    win.populate_data();
-                                }
+
+                    // Tab 1 Apps Matrix
+                    IDC_APP_ADD_WINDOW => {
+                        show_add_window_dialog(hwnd, win);
+                        LRESULT(0)
+                    }
+                    IDC_APP_DELETE => {
+                        if let Some(idx) = win.selected_app_idx {
+                            if let Some(row) = win.vm.binding_rows.get(idx) {
+                                let bid = row.binding_id.clone();
+                                win.vm.remove_binding(&bid);
+                                win.selected_app_idx = None;
+                                win.populate_data();
                             }
                         }
                         LRESULT(0)
                     }
-                    IDC_WIN_REFRESH => {
+                    IDC_APP_REFRESH => {
                         let sys = crate::platform::windows::Win32WindowSystem::new();
                         win.vm.refresh_candidates(&sys);
                         win.populate_data();
+                        LRESULT(0)
+                    }
+                    IDC_APP_APPLY_RULE => {
+                        win.save_current_app_rule();
+                        win.populate_app_matrix();
                         LRESULT(0)
                     }
 
@@ -1836,4 +2073,589 @@ unsafe extern "system" fn settings_wndproc(
     });
 
     result.unwrap_or_else(|_| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
+}
+
+// ============================================================================
+// "開いているウィンドウから追加" (Add Window) Modal Dialog
+// ============================================================================
+
+#[cfg(windows)]
+struct AddWindowDialogData {
+    parent_hwnd: windows::Win32::Foundation::HWND,
+    parent_win_ptr: *mut SettingsWindow,
+    selected_candidate_idx: Option<usize>,
+    hfont: windows::Win32::Graphics::Gdi::HFONT,
+    _dpi: u32,
+}
+
+#[cfg(windows)]
+impl Drop for AddWindowDialogData {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+        unsafe {
+            if !self.hfont.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.hfont.0));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn show_add_window_dialog(
+    parent_hwnd: windows::Win32::Foundation::HWND,
+    win: &mut SettingsWindow,
+) {
+    use std::sync::Once;
+    use windows::core::w;
+    use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetWindowRect, LoadCursorW, RegisterClassW,
+        SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+        IDC_ARROW, SW_SHOW, WNDCLASSW, WS_CAPTION, WS_POPUP, WS_SYSMENU,
+    };
+    use crate::platform::monitors::dip_to_px;
+
+    static REGISTER_ADDWIN_ONCE: Once = Once::new();
+    let class_name = w!("KiriAddWindowDialogClass");
+    let hinstance = GetModuleHandleW(None).unwrap();
+
+    REGISTER_ADDWIN_ONCE.call_once(|| {
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(add_window_wndproc),
+            hInstance: hinstance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut _),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+    });
+
+    let dpi = win.dpi.max(72);
+    let dlg_w = dip_to_px(680, dpi);
+    let dlg_h = dip_to_px(480, dpi);
+
+    let mut parent_rc = windows::Win32::Foundation::RECT::default();
+    let (dlg_x, dlg_y) = if GetWindowRect(parent_hwnd, &mut parent_rc).is_ok() {
+        let px = parent_rc.left + ((parent_rc.right - parent_rc.left) - dlg_w) / 2;
+        let py = parent_rc.top + ((parent_rc.bottom - parent_rc.top) - dlg_h) / 2;
+        (px.max(0), py.max(0))
+    } else {
+        (150, 150)
+    };
+
+    let hwnd = CreateWindowExW(
+        windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+        class_name,
+        w!("開いているウィンドウから追加"),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        dlg_x,
+        dlg_y,
+        dlg_w,
+        dlg_h,
+        parent_hwnd,
+        None,
+        hinstance,
+        None,
+    )
+    .unwrap();
+
+    let font = create_settings_ui_font(dpi);
+    let state = Box::new(AddWindowDialogData {
+        parent_hwnd,
+        parent_win_ptr: win as *mut SettingsWindow,
+        selected_candidate_idx: None,
+        hfont: font,
+        _dpi: dpi,
+    });
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+
+    let _ = EnableWindow(parent_hwnd, false);
+    init_add_window_controls(hwnd, hinstance, dpi, font);
+    populate_add_window_data(hwnd);
+
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+}
+
+#[cfg(windows)]
+unsafe fn init_add_window_controls(
+    hwnd: windows::Win32::Foundation::HWND,
+    hinstance: windows::Win32::Foundation::HMODULE,
+    dpi: u32,
+    font: windows::Win32::Graphics::Gdi::HFONT,
+) {
+    use crate::platform::monitors::dip_to_px;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{
+        LVCFMT_LEFT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
+        LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
+        LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, WC_LISTVIEWW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, SendMessageW, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON,
+        CBS_DROPDOWNLIST, ES_AUTOHSCROLL, WS_BORDER, WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
+    };
+
+    let create_c = |class: PCWSTR,
+                    text: PCWSTR,
+                    style_u32: u32,
+                    x_dip: i32,
+                    y_dip: i32,
+                    w_dip: i32,
+                    h_dip: i32,
+                    id: usize|
+     -> HWND {
+        let h = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+            class,
+            text,
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                style_u32 | WS_CHILD.0 | WS_VISIBLE.0,
+            ),
+            dip_to_px(x_dip, dpi),
+            dip_to_px(y_dip, dpi),
+            dip_to_px(w_dip, dpi),
+            dip_to_px(h_dip, dpi),
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::HMENU(id as *mut _),
+            hinstance,
+            None,
+        )
+        .unwrap();
+        let _ = SendMessageW(h, 0x0030, WPARAM(font.0 as usize), LPARAM(1));
+        h
+    };
+
+    create_c(
+        w!("STATIC"),
+        w!("開いているウィンドウ一覧 (選択して追加):"),
+        0,
+        16,
+        14,
+        400,
+        22,
+        0,
+    );
+
+    let h_lv = create_c(
+        WC_LISTVIEWW,
+        w!(""),
+        WS_BORDER.0
+            | WS_VSCROLL.0
+            | WS_HSCROLL.0
+            | (LVS_REPORT as u32)
+            | (LVS_SINGLESEL as u32)
+            | (LVS_SHOWSELALWAYS as u32),
+        16,
+        38,
+        648,
+        240,
+        IDC_ADDWIN_LIST,
+    );
+    let _ = SendMessageW(
+        h_lv,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        WPARAM(0),
+        LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize),
+    );
+
+    // Columns
+    let add_col = |idx: i32, title: &str, w_dip: i32| {
+        let w_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let col = LVCOLUMNW {
+            mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT,
+            fmt: LVCFMT_LEFT,
+            cx: dip_to_px(w_dip, dpi),
+            pszText: windows::core::PWSTR(w_title.as_ptr() as *mut u16),
+            iSubItem: idx,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_INSERTCOLUMNW,
+            WPARAM(idx as usize),
+            LPARAM(&col as *const _ as isize),
+        );
+    };
+    add_col(0, "モニター", 75);
+    add_col(1, "ウィンドウタイトル", 270);
+    add_col(2, "EXE名", 140);
+    add_col(3, "登録状況", 140);
+
+    create_c(w!("STATIC"), w!("追加先シーン:"), 0, 16, 292, 100, 22, 0);
+    create_c(
+        w!("COMBOBOX"),
+        w!(""),
+        CBS_DROPDOWNLIST as u32,
+        120,
+        288,
+        180,
+        200,
+        IDC_ADDWIN_SCENE_COMBO,
+    );
+
+    create_c(
+        w!("BUTTON"),
+        w!("常時表示にする"),
+        BS_AUTOCHECKBOX as u32,
+        320,
+        290,
+        140,
+        24,
+        IDC_ADDWIN_ALWAYS_VISIBLE,
+    );
+
+    create_c(
+        w!("BUTTON"),
+        w!("配置モニターで識別する"),
+        BS_AUTOCHECKBOX as u32,
+        470,
+        290,
+        194,
+        24,
+        IDC_ADDWIN_PIN_MONITOR,
+    );
+
+    create_c(
+        w!("STATIC"),
+        w!("再起動時の識別キーワード (空欄=タイトル不問):"),
+        0,
+        16,
+        330,
+        350,
+        22,
+        0,
+    );
+    create_c(
+        w!("EDIT"),
+        w!(""),
+        WS_BORDER.0 | (ES_AUTOHSCROLL as u32),
+        16,
+        354,
+        648,
+        28,
+        IDC_ADDWIN_KEYWORD,
+    );
+
+    create_c(
+        w!("BUTTON"),
+        w!("追加"),
+        BS_DEFPUSHBUTTON as u32,
+        450,
+        396,
+        100,
+        34,
+        IDC_ADDWIN_BTN_ADD,
+    );
+    create_c(
+        w!("BUTTON"),
+        w!("閉じる"),
+        BS_PUSHBUTTON as u32,
+        564,
+        396,
+        100,
+        34,
+        IDC_ADDWIN_BTN_CLOSE,
+    );
+}
+
+#[cfg(windows)]
+unsafe fn populate_add_window_data(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{
+        LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTITEMW, LVM_SETITEMSTATE,
+        LVM_SETITEMTEXTW, LVIS_FOCUSED, LVIS_SELECTED,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SendMessageW, BM_SETCHECK, CB_ADDSTRING, CB_RESETCONTENT, CB_SETCURSEL,
+        GWLP_USERDATA,
+    };
+
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AddWindowDialogData;
+    if ptr.is_null() {
+        return;
+    }
+    let data = &mut *ptr;
+    let parent_win = &mut *data.parent_win_ptr;
+
+    let h_lv = dlg_item(hwnd, IDC_ADDWIN_LIST);
+    let _ = SendMessageW(h_lv, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+
+    for (idx, cand) in parent_win.vm.candidate_windows.iter().enumerate() {
+        let mon_label = parent_win.vm.format_monitor_short_label(&cand.instance.monitor_id);
+        let w_mon: Vec<u16> = mon_label.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut item = LVITEMW {
+            mask: LVIF_TEXT | LVIF_PARAM,
+            iItem: idx as i32,
+            iSubItem: 0,
+            pszText: windows::core::PWSTR(w_mon.as_ptr() as *mut u16),
+            lParam: LPARAM(idx as isize),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_INSERTITEMW,
+            WPARAM(0),
+            LPARAM(&mut item as *mut _ as isize),
+        );
+
+        let title_str = if cand.instance.title.is_empty() {
+            "(タイトルなし)".to_string()
+        } else {
+            cand.instance.title.clone()
+        };
+        let w_title: Vec<u16> = title_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sub_title = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: idx as i32,
+            iSubItem: 1,
+            pszText: windows::core::PWSTR(w_title.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_SETITEMTEXTW,
+            WPARAM(idx),
+            LPARAM(&mut sub_title as *mut _ as isize),
+        );
+
+        let exe_name = std::path::Path::new(&cand.instance.exe_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&cand.instance.exe_path);
+        let w_exe: Vec<u16> = exe_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sub_exe = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: idx as i32,
+            iSubItem: 2,
+            pszText: windows::core::PWSTR(w_exe.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_SETITEMTEXTW,
+            WPARAM(idx),
+            LPARAM(&mut sub_exe as *mut _ as isize),
+        );
+
+        let status_str = if cand.bound_scene_ids.is_empty() {
+            "未登録".to_string()
+        } else {
+            let scene_names: Vec<&str> = parent_win
+                .vm
+                .config_draft
+                .scenes
+                .iter()
+                .filter(|s| cand.bound_scene_ids.iter().any(|b| b == &s.id))
+                .map(|s| s.name.as_str())
+                .collect();
+            format!("登録済 ({})", scene_names.join(","))
+        };
+        let w_status: Vec<u16> = status_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sub_status = LVITEMW {
+            mask: LVIF_TEXT,
+            iItem: idx as i32,
+            iSubItem: 3,
+            pszText: windows::core::PWSTR(w_status.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_SETITEMTEXTW,
+            WPARAM(idx),
+            LPARAM(&mut sub_status as *mut _ as isize),
+        );
+    }
+
+    // Populate scene combobox
+    let h_combo = dlg_item(hwnd, IDC_ADDWIN_SCENE_COMBO);
+    let _ = SendMessageW(h_combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
+    for scene in &parent_win.vm.config_draft.scenes {
+        let label = format!("{} [{}]", scene.name, scene.id);
+        let w_label: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = SendMessageW(
+            h_combo,
+            CB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(w_label.as_ptr() as isize),
+        );
+    }
+    let _ = SendMessageW(h_combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+
+    // Default checkboxes
+    let h_pin = dlg_item(hwnd, IDC_ADDWIN_PIN_MONITOR);
+    let _ = SendMessageW(h_pin, BM_SETCHECK, WPARAM(BST_CHECKED), LPARAM(0));
+
+    let h_av = dlg_item(hwnd, IDC_ADDWIN_ALWAYS_VISIBLE);
+    let _ = SendMessageW(h_av, BM_SETCHECK, WPARAM(BST_UNCHECKED), LPARAM(0));
+
+    if !parent_win.vm.candidate_windows.is_empty() {
+        data.selected_candidate_idx = Some(0);
+        let mut state_item = LVITEMW {
+            state: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+                LVIS_SELECTED.0 | LVIS_FOCUSED.0,
+            ),
+            stateMask: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(
+                LVIS_SELECTED.0 | LVIS_FOCUSED.0,
+            ),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            h_lv,
+            LVM_SETITEMSTATE,
+            WPARAM(0),
+            LPARAM(&mut state_item as *mut _ as isize),
+        );
+        load_add_window_candidate_details(hwnd, 0);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn load_add_window_candidate_details(hwnd: windows::Win32::Foundation::HWND, idx: usize) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowTextW, GWLP_USERDATA};
+
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AddWindowDialogData;
+    if ptr.is_null() {
+        return;
+    }
+    let data = &mut *ptr;
+    let parent_win = &mut *data.parent_win_ptr;
+
+    if let Some(cand) = parent_win.vm.candidate_windows.get(idx) {
+        let suggested_kw = parent_win
+            .vm
+            .suggest_default_title_keyword(&cand.instance)
+            .unwrap_or_default();
+        let h_kw = dlg_item(hwnd, IDC_ADDWIN_KEYWORD);
+        let w_kw: Vec<u16> = suggested_kw.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = SetWindowTextW(h_kw, PCWSTR(w_kw.as_ptr()));
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn add_window_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Controls::{LVN_ITEMCHANGED, NMHDR, NMLISTVIEW};
+    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GetWindowTextW,
+        MessageBoxW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, BM_GETCHECK,
+        CB_GETCURSEL, GWLP_USERDATA, MB_ICONINFORMATION, MB_OK, WM_CLOSE, WM_COMMAND,
+        WM_NCDESTROY, WM_NOTIFY,
+    };
+
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AddWindowDialogData;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let data = &mut *ptr;
+
+    match msg {
+        WM_NOTIFY => {
+            let nmhdr = &*(lparam.0 as *const NMHDR);
+            if nmhdr.idFrom == IDC_ADDWIN_LIST && nmhdr.code == LVN_ITEMCHANGED {
+                let nmlv = &*(lparam.0 as *const NMLISTVIEW);
+                if (nmlv.uNewState & windows::Win32::UI::Controls::LVIS_SELECTED.0) != 0
+                    && nmlv.iItem >= 0
+                {
+                    let sel = nmlv.iItem as usize;
+                    data.selected_candidate_idx = Some(sel);
+                    load_add_window_candidate_details(hwnd, sel);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as usize;
+            match id {
+                IDC_ADDWIN_BTN_ADD => {
+                    let parent_win = &mut *data.parent_win_ptr;
+                    if let Some(cand_idx) = data.selected_candidate_idx {
+                        if let Some(cand) = parent_win.vm.candidate_windows.get(cand_idx) {
+                            let h_combo = dlg_item(hwnd, IDC_ADDWIN_SCENE_COMBO);
+                            let s_sel = SendMessageW(h_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
+                                as usize;
+                            if let Some(scene) = parent_win.vm.config_draft.scenes.get(s_sel) {
+                                let scene_id = scene.id.clone();
+                                let h_av = dlg_item(hwnd, IDC_ADDWIN_ALWAYS_VISIBLE);
+                                let always_visible =
+                                    SendMessageW(h_av, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                                        == BST_CHECKED as isize;
+
+                                let h_pin = dlg_item(hwnd, IDC_ADDWIN_PIN_MONITOR);
+                                let pin_mon =
+                                    SendMessageW(h_pin, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                                        == BST_CHECKED as isize;
+
+                                let h_kw = dlg_item(hwnd, IDC_ADDWIN_KEYWORD);
+                                let mut buf = [0u16; 256];
+                                let len = GetWindowTextW(h_kw, &mut buf);
+                                let custom_kw = if len > 0 {
+                                    Some(String::from_utf16_lossy(&buf[..len as usize]))
+                                } else {
+                                    None
+                                };
+
+                                let instance = cand.instance.clone();
+                                parent_win.vm.bind_window_to_scene_with_options(
+                                    &instance,
+                                    &scene_id,
+                                    always_visible,
+                                    custom_kw,
+                                    pin_mon,
+                                );
+                                parent_win.populate_data();
+                                populate_add_window_data(hwnd);
+
+                                let _ = MessageBoxW(
+                                    hwnd,
+                                    w!("選択したウィンドウを登録しました。続けて他のウィンドウを追加するか、閉じてください。"),
+                                    w!("Kiri"),
+                                    MB_OK | MB_ICONINFORMATION,
+                                );
+                            }
+                        }
+                    }
+                    LRESULT(0)
+                }
+
+                IDC_ADDWIN_BTN_CLOSE => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+
+        WM_NCDESTROY => {
+            let parent_hwnd = data.parent_hwnd;
+            let _ = EnableWindow(parent_hwnd, true);
+            let _ = SetForegroundWindow(parent_hwnd);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = Box::from_raw(ptr);
+            LRESULT(0)
+        }
+
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
