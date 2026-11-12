@@ -72,7 +72,7 @@ pub fn show_context_menu(
             hmenu,
             MF_STRING,
             IDM_RESTORE_ALL_MINIMIZED,
-            w!("SceneDockが最小化したウィンドウをすべて復元(&R)"),
+            w!("Kiriが最小化したウィンドウをすべて復元(&R)"),
         );
 
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);

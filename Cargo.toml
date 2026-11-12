@@ -3,10 +3,10 @@ members = [".", "tools/testwin"]
 resolver = "2"
 
 [package]
-name = "scenedock"
+name = "kiri"
 version = "0.1.0"
 edition = "2021"
-description = "SceneDock - Windows 11 lightweight workspace scene switcher"
+description = "Kiri - Windows 11 lightweight workspace scene switcher"
 license = "MIT"
 
 [dependencies]

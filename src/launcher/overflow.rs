@@ -101,7 +101,7 @@ impl OverflowPopup {
         };
 
         static REGISTER_ONCE: Once = Once::new();
-        let class_name = w!("SceneDockOverflowPopupClass");
+        let class_name = w!("KiriOverflowPopupClass");
 
         unsafe {
             let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;

@@ -50,7 +50,7 @@ unsafe fn run_testwin(mode: &str, base_title: &str) {
     };
 
     let hinstance = GetModuleHandleW(None).unwrap();
-    let class_name = w!("SceneDockDummyTestWinClass");
+    let class_name = w!("KiriDummyTestWinClass");
 
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,

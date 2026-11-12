@@ -1,4 +1,4 @@
-# SceneDock (Kiri) — Windows 11 作業シーン切替ランチャー
+# Kiri — Windows 11 作業シーン切替ランチャー
 
 [spec.md](file:///d:/dev/Kiri/spec.md)（SD-SPEC-001 v1.1）に基づく、省リソース・非干渉型のWindows 11作業シーン切替ランチャーです。
 デュアルモニター環境等で、特定の制御対象モニターに配置された既存ウィンドウ（MT5、cTrader、VS Code、ブラウザ等）を作業シーンごとに**アイコン1クリック**で瞬時に最小化／復元して切り替えます。
@@ -14,7 +14,7 @@
 - **安全第一の設計**:
   - モーダルダイアログ表示中（親窓 `!IsWindowEnabled`）のウィンドウは最小化せずスキップし警告を出力（FR-17）。
   - 切替直前に文字入力中だった前景ウィンドウは最後尾に `SW_MINIMIZE` で最小化し、不可視ウィンドウに入力が残る事故を防止（FR-18）。
-  - SceneDock自身が最小化したウィンドウのみを復元対象とし、ユーザー自身が手動最小化したウィンドウを勝手に復元しない（FR-08）。
+  - Kiri自身が最小化したウィンドウのみを復元対象とし、ユーザー自身が手動最小化したウィンドウを勝手に復元しない（FR-08）。
   - 先行書き込みジャーナル（`runtime-state.json`）によるクラッシュ復旧および「すべて復元」安全機構。
 
 ---
@@ -33,7 +33,7 @@
 | **WinEventフック・トレイ** | [src/platform/hooks.rs](file:///d:/dev/Kiri/src/platform/hooks.rs), [src/platform/tray.rs](file:///d:/dev/Kiri/src/platform/tray.rs) | `EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND` 限定の `WINEVENT_OUTOFCONTEXT` フック、`Shell_NotifyIconW` システムトレイアイコン＋エクスプローラー再起動時（`TaskbarCreated`）自動再登録 |
 | **常駐ランチャーUI** | [src/launcher/window.rs](file:///d:/dev/Kiri/src/launcher/window.rs), [src/launcher/paint.rs](file:///d:/dev/Kiri/src/launcher/paint.rs), [src/launcher/overflow.rs](file:///d:/dev/Kiri/src/launcher/overflow.rs), [src/launcher/input.rs](file:///d:/dev/Kiri/src/launcher/input.rs) | `WS_EX_NOACTIVATE` + `MA_NOACTIVATE`、専用グリップ `HTCAPTION` ドラッグ、グリップダブルクリック位置リセット、右クリックコンテキストメニュー、GDIダブルバッファ＋ブラシ/ペンキャッシュ描画、内蔵ベクターアイコン（chart/code/globe）および外部 `.ico` ファイルロード・キャッシュ、トラッキングツールチップ（`TOOLTIPS_CLASSW`）、フォーカス非奪取 `⋯` ポップアップ、FFI境界 `catch_unwind` パニック保護 |
 | **4タブ ネイティブ設定画面** | [src/settings/window.rs](file:///d:/dev/Kiri/src/settings/window.rs), [src/settings/mod.rs](file:///d:/dev/Kiri/src/settings/mod.rs) | Win32標準コントロール（`WC_TABCONTROLW`, `LISTBOX`, `EDIT`, `BUTTON`, `COMBOBOX`）による4タブ構成（シーン／ウィンドウ／ランチャー／動作）。候補ウィンドウ列挙・警告表示、自動起動レジストリ（`HKCU\...\Run`）連携、アトミック保存 |
-| **単一インスタンス・DPIマニフェスト** | [src/main.rs](file:///d:/dev/Kiri/src/main.rs), [app.manifest](file:///d:/dev/Kiri/app.manifest), [build.rs](file:///d:/dev/Kiri/build.rs) | `CreateMutexW("Local\\SceneDock-...")` によるセッション単一インスタンス化、多重起動時の `AllowSetForegroundWindow` + 既存インスタンス設定画面起動通知、Per-Monitor DPI Awareness V2 マニフェスト埋め込み |
+| **単一インスタンス・DPIマニフェスト** | [src/main.rs](file:///d:/dev/Kiri/src/main.rs), [app.manifest](file:///d:/dev/Kiri/app.manifest), [build.rs](file:///d:/dev/Kiri/build.rs) | `CreateMutexW("Local\\Kiri-...")` によるセッション単一インスタンス化、多重起動時の `AllowSetForegroundWindow` + 既存インスタンス設定画面起動通知、Per-Monitor DPI Awareness V2 マニフェスト埋め込み |
 | **構造化ログ・タイトルマスク** | [src/diagnostics.rs](file:///d:/dev/Kiri/src/diagnostics.rs) | 口座番号等を含むウィンドウタイトルの既定マスク出力（`mask_title`）、GDI/USERオブジェクト計測ヘルパー |
 | **テスト用ダミーアプリ** | [tools/testwin/src/main.rs](file:///d:/dev/Kiri/tools/testwin/src/main.rs) | 複数窓、モーダル表示中、応答なし、最小化時トレイ非表示、タスクバーボタンなし、最大化、動的タイトル変化を再現する検証用Win32アプリ |
 
@@ -46,7 +46,7 @@
 | **フォーカス非奪取とドラッグ** | `WS_EX_NOACTIVATE` ＋ `WM_NCHITTEST` での `HTCAPTION` 返却によるグリップドラッグ | グリップドラッグ中もアクティブウィンドウのフォーカスを奪わずにスムーズに移動可能であることを確認。グリップダブルクリックによる既定位置復帰（`WM_NCLBUTTONDBLCLK`）および右クリック（`WM_NCRBUTTONUP`）も自前処理で正常動作。 |
 | **最小化・復元コマンド** | `SW_SHOWMINNOACTIVE` と `SW_SHOWNOACTIVATE` の効果 | `SW_SHOWMINNOACTIVE` は対象を非アクティブのまま最小化し、前景ウィンドウを奪わない。`SW_SHOWNOACTIVATE` は対象をアクティブ化せずに復元する。また、**非最小化の最大化ウィンドウに `SW_RESTORE` を送ると最大化が解除される問題**を確認し、復元直前の `IsIconic` 確認および `SW_SHOWNOACTIVATE` による復元を採用。 |
 | **入力取り残し防止（FR-18）** | 切替直前の前景ウィンドウが最小化対象に含まれる場合の挙動 | 最小化後に入力フォーカスが不可視ウィンドウに残る危険を防止するため、次シーンの復元要求完了後に、旧シーンの前景ウィンドウのみ `SW_MINIMIZE` を送出して次ウィンドウへ安全にフォーカスを委任する順序制御を確定。 |
-| **WinEventフック** | `EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND` の区別 | `WINEVENT_OUTOFCONTEXT` で登録したフックにより、SceneDock発行の操作とユーザーによるタスクバー手動復元／最小化を完全に区別可能であることを確認。手動復元を検知した時点で `invalidated` へ遷移させるルールを確立。 |
+| **WinEventフック** | `EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND` の区別 | `WINEVENT_OUTOFCONTEXT` で登録したフックにより、Kiri発行の操作とユーザーによるタスクバー手動復元／最小化を完全に区別可能であることを確認。手動復元を検知した時点で `invalidated` へ遷移させるルールを確立。 |
 | **所有ウィンドウの挙動** | オーナーを持つトップレベル窓（注文・アラート窓）の最小化追従 | オーナーが最小化されると所有ウィンドウもOSにより非表示となる。最小化中も常時表示が必要なウィンドウには `always_visible: true` を推奨する旨をUIおよび本仕様に明記。 |
 
 ---
@@ -71,7 +71,7 @@
 | **AT-12** | DPI 100%と150%の2台を移動 | **PASS** | Per-Monitor DPI V2 マニフェストおよび `WM_DPICHANGED` で正確に拡大縮小 |
 | **AT-13** | サブモニターを切断 | **PASS** | 切断検知時にプライマリモニターの作業領域内へ自動退避 |
 | **AT-14** | 対象の1アプリを応答なしにする | **PASS** | `SendMessageTimeoutW` / `IsHungAppWindow` によりUIがブロックされず切替続行 |
-| **AT-15** | 切替直後に「すべて復元」 | **PASS** | SceneDockが最小化した窓のみ正確に復元（手動最小化窓は除外） |
+| **AT-15** | 切替直後に「すべて復元」 | **PASS** | Kiriが最小化した窓のみ正確に復元（手動最小化窓は除外） |
 | **AT-16** | 通常終了／次回起動 | **PASS** | 設定が正常保持され、管理下ウィンドウが取り残されない |
 | **AT-17** | 登録対象アプリを終了／再起動 | **PASS** | HWNDが別プロセスに再利用されても PID/開始時刻照合で誤操作を防止 |
 | **AT-18** | 連続切替・長時間アイドル | **PASS** | メッセージループ待機で描画ループなし、GDI/メモリリークなし |
@@ -109,7 +109,7 @@ Windows 11 実機環境におけるリリースビルド実行実測値：
 
 ### 成果物バイナリ
 ビルド済みリリースバイナリは以下の場所に配置されています：
-- **ランチャー本体**: `target\release\scenedock.exe`（または `D:\DevCache\cargo-target\release\scenedock.exe`）
+- **ランチャー本体**: `target\release\kiri.exe`（または `D:\DevCache\cargo-target\release\kiri.exe`）
 - **受け入れテスト用ダミーアプリ**: `target\release\testwin.exe`（または `D:\DevCache\cargo-target\release\testwin.exe`）
 
 ### ビルドとテストの実行
@@ -124,13 +124,13 @@ cargo build --release --workspace
 ### 起動と操作
 ```powershell
 # ランチャー本体の起動
-.\target\release\scenedock.exe
+.\target\release\kiri.exe
 ```
 - **左クリック**: シーンアイコンをクリックしてシーン切替。
 - **グリップドラッグ**: 左端（横型時）または上端（縦型時）の専用グリップをドラッグして移動。
 - **グリップダブルクリック**: ランチャーを画面内の規定位置へリセット。
-- **右クリック**: コンテキストメニューを開く（「設定」「縦型／横型に切替」「位置をリセット」「SceneDockが最小化したウィンドウをすべて復元」「終了」）。
-- **多重起動防止**: 既にSceneDockが起動している状態で再度 `scenedock.exe` を実行すると、既存インスタンスに前景権限を譲渡し、設定画面を開いて自動終了します。
+- **右クリック**: コンテキストメニューを開く（「設定」「縦型／横型に切替」「位置をリセット」「Kiriが最小化したウィンドウをすべて復元」「終了」）。
+- **多重起動防止**: 既にKiriが起動している状態で再度 `kiri.exe` を実行すると、既存インスタンスに前景権限を譲渡し、設定画面を開いて自動終了します。
 
 ---
 
@@ -195,8 +195,8 @@ cargo run -p testwin -- --mode hung
 1. **所有ウィンドウ（オーナー付きダイアログ・アラート）の挙動**:
    MT5のアラート窓や注文画面など、メインウィンドウをオーナーとして持つトップレベルウィンドウは、Windows OSの仕様によりオーナー窓が最小化されている間は表示されません。最小化中も常時監視が必要なウィンドウは `always_visible: true`（全シーン共通常時表示）に指定してください。
 2. **モーダルダイアログ保護**:
-   注文確認画面や保存確認などのモーダルダイアログが開いている最中（親ウィンドウの `IsWindowEnabled` が偽の状態）は、安全のためSceneDockは最小化を行わず、スキップ警告をログに記録します。
+   注文確認画面や保存確認などのモーダルダイアログが開いている最中（親ウィンドウの `IsWindowEnabled` が偽の状態）は、安全のためKiriは最小化を行わず、スキップ警告をログに記録します。
 3. **管理者権限アプリ（UIPI）**:
-   SceneDockは安全のため通常ユーザー権限で動作します。管理者権限に昇格して動作しているアプリに対しては、WindowsのUIPI（User Interface Privilege Isolation）により最小化等の操作が拒否される場合があります。
+   Kiriは安全のため通常ユーザー権限で動作します。管理者権限に昇格して動作しているアプリに対しては、WindowsのUIPI（User Interface Privilege Isolation）により最小化等の操作が拒否される場合があります。
 4. **未署名EXEに関するセキュリティ警告**:
    他プロセスのウィンドウ状態を制御するネイティブバイナリであるため、未署名の状態では環境によって Windows Defender SmartScreen やウイルス対策ソフトの確認画面が表示されることがあります。商用配布時はコード署名証明書（EV/OV）による署名を推奨します。

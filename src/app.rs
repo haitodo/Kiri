@@ -190,7 +190,7 @@ impl AppController {
         extra_warnings
     }
 
-    /// Restore all windows minimized by SceneDock and reset scene state to `Unknown` (Section 8.1, AT-15).
+    /// Restore all windows minimized by Kiri and reset scene state to `Unknown` (Section 8.1, AT-15).
     pub fn restore_all_minimized_windows(&mut self) -> usize {
         self.process_queued_win_events();
         self.pending_verification = None;
@@ -268,7 +268,7 @@ impl AppController {
         overflow.iter().any(|s| s.id == active_id)
     }
 
-    /// Normal application shutdown: restore all windows minimized by SceneDock and clear journal (Section 8.1, AT-16).
+    /// Normal application shutdown: restore all windows minimized by Kiri and clear journal (Section 8.1, AT-16).
     pub fn on_normal_shutdown(&mut self) {
         let restored = self.recovery.restore_all_minimized_by_us(&mut *self.sys);
         let _ = self.recovery.clear_journal();

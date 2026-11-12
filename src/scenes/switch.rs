@@ -5,7 +5,7 @@
 //! - Protects windows on non-target monitors (FR-05, AT-06, AT-22).
 //! - Leaves unregistered windows completely untouched (AT-08).
 //! - Keeps windows shared between scenes or marked `always_visible` untouched (FR-07, AT-07).
-//! - Restores ONLY windows minimized by SceneDock (`ManagedActionState::MinimizedByUs`, FR-08, AT-09, AT-23).
+//! - Restores ONLY windows minimized by Kiri (`ManagedActionState::MinimizedByUs`, FR-08, AT-09, AT-23).
 //! - Skips disabled windows (`!is_enabled`, e.g. modal order confirmation dialog open, FR-17, AT-26) and warns.
 //! - Prevents keyboard input stranding on minimized foreground windows by minimizing the foreground window
 //!   LAST using `SW_MINIMIZE` after restoring target scene windows (FR-18, Section 5.4, AT-25).

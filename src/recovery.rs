@@ -7,7 +7,7 @@
 //! - Once the minimize request is issued, `state` transitions to `MinimizedByUs`.
 //! - If a user manually restores a window (`EVENT_SYSTEM_MINIMIZEEND` while not being restored by us),
 //!   its `ManagedAction` is marked `Invalidated` so subsequent manual re-minimization is never
-//!   mistaken for a SceneDock minimization (FR-08, AT-23).
+//!   mistaken for a Kiri minimization (FR-08, AT-23).
 //! - On normal exit, all `MinimizedByUs` windows are restored and `runtime-state.json` is cleared.
 //! - On logoff/shutdown (`WM_ENDSESSION`), windows are NOT restored and the journal is flushed as-is.
 //! - On startup after a crash, surviving windows matching `(hwnd, pid, process_start_time)` that are
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 pub enum ManagedActionState {
     /// Written to journal BEFORE `ShowWindowAsync` is called.
     Pending,
-    /// `ShowWindowAsync` was called by SceneDock to minimize this window.
+    /// `ShowWindowAsync` was called by Kiri to minimize this window.
     MinimizedByUs,
     /// User manually restored (or manually interacted with) the window; do not auto-restore.
     Invalidated,
@@ -72,7 +72,7 @@ pub struct RecoveryManager {
     journal_path: PathBuf,
     /// Active managed actions keyed by `hwnd`.
     actions: HashMap<u64, ManagedAction>,
-    /// HWNDs for which SceneDock itself recently issued a restore command
+    /// HWNDs for which Kiri itself recently issued a restore command
     /// (so the resulting `EVENT_SYSTEM_MINIMIZEEND` is recognized as ours, not a manual user restore).
     restoring_by_us: HashSet<u64>,
     /// Cached surviving actions loaded from a previous crashed session at startup.
@@ -205,7 +205,7 @@ impl RecoveryManager {
         }
     }
 
-    /// Mark that SceneDock is about to restore `hwnd` so the resulting `MINIMIZEEND` event
+    /// Mark that Kiri is about to restore `hwnd` so the resulting `MINIMIZEEND` event
     /// is not treated as an external manual override, and remove it from active minimized set.
     pub fn mark_restoring_by_us(&mut self, hwnd: u64) {
         self.restoring_by_us.insert(hwnd);
@@ -236,13 +236,13 @@ impl RecoveryManager {
         for ev in events {
             match ev.kind {
                 MinimizeEventKind::MinimizeEnd => {
-                    // If SceneDock itself initiated this restore, consume the marker and ignore
+                    // If Kiri itself initiated this restore, consume the marker and ignore
                     if self.restoring_by_us.remove(&ev.hwnd) {
                         continue;
                     }
                     // Otherwise, the user (or app) manually restored this window!
                     // Invalidate our ManagedAction so even if the user manually re-minimizes it later,
-                    // SceneDock will NOT auto-restore it on scene switch (AT-23).
+                    // Kiri will NOT auto-restore it on scene switch (AT-23).
                     if let Some(action) = self.actions.get_mut(&ev.hwnd) {
                         if matches!(
                             action.state,
@@ -263,7 +263,7 @@ impl RecoveryManager {
                 }
                 MinimizeEventKind::MinimizeStart => {
                     // If the window is NOT in `Pending` or `MinimizedByUs`, this was a user-initiated minimize.
-                    // We intentionally do NOT add it to `actions` (FR-08: only restore what SceneDock minimized).
+                    // We intentionally do NOT add it to `actions` (FR-08: only restore what Kiri minimized).
                 }
             }
         }
@@ -272,7 +272,7 @@ impl RecoveryManager {
         }
     }
 
-    /// Restore all windows currently minimized by SceneDock (Section 8.1 "SceneDockが最小化したウィンドウをすべて復元", AT-15).
+    /// Restore all windows currently minimized by Kiri (Section 8.1 "Kiriが最小化したウィンドウをすべて復元", AT-15).
     /// Restores in reverse Z-order (bottom to top) and returns the number of windows restored.
     pub fn restore_all_minimized_by_us(&mut self, sys: &mut dyn WindowSystem) -> usize {
         let mut candidates: Vec<ManagedAction> = self

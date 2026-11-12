@@ -33,12 +33,12 @@ impl LogLevel {
     }
 }
 
-/// Initialize the logger in `%LOCALAPPDATA%\SceneDock\scenedock.log` (or custom directory).
+/// Initialize the logger in `%LOCALAPPDATA%\Kiri\kiri.log` (or custom directory).
 pub fn init_logger(app_data_dir: Option<PathBuf>, verbose_titles: bool) {
     VERBOSE_TITLE_LOGGING.store(verbose_titles, Ordering::Relaxed);
     let dir = app_data_dir.unwrap_or_else(default_app_data_dir);
     let _ = fs::create_dir_all(&dir);
-    let log_path = dir.join("scenedock.log");
+    let log_path = dir.join("kiri.log");
     let mutex = LOG_FILE_PATH.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = mutex.lock() {
         *guard = Some(log_path);
@@ -108,9 +108,9 @@ pub fn current_unix_ms() -> u64 {
 
 pub fn default_app_data_dir() -> PathBuf {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(local_app_data).join("SceneDock")
+        PathBuf::from(local_app_data).join("Kiri")
     } else {
-        PathBuf::from(".").join("SceneDock")
+        PathBuf::from(".").join("Kiri")
     }
 }
 

@@ -53,7 +53,7 @@ pub enum BindingResolution {
 pub enum RegistrationWarning {
     /// Window has no taskbar button (`!has_taskbar_button`), so user cannot manually restore it from taskbar.
     NoTaskbarButton,
-    /// Process is running elevated (Administrator); UIPI prevents normal-privilege SceneDock from controlling it.
+    /// Process is running elevated (Administrator); UIPI prevents normal-privilege Kiri from controlling it.
     ElevatedProcess,
     /// Window is currently on a monitor other than `target_monitor`.
     OutsideTargetMonitor { window_monitor: String },

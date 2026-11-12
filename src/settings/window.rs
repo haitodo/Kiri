@@ -105,7 +105,7 @@ impl SettingsWindow {
         }
 
         static REGISTER_ONCE: Once = Once::new();
-        let class_name = w!("SceneDockSettingsWindowClass");
+        let class_name = w!("KiriSettingsWindowClass");
 
         unsafe {
             let icex = INITCOMMONCONTROLSEX {
@@ -137,7 +137,7 @@ impl SettingsWindow {
             let hwnd = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 class_name,
-                w!("SceneDock 設定"),
+                w!("Kiri 設定"),
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -430,7 +430,7 @@ impl SettingsWindow {
 
         t3.push(create_ctrl(
             w!("BUTTON"),
-            w!("SceneDock が最小化した全ウィンドウを復元"),
+            w!("Kiri が最小化した全ウィンドウを復元"),
             BS_PUSHBUTTON as u32,
             30,
             200,
@@ -924,7 +924,7 @@ unsafe extern "system" fn settings_wndproc(
                     // Tab 2 Reset position
                     IDC_LCH_RESET_POS => {
                         win.vm.config_draft.launcher.position = None;
-                        let _ = MessageBoxW(hwnd, w!("ランチャー位置を初期化しました。[適用] または [OK] で反映されます。"), w!("SceneDock"), MB_OK | MB_ICONINFORMATION);
+                        let _ = MessageBoxW(hwnd, w!("ランチャー位置を初期化しました。[適用] または [OK] で反映されます。"), w!("Kiri"), MB_OK | MB_ICONINFORMATION);
                         LRESULT(0)
                     }
 
@@ -936,7 +936,7 @@ unsafe extern "system" fn settings_wndproc(
                             WPARAM(0),
                             LPARAM(0),
                         );
-                        let _ = MessageBoxW(hwnd, w!("すべての最小化ウィンドウを復元しました。"), w!("SceneDock"), MB_OK | MB_ICONINFORMATION);
+                        let _ = MessageBoxW(hwnd, w!("すべての最小化ウィンドウを復元しました。"), w!("Kiri"), MB_OK | MB_ICONINFORMATION);
                         LRESULT(0)
                     }
                     IDC_BEH_OPEN_FOLDER => {

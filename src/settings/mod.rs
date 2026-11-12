@@ -189,7 +189,7 @@ impl SettingsViewModel {
     }
 }
 
-/// Check if `SceneDock` is registered in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (FR-14, Section 11).
+/// Check if `Kiri` is registered in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (FR-14, Section 11).
 #[cfg(windows)]
 pub fn is_autostart_enabled() -> bool {
     use windows::core::w;
@@ -210,7 +210,7 @@ pub fn is_autostart_enabled() -> bool {
         {
             return false;
         }
-        let exists = RegQueryValueExW(hkey, w!("SceneDock"), None, None, None, None).is_ok();
+        let exists = RegQueryValueExW(hkey, w!("Kiri"), None, None, None, None).is_ok();
         let _ = RegCloseKey(hkey);
         exists
     }
@@ -248,11 +248,11 @@ pub fn set_autostart_enabled(enable: bool) -> Result<(), String> {
             let wide: Vec<u16> = quoted.encode_utf16().chain(std::iter::once(0)).collect();
             let byte_slice =
                 std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
-            RegSetValueExW(hkey, w!("SceneDock"), 0, REG_SZ, Some(byte_slice))
+            RegSetValueExW(hkey, w!("Kiri"), 0, REG_SZ, Some(byte_slice))
                 .ok()
                 .map_err(|e| format!("RegSetValueExW failed: {}", e))
         } else {
-            let _ = RegDeleteValueW(hkey, w!("SceneDock"));
+            let _ = RegDeleteValueW(hkey, w!("Kiri"));
             Ok(())
         };
 

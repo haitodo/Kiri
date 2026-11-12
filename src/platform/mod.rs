@@ -100,7 +100,7 @@ impl std::fmt::Display for PlatformError {
 /// Abstraction over Win32 window enumeration and state control (Section 7.1).
 pub trait WindowSystem {
     /// Enumerate candidate top-level windows on the current virtual desktop in Z-order (0 = top).
-    /// Excludes cloaked windows, other virtual desktop windows, owned windows, and SceneDock's own windows.
+    /// Excludes cloaked windows, other virtual desktop windows, owned windows, and Kiri's own windows.
     fn enumerate_windows(&self) -> Vec<WindowInstance>;
 
     /// Query the live state of a specific HWND (even if it became invisible after minimizing to system tray).

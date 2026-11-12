@@ -58,7 +58,7 @@ impl TrayIcon {
                 ..Default::default()
             };
 
-            let tip = w!("SceneDock - 作業シーン切替ランチャー");
+            let tip = w!("Kiri - 作業シーン切替ランチャー");
             let slice = tip.as_wide();
             let copy_len = slice.len().min(nid.szTip.len() - 1);
             nid.szTip[..copy_len].copy_from_slice(&slice[..copy_len]);

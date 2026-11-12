@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! SceneDock entry point:
+//! Kiri entry point:
 //! - Installs panic hook for crash diagnostics
 //! - Ensures Per-Monitor DPI Awareness V2
-//! - Enforces session-local single instance via `CreateMutexW("Local\\SceneDock-...")`
+//! - Enforces session-local single instance via `CreateMutexW("Local\\Kiri-...")`
 //!   and notifies the existing instance (`AllowSetForegroundWindow` + `WM_APP_OPEN_SETTINGS`)
 //! - Runs the event-driven Win32 `GetMessageW` loop with zero idle polling.
 
@@ -39,7 +39,7 @@ fn main() {
             return;
         };
 
-        log_info("startup", "SceneDock starting up");
+        log_info("startup", "Kiri starting up");
 
         let config_mgr = ConfigManager::new(ConfigManager::default_config_path());
         let recovery = RecoveryManager::new(RecoveryManager::default_journal_path());
@@ -80,7 +80,7 @@ impl Drop for SingleInstanceMutex {
     }
 }
 
-/// Acquire `Local\SceneDock-{GUID}` mutex. If another instance is already running in this user session,
+/// Acquire `Local\Kiri-{GUID}` mutex. If another instance is already running in this user session,
 /// grant it foreground permission (`AllowSetForegroundWindow`) and post `WM_APP_OPEN_SETTINGS` (Section 7.2 & 8.2).
 #[cfg(windows)]
 fn acquire_single_instance_or_notify_existing() -> Option<SingleInstanceMutex> {
@@ -95,16 +95,16 @@ fn acquire_single_instance_or_notify_existing() -> Option<SingleInstanceMutex> {
         let h_mutex = CreateMutexW(
             None,
             false,
-            w!("Local\\SceneDock-8B3F6A20-5E19-4C94-A123-7D9C0E5F1101"),
+            w!("Local\\Kiri-8B3F6A20-5E19-4C94-A123-7D9C0E5F1101"),
         )
         .ok()?;
 
         if GetLastError() == ERROR_ALREADY_EXISTS {
             log_info(
                 "startup",
-                "Existing SceneDock instance detected; forwarding focus and opening settings",
+                "Existing Kiri instance detected; forwarding focus and opening settings",
             );
-            if let Ok(existing_hwnd) = FindWindowW(w!("SceneDockLauncherWindowClass"), None) {
+            if let Ok(existing_hwnd) = FindWindowW(w!("KiriLauncherWindowClass"), None) {
                 if !existing_hwnd.0.is_null() {
                     let mut existing_pid = 0u32;
                     GetWindowThreadProcessId(existing_hwnd, Some(&mut existing_pid));

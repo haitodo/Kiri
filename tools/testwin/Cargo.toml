@@ -2,7 +2,7 @@
 name = "testwin"
 version = "0.1.0"
 edition = "2021"
-description = "Acceptance test dummy window generator for SceneDock"
+description = "Acceptance test dummy window generator for Kiri"
 
 [dependencies.windows]
 version = "0.58"

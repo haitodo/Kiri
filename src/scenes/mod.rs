@@ -20,7 +20,7 @@ mod tests {
     fn test_journal_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "scenedock_journal_{}_{}_{}.json",
+            "kiri_journal_{}_{}_{}.json",
             std::process::id(),
             crate::diagnostics::current_unix_ms(),
             name
@@ -261,7 +261,7 @@ mod tests {
             &mut sys,
             None,
         );
-        // Switch to "trade" -> MT5 was minimized by user, NOT SceneDock, so it must NOT be restored!
+        // Switch to "trade" -> MT5 was minimized by user, NOT Kiri, so it must NOT be restored!
         let out = execute_scene_switch(
             "trade",
             &cfg,
@@ -274,7 +274,7 @@ mod tests {
         assert!(out.restored_hwnds.is_empty());
         assert!(sys.query_window(20).unwrap().is_iconic);
 
-        // Now user restores MT5 (20), then SceneDock switches to "code" (so SceneDock minimizes 20)
+        // Now user restores MT5 (20), then Kiri switches to "code" (so Kiri minimizes 20)
         sys.simulate_user_restore(20);
         let out_code = execute_scene_switch(
             "code",
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].hwnd, 20);
 
-        // AT-15: "Restore All" restores only windows minimized by SceneDock
+        // AT-15: "Restore All" restores only windows minimized by Kiri
         let restored = new_recovery.restore_all_minimized_by_us(&mut sys);
         assert_eq!(restored, 1);
         assert!(!sys.query_window(20).unwrap().is_iconic);
@@ -651,7 +651,7 @@ mod tests {
         let jpath = test_journal_path("at14");
         let mut recovery = RecoveryManager::new(jpath.clone());
 
-        // Switch to "code" -> MT5 is hung, but SceneDock does not block, issues async minimize, emits warning
+        // Switch to "code" -> MT5 is hung, but Kiri does not block, issues async minimize, emits warning
         let out = execute_scene_switch(
             "code",
             &cfg,

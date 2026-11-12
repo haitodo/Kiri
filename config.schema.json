@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scenedock.local/schemas/config.schema.json",
-  "title": "SceneDock Configuration Schema",
+  "$id": "https://kiri.local/schemas/config.schema.json",
+  "title": "Kiri Configuration Schema",
   "type": "object",
   "required": ["schema_version", "launcher", "target", "scenes", "bindings"],
   "additionalProperties": true,

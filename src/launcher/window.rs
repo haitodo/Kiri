@@ -29,7 +29,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 
 /// Window class name used for single-instance discovery (`FindWindowW`).
-pub const LAUNCHER_WINDOW_CLASS: &str = "SceneDockLauncherWindowClass";
+pub const LAUNCHER_WINDOW_CLASS: &str = "KiriLauncherWindowClass";
 
 /// Message sent by a 2nd process instance to open Settings on the running instance (Section 7.2 & 8.2).
 pub const WM_APP_OPEN_SETTINGS: u32 = 0x8000 + 4; // WM_APP + 4
@@ -74,7 +74,7 @@ impl LauncherWindowHost {
         };
 
         static REGISTER_ONCE: Once = Once::new();
-        let class_name = w!("SceneDockLauncherWindowClass");
+        let class_name = w!("KiriLauncherWindowClass");
 
         let (x, y, w, h) = app.resolve_initial_or_updated_launcher_rect();
         let dpi = app.launcher_dpi;
@@ -102,7 +102,7 @@ impl LauncherWindowHost {
             let hwnd = CreateWindowExW(
                 ex_style,
                 class_name,
-                w!("SceneDock"),
+                w!("Kiri"),
                 WS_POPUP,
                 x,
                 y,
@@ -197,8 +197,8 @@ impl LauncherWindowHost {
         unsafe {
             let ans = MessageBoxW(
                 self.hwnd,
-                w!("前回の異常終了時に SceneDock が最小化したウィンドウが残っています。\nこれらを今すぐ復元しますか？"),
-                w!("SceneDock - ウィンドウの復旧確認"),
+                w!("前回の異常終了時に Kiri が最小化したウィンドウが残っています。\nこれらを今すぐ復元しますか？"),
+                w!("Kiri - ウィンドウの復旧確認"),
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
             );
             if ans == IDYES {
@@ -313,7 +313,7 @@ impl LauncherWindowHost {
                     Some("その他のシーン (⋯)".to_string())
                 }
             }
-            HitTarget::Grip => Some("SceneDock (ドラッグ移動 / Wクリックでリセット)".to_string()),
+            HitTarget::Grip => Some("Kiri (ドラッグ移動 / Wクリックでリセット)".to_string()),
             HitTarget::None => None,
         };
 
@@ -375,7 +375,7 @@ impl LauncherWindowHost {
                 let ans = MessageBoxW(
                     self.hwnd,
                     w!("制御対象モニターがまだ設定されていません。\n現在ランチャーがあるモニターを制御対象モニターとして設定しますか？"),
-                    w!("SceneDock - 初回モニター設定"),
+                    w!("Kiri - 初回モニター設定"),
                     MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST,
                 );
                 if ans == IDYES && !self.app.launcher_monitor_id.is_empty() {

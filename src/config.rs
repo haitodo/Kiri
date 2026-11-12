@@ -700,7 +700,7 @@ mod tests {
     fn temp_test_dir(suffix: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "scenedock_test_{}_{}_{}",
+            "kiri_test_{}_{}_{}",
             std::process::id(),
             crate::diagnostics::current_unix_ms(),
             suffix
