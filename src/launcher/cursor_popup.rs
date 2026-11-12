@@ -3,10 +3,10 @@
 mod paint;
 
 use self::paint::{PopupFonts, PopupPalette};
-use super::input::point_in_rect;
+use super::input::{point_in_rect, SceneWheel};
 use super::paint::{GdiThemeCache, GdiplusContext};
 use crate::config::{AppConfig, CursorPopupPosition, RectData, Scene, Shortcut};
-use crate::platform::cursor_input::{PopupBounds, WM_APP_DISMISS_CURSOR_POPUP};
+use crate::platform::cursor_input::{PopupInput, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP};
 use crate::platform::monitors::{clamp_and_snap_in_work_area, dip_to_px};
 use crate::platform::MonitorInfoData;
 use std::mem::size_of;
@@ -14,8 +14,8 @@ use std::sync::Once;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, InvalidateRect, SetWindowRgn,
-    PAINTSTRUCT,
+    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, InvalidateRect, ScreenToClient,
+    SetWindowRgn, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::SetScrollInfo;
@@ -202,6 +202,7 @@ pub struct CursorPopup {
     width: i32,
     height: i32,
     scroll: i32,
+    scene_wheel: SceneWheel,
     hover: Option<Hit>,
     pressed: Option<Hit>,
     tracking_leave: bool,
@@ -254,6 +255,7 @@ impl CursorPopup {
                 width: 0,
                 height: 0,
                 scroll: 0,
+                scene_wheel: SceneWheel::default(),
                 hover: None,
                 pressed: None,
                 tracking_leave: false,
@@ -273,7 +275,7 @@ impl CursorPopup {
         monitor: &MonitorInfoData,
         config: &AppConfig,
         active_scene_id: Option<&str>,
-    ) -> windows::core::Result<PopupBounds> {
+    ) -> windows::core::Result<PopupInput> {
         self.scenes = config.ordered_scenes().into_iter().cloned().collect();
         self.shortcuts.clone_from(&config.shortcuts);
         self.active_scene_id = active_scene_id.map(str::to_owned);
@@ -295,6 +297,7 @@ impl CursorPopup {
         let height = bounds.height();
         self.layout = layout;
         self.scroll = scroll;
+        self.scene_wheel = SceneWheel::default();
         self.hover = None;
         self.pressed = None;
         self.tracking_leave = false;
@@ -345,9 +348,10 @@ impl CursorPopup {
             self.height = client.bottom;
             let _ = InvalidateRect(self.hwnd, None, false);
         }
-        Ok(PopupBounds {
+        Ok(PopupInput {
             rect: bounds,
             corner_radius,
+            has_scenes: !self.scenes.is_empty(),
         })
     }
 
@@ -358,6 +362,54 @@ impl CursorPopup {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+        }
+    }
+
+    pub fn wheel_steps(&mut self, delta: i16, mut point: POINT) -> i32 {
+        if !self.visible || self.pending_action.is_some() {
+            return 0;
+        }
+
+        let over_popup = self.layout.content_height > self.height
+            && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
+            && (0..self.window_width).contains(&point.x)
+            && (0..self.height).contains(&point.y);
+        let shortcuts_bottom = self
+            .layout
+            .shortcut(self.shortcuts.len().max(1) - 1, self.width)
+            .bottom;
+        let over_shortcuts = (self.layout.shortcut_header_top..shortcuts_bottom)
+            .contains(&(point.y + self.scroll));
+        let over_scroll_area = over_popup && (point.x >= self.width || over_shortcuts);
+        if self.scenes.is_empty() || over_scroll_area {
+            self.scene_wheel = SceneWheel::default();
+            let pixels = i32::from(delta) * self.layout.row_height / WHEEL_DELTA as i32;
+            self.scroll_to(self.scroll - pixels);
+            return 0;
+        }
+
+        self.scene_wheel.steps(delta)
+    }
+
+    pub fn update_active_scene(&mut self, active_scene_id: Option<&str>) {
+        if !self.visible || self.active_scene_id.as_deref() == active_scene_id {
+            return;
+        }
+        self.active_scene_id = active_scene_id.map(str::to_owned);
+        if let Some(index) = self
+            .scenes
+            .iter()
+            .position(|scene| Some(scene.id.as_str()) == active_scene_id)
+        {
+            let rect = self.layout.scene(index, self.width);
+            if rect.top < self.scroll {
+                self.scroll_to(rect.top);
+            } else if rect.bottom > self.scroll + self.height {
+                self.scroll_to(rect.bottom - self.height);
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, false);
         }
     }
 
@@ -378,24 +430,26 @@ impl CursorPopup {
         })
     }
 
-    unsafe fn scroll_to(&mut self, requested: i32) {
+    fn scroll_to(&mut self, requested: i32) {
         let scroll = requested.clamp(0, (self.layout.content_height - self.height).max(0));
         if scroll != self.scroll {
             self.scroll = scroll;
             self.hover = None;
             self.pressed = None;
-            SetScrollInfo(
-                self.hwnd,
-                SB_VERT,
-                &SCROLLINFO {
-                    cbSize: size_of::<SCROLLINFO>() as u32,
-                    fMask: SIF_POS,
-                    nPos: scroll,
-                    ..Default::default()
-                },
-                true,
-            );
-            let _ = InvalidateRect(self.hwnd, None, false);
+            unsafe {
+                SetScrollInfo(
+                    self.hwnd,
+                    SB_VERT,
+                    &SCROLLINFO {
+                        cbSize: size_of::<SCROLLINFO>() as u32,
+                        fMask: SIF_POS,
+                        nPos: scroll,
+                        ..Default::default()
+                    },
+                    true,
+                );
+                let _ = InvalidateRect(self.hwnd, None, false);
+            }
         }
     }
 
@@ -516,8 +570,10 @@ unsafe extern "system" fn window_proc(
                 );
             }
             WM_MOUSEWHEEL => {
-                let delta = ((wparam.0 >> 16) as i16) as i32;
-                popup.scroll_to(popup.scroll - delta * popup.layout.row_height / 120);
+                // Also handle native wheel messages if the low-level hook is unavailable.
+                if popup.visible {
+                    let _ = PostMessageW(popup.owner, WM_APP_CURSOR_POPUP_WHEEL, wparam, lparam);
+                }
             }
             WM_VSCROLL => {
                 let next = match SCROLLBAR_COMMAND((wparam.0 & 0xffff) as i32) {
@@ -611,7 +667,9 @@ mod tests {
     }
 
     #[test]
-    fn native_popup_keeps_focus_and_routes_click_after_scrolling() {
+    fn native_popup_routes_wheel_and_click_without_taking_focus() {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+
         unsafe {
             let work_area = RectData {
                 left: -20000,
@@ -675,6 +733,9 @@ mod tests {
             };
             GetScrollInfo(popup.hwnd, SB_VERT, &mut scrollbar).unwrap();
             assert_eq!(scrollbar.nPos, popup.scroll);
+            let initial_scroll = popup.scroll;
+            assert_eq!(popup.wheel_steps(-120, cursor), 1);
+            assert_eq!(popup.scroll, initial_scroll);
             let x = cursor.x - bounds.rect.left;
             let y = cursor.y - bounds.rect.top - CURSOR_GAP_DIP - 1;
             let hit = LPARAM(((y as isize) << 16) | x as isize);
@@ -707,6 +768,21 @@ mod tests {
                 PM_REMOVE
             )
             .as_bool());
+
+            let mut shortcut_point = POINT {
+                x: row.left + 3,
+                y: row.top + 3,
+            };
+            assert!(ClientToScreen(popup.hwnd, &mut shortcut_point).as_bool());
+            assert_eq!(popup.wheel_steps(-120, shortcut_point), 0);
+            assert_eq!(popup.scroll, popup.layout.row_height);
+
+            popup.update_active_scene(Some("trade"));
+            assert_eq!(popup.active_scene_id.as_deref(), Some("trade"));
+            let active_tile = popup.viewport_rect(popup.layout.scene(0, popup.width)).unwrap();
+            assert!(active_tile.top >= 0 && active_tile.bottom <= popup.height);
+            assert!(popup.visible);
+            assert_ne!(GetForegroundWindow(), popup.hwnd);
             popup.hide();
             assert!(!IsWindowVisible(popup.hwnd).as_bool());
             drop(popup);

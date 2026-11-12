@@ -1,4 +1,4 @@
-//! Observe Ctrl taps and popup dismissal without consuming keyboard or mouse input.
+//! Observe Ctrl taps and outside clicks, and route the wheel to the non-activating launcher.
 
 use crate::config::RectData;
 use std::cell::Cell;
@@ -9,24 +9,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RBUTTON, VK_RCONTROL, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
+    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
+    HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_XBUTTONDOWN,
 };
 
 pub const WM_APP_TOGGLE_CURSOR_POPUP: u32 = 0x8000 + 7;
 pub const WM_APP_DISMISS_CURSOR_POPUP: u32 = 0x8000 + 8;
+pub const WM_APP_CURSOR_POPUP_WHEEL: u32 = 0x8000 + 11;
 const DOUBLE_TAP_MS: u32 = 450;
 const LEFT_CTRL: u8 = 1;
 const RIGHT_CTRL: u8 = 2;
 
 #[derive(Clone, Copy)]
-pub struct PopupBounds {
+pub struct PopupInput {
     pub rect: RectData,
     pub corner_radius: i32,
+    pub has_scenes: bool,
 }
 
-impl PopupBounds {
+impl PopupInput {
     fn contains(self, point: POINT) -> bool {
         let rect = self.rect;
         if point.x < rect.left
@@ -107,7 +110,8 @@ impl CtrlTaps {
 struct InputState {
     hwnd: HWND,
     taps: CtrlTaps,
-    popup_bounds: Option<PopupBounds>,
+    popup: Option<PopupInput>,
+    bar_hovered: bool,
 }
 
 // Both low-level callbacks run on the UI thread that installed them.
@@ -157,9 +161,16 @@ impl CursorInput {
         let _ = update_mouse_hook(state);
     }
 
-    pub fn set_popup_bounds(&self, bounds: Option<PopupBounds>) -> windows::core::Result<()> {
+    pub fn set_popup(&self, popup: Option<PopupInput>) -> windows::core::Result<()> {
         let mut state = STATE.get();
-        state.popup_bounds = bounds;
+        state.popup = popup;
+        STATE.set(state);
+        update_mouse_hook(state)
+    }
+
+    pub fn set_bar_hovered(&self, hovered: bool) -> windows::core::Result<()> {
+        let mut state = STATE.get();
+        state.bar_hovered = hovered;
         STATE.set(state);
         update_mouse_hook(state)
     }
@@ -168,15 +179,15 @@ impl CursorInput {
 impl Drop for CursorInput {
     fn drop(&mut self) {
         let _ = self.set_ctrl_enabled(false);
-        let _ = self.set_popup_bounds(None);
-        STATE.set(InputState::default());
+        let state = InputState::default();
+        STATE.set(state);
+        let _ = update_mouse_hook(state);
     }
 }
 
 fn update_mouse_hook(state: InputState) -> windows::core::Result<()> {
     let hook = MOUSE_HOOK.get();
-    // Watch Ctrl+click only during a Ctrl press, and outside clicks only during a popup.
-    if state.taps.held != 0 || state.popup_bounds.is_some() {
+    if state.taps.held != 0 || state.popup.is_some() || state.bar_hovered {
         if hook.0.is_null() {
             MOUSE_HOOK.set(unsafe {
                 SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), GetModuleHandleW(None)?, 0)?
@@ -249,16 +260,12 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
     );
     if code == HC_ACTION as i32 && (button || matches!(message, WM_MOUSEWHEEL | WM_MOUSEHWHEEL)) {
-        let _ = std::panic::catch_unwind(|| {
+        let handled = std::panic::catch_unwind(|| {
             let mut state = STATE.get();
             state.taps.interrupt();
             STATE.set(state);
-            let pt = (*(lparam.0 as *const MSLLHOOKSTRUCT)).pt;
-            if button
-                && state
-                    .popup_bounds
-                    .is_some_and(|bounds| !bounds.contains(pt))
-            {
+            let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            if button && state.popup.is_some_and(|popup| !popup.contains(mouse.pt)) {
                 let _ = PostMessageW(
                     state.hwnd,
                     WM_APP_DISMISS_CURSOR_POPUP,
@@ -266,7 +273,35 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     LPARAM(0),
                 );
             }
-        });
+            if message != WM_MOUSEWHEEL {
+                return false;
+            }
+
+            let target_message = match state.popup {
+                Some(popup) if popup.has_scenes || popup.contains(mouse.pt) => {
+                    WM_APP_CURSOR_POPUP_WHEEL
+                }
+                None if state.bar_hovered && WindowFromPoint(mouse.pt) == state.hwnd => {
+                    WM_MOUSEWHEEL
+                }
+                _ => return false,
+            };
+            // Use the same delta and screen coordinate fields as WM_MOUSEWHEEL.
+            let delta = (mouse.mouseData & 0xffff_0000) as usize;
+            let x = u32::from(mouse.pt.x as u16);
+            let y = u32::from(mouse.pt.y as u16);
+            PostMessageW(
+                state.hwnd,
+                target_message,
+                WPARAM(delta),
+                LPARAM(((y << 16) | x) as isize),
+            )
+            .is_ok()
+        })
+        .unwrap_or(false);
+        if handled {
+            return LRESULT(1);
+        }
     }
     CallNextHookEx(None, code, wparam, lparam)
 }
@@ -275,6 +310,83 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn wheel_at_the_invocation_point_routes_only_while_the_scene_popup_is_open() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+            WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                GetModuleHandleW(None).unwrap(),
+                None,
+            )
+            .unwrap();
+            let input = CursorInput::new(hwnd);
+            let mouse = MSLLHOOKSTRUCT {
+                pt: POINT { x: -350, y: 175 },
+                mouseData: u32::from(-120i16 as u16) << 16,
+                ..Default::default()
+            };
+            let send_wheel = || {
+                mouse_proc(
+                    HC_ACTION as i32,
+                    WPARAM(WM_MOUSEWHEEL as usize),
+                    LPARAM(&mouse as *const _ as isize),
+                )
+            };
+            let receive_wheel = |message: &mut MSG| {
+                PeekMessageW(
+                    message,
+                    hwnd,
+                    WM_APP_CURSOR_POPUP_WHEEL,
+                    WM_APP_CURSOR_POPUP_WHEEL,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            let popup = PopupInput {
+                rect: RectData {
+                    left: -310,
+                    top: 100,
+                    right: -1,
+                    bottom: 358,
+                },
+                corner_radius: 10,
+                has_scenes: true,
+            };
+            STATE.set(InputState {
+                hwnd,
+                popup: Some(popup),
+                ..InputState::default()
+            });
+            let mut message = MSG::default();
+            assert_eq!(send_wheel().0, 1);
+            assert!(receive_wheel(&mut message));
+            assert_eq!((message.wParam.0 >> 16) as i16, -120);
+            assert_eq!(message.lParam.0 as i16, -350);
+            assert_eq!((message.lParam.0 >> 16) as i16, 175);
+
+            input.set_popup(None).unwrap();
+            let _ = send_wheel();
+            assert!(!receive_wheel(&mut message));
+            drop(input);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
+
     fn tap(taps: &mut CtrlTaps, side: u8, time: u32) -> bool {
         assert!(!taps.ctrl(side, true, time, false));
         taps.ctrl(side, false, time.wrapping_add(35), false)
@@ -282,7 +394,7 @@ mod tests {
 
     #[test]
     fn transparent_popup_corners_count_as_outside_clicks() {
-        let bounds = PopupBounds {
+        let bounds = PopupInput {
             rect: RectData {
                 left: -310,
                 top: 100,
@@ -290,12 +402,13 @@ mod tests {
                 bottom: 358,
             },
             corner_radius: 10,
+            has_scenes: true,
         };
         assert!(!bounds.contains(POINT { x: -310, y: 100 }));
         assert!(!bounds.contains(POINT { x: -2, y: 357 }));
         assert!(bounds.contains(POINT { x: -295, y: 100 }));
         assert!(bounds.contains(POINT { x: -310, y: 150 }));
-        assert!(PopupBounds {
+        assert!(PopupInput {
             corner_radius: 0,
             ..bounds
         }

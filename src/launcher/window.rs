@@ -3,7 +3,7 @@
 //! Implements all Win32 message handling specified in Sections 2.1, 2.2, 5.1, 7.1, 7.2, 7.3, and 8.2:
 //! - `WS_POPUP` with `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
 //! - `WM_MOUSEACTIVATE` -> `MA_NOACTIVATE` (clicks never steal foreground focus)
-//! - `WM_NCHITTEST` -> `HTCAPTION` strictly on the grip area; `HTCLIENT` elsewhere
+//! - `WM_NCHITTEST` -> `HTCLIENT`, with grip dragging handled by the launcher
 //! - `WM_NCLBUTTONDBLCLK` -> resets position without maximizing
 //! - `WM_NCRBUTTONUP` / `WM_CONTEXTMENU` -> shows custom context menu even on the grip
 //! - `WM_EXITSIZEMOVE` -> clamps/snaps to work area and persists position once at drag end
@@ -15,12 +15,12 @@
 use crate::app::AppController;
 use crate::diagnostics::{log_error, log_info, log_warn};
 use crate::launcher::cursor_popup::{CursorPopup, PopupAction, WM_APP_CURSOR_POPUP_ACTION};
-use crate::launcher::input::{HitTarget, LauncherLayout};
+use crate::launcher::input::{wheel_scene_index, HitTarget, LauncherLayout, SceneWheel};
 use crate::launcher::menu::{show_context_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
 use crate::platform::cursor_input::{
-    CursorInput, WM_APP_DISMISS_CURSOR_POPUP, WM_APP_TOGGLE_CURSOR_POPUP,
+    CursorInput, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP, WM_APP_TOGGLE_CURSOR_POPUP,
 };
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
 use crate::platform::monitors::find_monitor_for_point;
@@ -70,6 +70,7 @@ pub struct LauncherWindowHost {
     pub overflow_popup: Option<Box<OverflowPopup>>,
     cursor_input: CursorInput,
     cursor_popup: Option<Box<CursorPopup>>,
+    bar_wheel: SceneWheel,
     pub tray: Option<TrayIcon>,
     pub win_event_hook: Option<WinEventHookGuard>,
     pub registered_hotkey_count: usize,
@@ -193,6 +194,7 @@ impl LauncherWindowHost {
                 overflow_popup,
                 cursor_input: CursorInput::new(hwnd),
                 cursor_popup: None,
+                bar_wheel: SceneWheel::default(),
                 tray,
                 win_event_hook,
                 registered_hotkey_count: 0,
@@ -276,9 +278,15 @@ impl LauncherWindowHost {
         if let Err(error) = self.cursor_input.set_ctrl_enabled(self.app.config.launcher.ctrl_double_tap) {
             log_warn("hotkey", &format!("Could not enable Ctrl double-tap: {error}"));
         }
+        let bar_hovered = self.app.config.launcher.show_bar
+            && self.tracking_mouse_leave
+            && !self.app.config.scenes.is_empty();
+        let _ = self.cursor_input.set_bar_hovered(bar_hovered);
         let command = if self.app.config.launcher.show_bar {
             SW_SHOWNOACTIVATE
         } else {
+            self.tracking_mouse_leave = false;
+            self.bar_wheel = SceneWheel::default();
             self.hide_tooltip();
             if let Some(overflow) = &mut self.overflow_popup {
                 overflow.hide();
@@ -319,9 +327,9 @@ impl LauncherWindowHost {
         }
         if let Some(popup) = &mut self.cursor_popup {
             match popup.show(cursor, monitor, &self.app.config, self.app.state_mgr.active_scene_id()) {
-                Ok(bounds) => {
-                    if let Err(error) = self.cursor_input.set_popup_bounds(Some(bounds)) {
-                        log_warn("launcher", &format!("Could not observe outside clicks: {error}"));
+                Ok(input) => {
+                    if let Err(error) = self.cursor_input.set_popup(Some(input)) {
+                        log_warn("launcher", &format!("Could not hook popup mouse input: {error}"));
                     }
                 }
                 Err(error) => {
@@ -334,7 +342,7 @@ impl LauncherWindowHost {
 
     fn hide_cursor_popup(&mut self) {
         if let Some(popup) = &mut self.cursor_popup {
-            let _ = self.cursor_input.set_popup_bounds(None);
+            let _ = self.cursor_input.set_popup(None);
             popup.hide();
         }
     }
@@ -497,19 +505,47 @@ impl LauncherWindowHost {
     }
 
     pub fn trigger_scene_switch(&mut self, scene_id: &str) {
+        self.hide_cursor_popup();
+        self.switch_scene(scene_id);
+    }
+
+    fn cycle_scene(&mut self, steps: i32) {
+        if steps == 0 {
+            return;
+        }
+        let scenes = self.app.config.ordered_scenes();
+        let active_id = self.app.state_mgr.active_scene_id();
+        let active_index = scenes
+            .iter()
+            .position(|scene| Some(scene.id.as_str()) == active_id);
+        let Some(index) = wheel_scene_index(scenes.len(), active_index, steps) else {
+            return;
+        };
+        let scene_id = scenes[index].id.clone();
+        self.hide_tooltip();
+        if let Some(overflow) = &mut self.overflow_popup {
+            overflow.hide();
+        }
+        self.switch_scene(&scene_id);
+        if let Some(popup) = &mut self.cursor_popup {
+            popup.update_active_scene(self.app.state_mgr.active_scene_id());
+        }
+    }
+
+    fn switch_scene(&mut self, scene_id: &str) {
         use windows::core::w;
         use windows::Win32::Graphics::Gdi::InvalidateRect;
         use windows::Win32::UI::WindowsAndMessaging::{
             KillTimer, MessageBoxW, SetTimer, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
         };
 
-        self.hide_cursor_popup();
         let outcome = self.app.switch_to_scene(scene_id);
 
         if outcome
             .warnings
             .contains(&SwitchWarning::TargetMonitorNotConfigured)
         {
+            self.hide_cursor_popup();
             // Per Section 0 & 6: Prompt user to select target monitor on first use, proposing launcher's monitor
             unsafe {
                 let ans = MessageBoxW(
@@ -605,7 +641,7 @@ unsafe extern "system" fn launcher_wndproc(
     use crate::config::RectData;
     use windows::Win32::Foundation::{LRESULT, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT,
+        BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -613,9 +649,9 @@ unsafe extern "system" fn launcher_wndproc(
         SetCursor, SetTimer, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_SIZEALL, MA_NOACTIVATE,
         WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
         WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WM_NCHITTEST,
-        WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
-        WM_WTSSESSION_CHANGE,
+        WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP,
+        WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP,
+        WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE,
     };
 
     // Per Section 7.1: Catch any Rust panic at the FFI boundary to prevent immediate process abort
@@ -623,6 +659,10 @@ unsafe extern "system" fn launcher_wndproc(
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut LauncherWindowHost;
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        // WindowFromPoint in the wheel hook can request a hit test synchronously.
+        if msg == WM_NCHITTEST {
+            return LRESULT(HTCLIENT as isize);
         }
         let host = &mut *ptr;
 
@@ -639,10 +679,6 @@ unsafe extern "system" fn launcher_wndproc(
         match msg {
             // Section 2.1: Never activate the launcher window on mouse click
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-
-            // Section 2.2: All client points use HTCLIENT; custom pointer capture on HitTarget::Grip
-            // handles dragging smoothly across monitors with different DPIs without modal loop oscillation.
-            WM_NCHITTEST => LRESULT(HTCLIENT as isize),
 
             WM_SETCURSOR => {
                 if host.drag_state.is_some() || host.hovered == HitTarget::Grip {
@@ -787,8 +823,10 @@ unsafe extern "system" fn launcher_wndproc(
                         hwndTrack: hwnd,
                         dwHoverTime: 0,
                     };
-                    let _ = TrackMouseEvent(&mut tme);
-                    host.tracking_mouse_leave = true;
+                    host.tracking_mouse_leave = TrackMouseEvent(&mut tme).is_ok();
+                    if host.tracking_mouse_leave && !host.app.config.scenes.is_empty() {
+                        let _ = host.cursor_input.set_bar_hovered(true);
+                    }
                 }
 
                 let new_target = host.layout.hit_test(client_x, client_y);
@@ -808,11 +846,38 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_MOUSELEAVE => {
                 host.tracking_mouse_leave = false;
+                let _ = host.cursor_input.set_bar_hovered(false);
+                host.bar_wheel = SceneWheel::default();
                 if host.drag_state.is_none() {
                     host.hovered = HitTarget::None;
                     host.hide_tooltip();
                     let _ = InvalidateRect(hwnd, None, false);
                 }
+                LRESULT(0)
+            }
+
+            WM_MOUSEWHEEL | WM_APP_CURSOR_POPUP_WHEEL => {
+                let delta = (wparam.0 >> 16) as i16;
+                let mut point = POINT {
+                    x: i32::from(lparam.0 as i16),
+                    y: i32::from((lparam.0 >> 16) as i16),
+                };
+                let steps = if msg == WM_APP_CURSOR_POPUP_WHEEL {
+                    host.cursor_popup
+                        .as_mut()
+                        .map_or(0, |popup| popup.wheel_steps(delta, point))
+                } else if host.app.config.launcher.show_bar
+                    && host.drag_state.is_none()
+                    && !host.cursor_popup.as_ref().is_some_and(|popup| popup.visible)
+                    && ScreenToClient(hwnd, &mut point).as_bool()
+                    && (0..host.layout.width_px).contains(&point.x)
+                    && (0..host.layout.height_px).contains(&point.y)
+                {
+                    host.bar_wheel.steps(delta)
+                } else {
+                    0
+                };
+                host.cycle_scene(steps);
                 LRESULT(0)
             }
 

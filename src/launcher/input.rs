@@ -8,10 +8,38 @@
 
 use crate::config::{LauncherConfig, Orientation, RectData, Scene};
 use crate::platform::monitors::dip_to_px;
+use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
 pub const OUTER_PADDING_DIP: i32 = 3;
 pub const ELEMENT_GAP_DIP: i32 = 2;
 pub const CORNER_RADIUS_DIP: i32 = 6;
+
+#[derive(Default)]
+pub(super) struct SceneWheel {
+    remainder: i32,
+}
+
+impl SceneWheel {
+    pub(super) fn steps(&mut self, delta: i16) -> i32 {
+        let notch = WHEEL_DELTA as i32;
+        let total = self.remainder + i32::from(delta);
+        self.remainder = total % notch;
+        -(total / notch)
+    }
+}
+
+pub(super) fn wheel_scene_index(
+    scene_count: usize,
+    active_index: Option<usize>,
+    steps: i32,
+) -> Option<usize> {
+    if scene_count == 0 || steps == 0 {
+        return None;
+    }
+    let start = active_index.unwrap_or(if steps > 0 { scene_count - 1 } else { 0 });
+    let next = (start as i64 + i64::from(steps)).rem_euclid(scene_count as i64) as usize;
+    (Some(next) != active_index).then_some(next)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
@@ -199,6 +227,29 @@ pub fn point_in_rect(x: i32, y: i32, r: &RectData) -> bool {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+
+    #[test]
+    fn wheel_accumulates_partial_deltas_in_both_directions() {
+        let mut wheel = SceneWheel::default();
+        assert_eq!(wheel.steps(-30), 0);
+        assert_eq!(wheel.steps(-60), 0);
+        assert_eq!(wheel.steps(30), 0);
+        assert_eq!(wheel.steps(-60), 1);
+        assert_eq!(wheel.steps(270), -2);
+        assert_eq!(wheel.steps(90), -1);
+    }
+
+    #[test]
+    fn wheel_wraps_around_the_scene_order() {
+        assert_eq!(wheel_scene_index(3, Some(0), -1), Some(2));
+        assert_eq!(wheel_scene_index(3, Some(2), 1), Some(0));
+        assert_eq!(wheel_scene_index(3, Some(0), 2), Some(2));
+        assert_eq!(wheel_scene_index(3, Some(0), -3), None);
+        assert_eq!(wheel_scene_index(3, None, 1), Some(0));
+        assert_eq!(wheel_scene_index(3, None, -1), Some(2));
+        assert_eq!(wheel_scene_index(0, None, 1), None);
+        assert_eq!(wheel_scene_index(1, Some(0), 1), None);
+    }
 
     #[test]
     fn test_launcher_dimensions_match_spec_126x38_at_96dpi() {
