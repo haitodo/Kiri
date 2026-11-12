@@ -1,0 +1,156 @@
+# ==============================================================================
+# SceneDock Git Ignore Rules
+# Designed to protect personal data, credentials, runtime journals, and build artifacts
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Personal & Sensitive Information (Never commit secrets / credentials)
+# ------------------------------------------------------------------------------
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets/
+
+# Credentials, tokens, and authentication configs
+credentials.json
+secrets.json
+auth.json
+token.json
+tokens.json
+jwt.token
+*credential*
+*secret*
+
+# Cloud & service credentials
+.aws/
+.azure/
+.gcp/
+google-credentials*.json
+
+# Private keys, certificates, and keystores
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+*.der
+*.kdbx
+*.keystore
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+known_hosts
+
+# ------------------------------------------------------------------------------
+# 2. SceneDock Runtime State & Local Configuration
+# (May contain live trading account numbers, window titles, and local user paths)
+# ------------------------------------------------------------------------------
+config.json
+config.json.bak
+config.v*.json
+runtime-state.json
+runtime-state.json.bak
+*.local.json
+local.config.json
+
+# Explicitly keep the JSON schema definition
+!config.schema.json
+
+# Application logs & diagnostics
+scenedock.log
+scenedock.log.*
+logs/
+*.log
+*.log.*
+
+# Crash dumps & debugging traces
+*.dmp
+*.mdmp
+*.crash
+*.stackdump
+
+# ------------------------------------------------------------------------------
+# 3. Rust & Cargo Build Artifacts
+# ------------------------------------------------------------------------------
+target/
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+
+# Local binary outputs (in case copied outside target/)
+*.exe
+*.dll
+*.so
+*.dylib
+*.rlib
+
+# ------------------------------------------------------------------------------
+# 4. IDE, Editor, and Tool Configuration
+# ------------------------------------------------------------------------------
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosv
+*.sln.docstates
+
+# Visual Studio Code (personal workspace settings & launch configurations)
+.vscode/
+
+# JetBrains (CLion, IntelliJ, etc.)
+.idea/
+*.iml
+
+# Vim / Emacs / Sublime Text / Other editors
+*.swp
+*.swo
+*~
+.#*
+*.sublime-workspace
+*.sublime-project
+
+# ------------------------------------------------------------------------------
+# 5. Operating System Artifacts
+# ------------------------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+.directory
+
+# ------------------------------------------------------------------------------
+# 6. Temporary and Backup Files
+# ------------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.invalid-*
+
+# ------------------------------------------------------------------------------
+# 7. Other Package Managers & Runtimes (Fallback)
+# ------------------------------------------------------------------------------
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/

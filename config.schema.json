@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scenedock.local/schemas/config.schema.json",
+  "title": "SceneDock Configuration Schema",
+  "type": "object",
+  "required": ["schema_version", "launcher", "target", "scenes", "bindings"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "launcher": {
+      "type": "object",
+      "required": [
+        "orientation",
+        "button_size_dip",
+        "grip_size_dip",
+        "visible_slots",
+        "always_on_top",
+        "snap_to_edges",
+        "focus_on_switch"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "orientation": {
+          "type": "string",
+          "enum": ["horizontal", "vertical"]
+        },
+        "button_size_dip": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 96,
+          "default": 32
+        },
+        "grip_size_dip": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 48,
+          "default": 18
+        },
+        "visible_slots": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 12,
+          "default": 3
+        },
+        "always_on_top": {
+          "type": "boolean",
+          "default": true
+        },
+        "snap_to_edges": {
+          "type": "boolean",
+          "default": false
+        },
+        "focus_on_switch": {
+          "type": "boolean",
+          "default": false
+        },
+        "position": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["monitor_id", "rel_x", "rel_y"],
+              "properties": {
+                "monitor_id": { "type": "string" },
+                "rel_x": { "type": "number" },
+                "rel_y": { "type": "number" },
+                "dpi": { "type": "integer" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["monitor_policy"],
+      "additionalProperties": true,
+      "properties": {
+        "monitor_policy": {
+          "type": "string",
+          "enum": ["fixed", "launcher_monitor"]
+        },
+        "monitor_id": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "icon", "order", "pinned"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "icon": { "type": "string" },
+          "order": { "type": "integer" },
+          "pinned": { "type": "boolean" }
+        }
+      }
+    },
+    "bindings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "match", "scene_ids", "always_visible", "enabled"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "match": {
+            "type": "object",
+            "required": ["exe_path", "window_class", "title_rule"],
+            "properties": {
+              "exe_path": { "type": "string" },
+              "window_class": { "type": "string" },
+              "title_rule": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": ["any", "exact", "prefix", "contains", "regex"]
+                  },
+                  "value": { "type": ["string", "null"] }
+                }
+              },
+              "aumid": { "type": ["string", "null"] }
+            }
+          },
+          "instance_hint": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "properties": {
+                  "last_pid": { "type": ["integer", "null"] },
+                  "last_start_time": { "type": ["integer", "null"] },
+                  "disambiguator": { "type": ["string", "null"] }
+                }
+              }
+            ]
+          },
+          "scene_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "always_visible": { "type": "boolean" },
+          "enabled": { "type": "boolean" }
+        }
+      }
+    },
+    "hotkeys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scene_id", "modifiers", "vk"],
+        "properties": {
+          "scene_id": { "type": "string" },
+          "modifiers": { "type": "integer" },
+          "vk": { "type": "integer" }
+        }
+      }
+    },
+    "layouts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scene_id", "monitor_id", "entries"],
+        "properties": {
+          "scene_id": { "type": "string" },
+          "monitor_id": { "type": "string" },
+          "dpi": { "type": "integer" },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["binding_id", "rel_left", "rel_top", "rel_right", "rel_bottom", "maximized"],
+              "properties": {
+                "binding_id": { "type": "string" },
+                "rel_left": { "type": "number" },
+                "rel_top": { "type": "number" },
+                "rel_right": { "type": "number" },
+                "rel_bottom": { "type": "number" },
+                "maximized": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "monitors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["monitor_id"],
+        "properties": {
+          "monitor_id": { "type": "string" },
+          "friendly_name": { "type": ["string", "null"] },
+          "work_area": {
+            "type": "object",
+            "properties": {
+              "left": { "type": "integer" },
+              "top": { "type": "integer" },
+              "right": { "type": "integer" },
+              "bottom": { "type": "integer" }
+            }
+          },
+          "dpi": { "type": "integer" },
+          "last_active_scene_id": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
