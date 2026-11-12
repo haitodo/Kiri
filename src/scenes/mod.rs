@@ -940,4 +940,148 @@ mod tests {
 
         let _ = std::fs::remove_file(jpath);
     }
+
+    #[test]
+    fn test_switch_brings_target_apps_to_front_above_active_and_unregistered_windows() {
+        let cfg = setup_standard_config();
+        // Bindings:
+        // MT5 (20) -> "trade"
+        // VSCode (30) -> "code"
+        // Shared (40) -> "trade", "code"
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+
+        // Window 99: An unregistered browser window (e.g. Chrome) that is currently active and in foreground!
+        sys.add_window(make_win(
+            99,
+            999,
+            r"C:\Program Files\Google\Chrome\chrome.exe",
+            "Chrome_WidgetWin_1",
+            "Google Chrome",
+            "MON-2-TARGET",
+        ));
+        // Window 20: MT5 (trade) - currently iconic
+        let mut mt5 = make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5",
+            "MON-2-TARGET",
+        );
+        mt5.is_iconic = true;
+        sys.add_window(mt5);
+
+        // Window 40: Shared window - currently open, but behind Chrome (z_order = 2)
+        sys.add_window(make_win(
+            40,
+            400,
+            r"C:\Apps\Shared\shared.exe",
+            "SharedClass",
+            "Shared App",
+            "MON-2-TARGET",
+        ));
+
+        // Chrome (99) is the foreground window!
+        sys.foreground_hwnd = Some(99);
+
+        let mut state_mgr = SceneStateManager::new(None);
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("bring_to_front_test");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+
+        // Switch to "trade"
+        let out = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+
+        assert!(out.switched);
+        // MT5 was restored
+        assert!(!sys.query_window(20).unwrap().is_iconic);
+        // Unregistered Chrome (99) was NOT minimized
+        assert!(!sys.query_window(99).unwrap().is_iconic);
+
+        // Both target windows (20, 40) must be brought to front above Chrome (99)!
+        let z_mt5 = sys.windows.iter().position(|w| w.hwnd == 20).unwrap();
+        let z_shared = sys.windows.iter().position(|w| w.hwnd == 40).unwrap();
+        let z_chrome = sys.windows.iter().position(|w| w.hwnd == 99).unwrap();
+
+        assert!(
+            z_mt5 < z_chrome,
+            "MT5 (z={}) should be in front of Chrome (z={})",
+            z_mt5,
+            z_chrome
+        );
+        assert!(
+            z_shared < z_chrome,
+            "Shared app (z={}) should be in front of Chrome (z={})",
+            z_shared,
+            z_chrome
+        );
+
+        // Topmost target window must have received foreground focus!
+        assert_eq!(sys.get_foreground_window(), Some(20));
+
+        let _ = std::fs::remove_file(jpath);
+    }
+
+    #[test]
+    fn test_switch_brings_already_non_iconic_target_app_to_front() {
+        let cfg = setup_standard_config();
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+
+        // Scene "code" app: VSCode (30), currently open and active in foreground
+        sys.add_window(make_win(
+            30,
+            300,
+            r"C:\Apps\VSCode\Code.exe",
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+            "MON-2-TARGET",
+        ));
+
+        // Scene "trade" app: MT5 (20) - NOT iconic, but sitting in background behind VSCode!
+        sys.add_window(make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5",
+            "MON-2-TARGET",
+        ));
+
+        sys.foreground_hwnd = Some(30);
+
+        let mut state_mgr = SceneStateManager::new(Some("code".to_string()));
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("non_iconic_front_test");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+
+        // Switch to "trade"
+        let out = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+
+        assert!(out.switched);
+        // VSCode (30) was minimized because it's not in "trade"
+        assert!(sys.query_window(30).unwrap().is_iconic);
+
+        // MT5 (20) was already non-iconic, so not restored, but brought to front & focused!
+        assert!(!sys.query_window(20).unwrap().is_iconic);
+        assert_eq!(sys.windows[0].hwnd, 20); // Front of Z-order
+        assert_eq!(sys.get_foreground_window(), Some(20));
+
+        let _ = std::fs::remove_file(jpath);
+    }
 }

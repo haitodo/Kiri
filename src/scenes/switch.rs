@@ -341,8 +341,10 @@ pub fn execute_scene_switch(
     }
 
     // Step 4: Compute `to_restore` = windows belonging to `next` (not `always_visible`)
-    // that are currently `IsIconic`.
+    // that are currently `IsIconic`. Also compute `to_bring_to_front` = windows belonging to `next`
+    // that are already open (non-iconic) so they are brought above previously open/unregistered apps.
     let mut to_restore: Vec<(String, WindowInstance, usize)> = Vec::new();
+    let mut to_bring_to_front: Vec<(String, WindowInstance, usize)> = Vec::new();
     let mut seen_restore_hwnds: HashSet<u64> = HashSet::new();
 
     if config.launcher.restore_all_on_switch {
@@ -357,20 +359,29 @@ pub fn execute_scene_switch(
             } else {
                 win.monitor_id == target_mon_id
             };
-            if on_valid_monitor && win.is_iconic {
-                if seen_restore_hwnds.insert(win.hwnd) {
-                    if win.is_hung {
-                        warnings.push(SwitchWarning::HungWindowDetected {
-                            binding_id: binding_id.clone(),
-                            hwnd: win.hwnd,
-                        });
+            if on_valid_monitor {
+                if win.is_iconic {
+                    if seen_restore_hwnds.insert(win.hwnd) {
+                        if win.is_hung {
+                            warnings.push(SwitchWarning::HungWindowDetected {
+                                binding_id: binding_id.clone(),
+                                hwnd: win.hwnd,
+                            });
+                        }
+                        let z = recovery
+                            .actions()
+                            .get(&win.hwnd)
+                            .map(|a| a.z_order_at_minimize)
+                            .unwrap_or(win.z_order);
+                        to_restore.push((binding_id.clone(), win.clone(), z));
                     }
+                } else if win.is_visible {
                     let z = recovery
                         .actions()
                         .get(&win.hwnd)
                         .map(|a| a.z_order_at_minimize)
                         .unwrap_or(win.z_order);
-                    to_restore.push((binding_id.clone(), win.clone(), z));
+                    to_bring_to_front.push((binding_id.clone(), win.clone(), z));
                 }
             }
         }
@@ -488,7 +499,7 @@ pub fn execute_scene_switch(
     let mut verification_restored = Vec::new();
     let total_restore = to_restore.len();
 
-    for (idx, (binding_id, win, _z)) in to_restore.into_iter().enumerate() {
+    for (idx, (binding_id, win, _z)) in to_restore.iter().enumerate() {
         // Section 5.3: Always re-verify `is_iconic` immediately before sending restore command
         let still_iconic = sys
             .query_window(win.hwnd)
@@ -500,7 +511,10 @@ pub fn execute_scene_switch(
         }
 
         let is_topmost_restore = idx + 1 == total_restore;
-        let cmd = if config.launcher.focus_on_switch && is_topmost_restore {
+        let cmd = if config.launcher.focus_on_switch
+            && is_topmost_restore
+            && deferred_foreground_minimize.is_none()
+        {
             ShowCmd::RestoreActivate
         } else {
             ShowCmd::RestoreNoActivate
@@ -510,7 +524,7 @@ pub fn execute_scene_switch(
         match sys.show_window_async(win.hwnd, cmd) {
             Ok(()) => {
                 restored_hwnds.push(win.hwnd);
-                verification_restored.push((binding_id, win.hwnd));
+                verification_restored.push((binding_id.clone(), win.hwnd));
             }
             Err(e) => {
                 log_warn(
@@ -524,12 +538,12 @@ pub fn execute_scene_switch(
     // Step 7b (Section 5.4, FR-18, AT-25): If the foreground window was in `to_minimize`,
     // minimize it AFTER restoring next-scene windows using `SW_MINIMIZE` (`MinimizeActivateNext`)
     // so keyboard focus never stays trapped on an invisible minimized window.
-    if let Some((binding_id, fg_win)) = deferred_foreground_minimize {
+    if let Some((binding_id, fg_win)) = &deferred_foreground_minimize {
         match sys.show_window_async(fg_win.hwnd, ShowCmd::MinimizeActivateNext) {
             Ok(()) => {
                 recovery.mark_minimize_issued(fg_win.hwnd);
                 minimized_hwnds.push(fg_win.hwnd);
-                verification_minimized.push((binding_id, fg_win.hwnd));
+                verification_minimized.push((binding_id.clone(), fg_win.hwnd));
             }
             Err(e) => {
                 log_warn(
@@ -538,6 +552,39 @@ pub fn execute_scene_switch(
                 );
                 recovery.invalidate_hwnd(fg_win.hwnd);
             }
+        }
+    }
+
+    // Step 8b: Bring all next-scene windows (restored + already non-iconic) to the top of Z-order
+    // in bottom-to-top order so they appear above previously open/unregistered apps,
+    // and activate the topmost window so it doesn't get obscured behind active apps.
+    let mut all_target_scene_windows: Vec<(u64, usize, bool)> = Vec::new(); // (hwnd, z_order, is_hung)
+    for (_bid, win, z) in &to_restore {
+        if restored_hwnds.contains(&win.hwnd) {
+            all_target_scene_windows.push((win.hwnd, *z, win.is_hung));
+        }
+    }
+    for (_bid, win, z) in &to_bring_to_front {
+        all_target_scene_windows.push((win.hwnd, *z, win.is_hung));
+    }
+
+    // Sort descending by Z-order (largest Z = bottom-most first, so topmost window is brought to top last)
+    all_target_scene_windows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (h, _z, _is_hung) in &all_target_scene_windows {
+        sys.bring_to_top(*h);
+    }
+
+    // Determine the topmost candidate to focus
+    let topmost_candidate = all_target_scene_windows
+        .iter()
+        .rev()
+        .find(|(_, _, is_hung)| !*is_hung)
+        .or_else(|| all_target_scene_windows.last());
+
+    if let Some((top_hwnd, _, _)) = topmost_candidate {
+        if config.launcher.focus_on_switch || deferred_foreground_minimize.is_some() {
+            sys.set_foreground_window(*top_hwnd);
         }
     }
 

@@ -52,7 +52,7 @@ pub struct LauncherConfig {
     pub always_on_top: bool,
     #[serde(default)]
     pub snap_to_edges: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub focus_on_switch: bool,
     /// When switching to a scene, restore ALL registered windows that are currently iconic,
     /// regardless of whether they were minimized by Kiri or manually by the user.
@@ -84,7 +84,7 @@ impl Default for LauncherConfig {
             visible_slots: 3,
             always_on_top: true,
             snap_to_edges: false,
-            focus_on_switch: false,
+            focus_on_switch: true,
             restore_all_on_switch: true,
             position: None,
         }

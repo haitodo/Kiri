@@ -202,21 +202,32 @@ impl WindowSystem for FakeWindowSystem {
         Ok(())
     }
 
+    fn bring_to_top(&mut self, hwnd: u64) -> bool {
+        if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd) {
+            let win = self.windows.remove(pos);
+            self.windows.insert(0, win);
+            self.recompute_z_order();
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_foreground_window(&self) -> Option<u64> {
         self.foreground_hwnd
     }
 
     fn set_foreground_window(&mut self, hwnd: u64) -> bool {
-        if self
-            .windows
-            .iter()
-            .any(|w| w.hwnd == hwnd && w.is_visible && !w.is_iconic)
-        {
-            self.foreground_hwnd = Some(hwnd);
-            true
-        } else {
-            false
+        if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd) {
+            if self.windows[pos].is_visible && !self.windows[pos].is_iconic {
+                let win = self.windows.remove(pos);
+                self.windows.insert(0, win);
+                self.recompute_z_order();
+                self.foreground_hwnd = Some(hwnd);
+                return true;
+            }
         }
+        false
     }
 
     fn set_window_placement(

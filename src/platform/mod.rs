@@ -109,6 +109,9 @@ pub trait WindowSystem {
     /// Issue an asynchronous `ShowWindowAsync` command to another process's window.
     fn show_window_async(&mut self, hwnd: u64, cmd: ShowCmd) -> Result<(), PlatformError>;
 
+    /// Bring a window to the top of the Z-order without necessarily activating it.
+    fn bring_to_top(&mut self, hwnd: u64) -> bool;
+
     /// Get the current foreground window HWND (`GetForegroundWindow`).
     fn get_foreground_window(&self) -> Option<u64>;
 

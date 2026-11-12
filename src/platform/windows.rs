@@ -127,6 +127,27 @@ impl WindowSystem for Win32WindowSystem {
         }
     }
 
+    fn bring_to_top(&mut self, hwnd_val: u64) -> bool {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_SHOWWINDOW,
+        };
+        let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            BringWindowToTop(hwnd).is_ok()
+        }
+    }
+
     fn get_foreground_window(&self) -> Option<u64> {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         unsafe {
@@ -141,9 +162,56 @@ impl WindowSystem for Win32WindowSystem {
 
     fn set_foreground_window(&mut self, hwnd_val: u64) -> bool {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
-        let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
-        unsafe { SetForegroundWindow(hwnd).as_bool() }
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+            SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+        };
+
+        let target_hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
+        unsafe {
+            let _ = SetWindowPos(
+                target_hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = BringWindowToTop(target_hwnd);
+
+            let fg_hwnd = GetForegroundWindow();
+            if fg_hwnd == target_hwnd {
+                return true;
+            }
+
+            let cur_thread_id = GetCurrentThreadId();
+            let fg_thread_id = if !fg_hwnd.0.is_null() {
+                GetWindowThreadProcessId(fg_hwnd, None)
+            } else {
+                0
+            };
+            let target_thread_id = GetWindowThreadProcessId(target_hwnd, None);
+
+            if fg_thread_id != 0 && fg_thread_id != cur_thread_id {
+                let _ = AttachThreadInput(cur_thread_id, fg_thread_id, true);
+                if target_thread_id != 0 && target_thread_id != cur_thread_id {
+                    let _ = AttachThreadInput(cur_thread_id, target_thread_id, true);
+                }
+
+                let ok = SetForegroundWindow(target_hwnd).as_bool();
+                let _ = BringWindowToTop(target_hwnd);
+
+                if target_thread_id != 0 && target_thread_id != cur_thread_id {
+                    let _ = AttachThreadInput(cur_thread_id, target_thread_id, false);
+                }
+                let _ = AttachThreadInput(cur_thread_id, fg_thread_id, false);
+                ok
+            } else {
+                SetForegroundWindow(target_hwnd).as_bool()
+            }
+        }
     }
 
     fn set_window_placement(

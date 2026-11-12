@@ -210,6 +210,7 @@ switch_scene(target_monitor, next):
   6. to_minimize の配置・Z順を記録し、ジャーナルへ pending として先に書く
   7. 最小化要求（SW_SHOWMINNOACTIVE）。前景窓が含まれる場合はその窓だけ8.の後に処理（5.4）
   8. to_restore を記録済みZ順の下から上へ復元要求（5.3）
+ 8b. 次シーンの全窓（復元窓＋既に開いていた非最小化窓）をZ順下位から上位へ前面化（BringWindowToTop）し、最上位窓をアクティブ化（focus_on_switch）
   9. state = Active(next) を確定し、ランチャーの選択表示を更新
  10. 単発タイマー（例：500ms後）で結果を照合し、失敗窓を個別に記録・警告
      （失敗があっても他の操作は続行済み）
@@ -248,9 +249,10 @@ switch_scene(target_monitor, next):
 ## 5.4 フォーカス・前面化
 
 - ランチャー自体のクリックではOSの前面ウィンドウを奪わない。
-- 初期版はシーン切替後に**無条件の `SetForegroundWindow` をしない**。フォーカス移動はWindowsの制限を尊重する。
-- 必要であれば「切替先を前面化する」オプションとして実装・評価する（初期OFF）。
-- フォーカス維持の失敗はシーン切替失敗と見なさない。トレードソフトへの意図しないキー入力を避ける。
+- シーン切替時は、次シーンの登録ウィンドウ群（復元された窓および既に開いていた非最小化窓）を、背面に隠れるのを防ぐためZ順の下から上へ前面化（`BringWindowToTop` / `SetWindowPos(HWND_TOP)`）する。
+- 最上位の登録ウィンドウに対してフォアグラウンド設定（`SetForegroundWindow`）を行い、未登録アプリや開いていたアプリの背面に隠れるのを防止する（`focus_on_switch`、既定: 有効）。
+- フォーカス移動はWindowsの制限（Foreground Lockout）に対応するため `AttachThreadInput` を用いて確実に前面化する。
+- フォーカス維持の失敗はシーン切替失敗と見なさない。
 - **入力の取り残し防止（FR-18）**：切替直前の前景窓が最小化対象に含まれる場合、最小化後もキーボードフォーカスが不可視の窓に残り、キー入力（取引ソフトの注文ショートカット等）がその窓に届く危険がある。この窓は次シーンの窓の復元要求を出した後に最小化する。第一候補は、この窓に限り `SW_MINIMIZE` を使い、OSにZ順で次の窓（直前に復元した次シーンの窓になることが多い）をアクティブ化させる方式とする。照合時に前景窓が最小化済みの窓のままなら、OSの制限の範囲で入力先を安全な窓（次シーンの最上位窓、なければデスクトップ）へ移す。挙動は Phase 0 でMT5／cTraderを用いて検証し、結果を既知の制約に記載する。
 
 # 6. 設定データ形式（JSON案）
@@ -267,7 +269,7 @@ switch_scene(target_monitor, next):
     "visible_slots": 3,
     "always_on_top": true,
     "snap_to_edges": false,
-    "focus_on_switch": false,
+    "focus_on_switch": true,
     "position": null
   },
   "target": {
