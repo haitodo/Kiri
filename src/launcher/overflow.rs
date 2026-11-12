@@ -66,6 +66,8 @@ pub struct OverflowPopup {
     active_scene_id: Option<String>,
     hovered_idx: Option<usize>,
     dpi: u32,
+    font_dpi: u32,
+    font: windows::Win32::Graphics::Gdi::HFONT,
     visible: bool,
     bg_brush: windows::Win32::Graphics::Gdi::HBRUSH,
     border_brush: windows::Win32::Graphics::Gdi::HBRUSH,
@@ -78,12 +80,40 @@ impl Drop for OverflowPopup {
     fn drop(&mut self) {
         use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
         unsafe {
+            if !self.font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
             let _ = DeleteObject(HGDIOBJ(self.bg_brush.0));
             let _ = DeleteObject(HGDIOBJ(self.border_brush.0));
             let _ = DeleteObject(HGDIOBJ(self.hover_brush.0));
             let _ = DeleteObject(HGDIOBJ(self.active_brush.0));
         }
     }
+}
+
+#[cfg(windows)]
+unsafe fn create_popup_font(dpi: u32) -> windows::Win32::Graphics::Gdi::HFONT {
+    use windows::core::w;
+    use windows::Win32::Graphics::Gdi::{
+        CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, FF_DONTCARE,
+        FW_NORMAL, OUT_DEFAULT_PRECIS,
+    };
+    CreateFontW(
+        -dip_to_px(13, dpi.max(96)),
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        FF_DONTCARE.0 as u32,
+        w!("Yu Gothic UI"),
+    )
 }
 
 #[cfg(windows)]
@@ -124,6 +154,8 @@ impl OverflowPopup {
                 active_scene_id: None,
                 hovered_idx: None,
                 dpi: 96,
+                font_dpi: 96,
+                font: create_popup_font(96),
                 visible: false,
                 bg_brush: CreateSolidBrush(COLORREF(0x001F_1A18)),
                 border_brush: CreateSolidBrush(COLORREF(0x0044_3934)),
@@ -196,7 +228,19 @@ impl OverflowPopup {
         let rc = compute_overflow_popup_rect(anchor_screen_rect, scenes.len(), dpi, work_area);
         self.scenes = scenes;
         self.active_scene_id = active_scene_id;
-        self.dpi = dpi;
+        self.dpi = dpi.max(96);
+        if self.font_dpi != self.dpi {
+            unsafe {
+                let new_font = create_popup_font(self.dpi);
+                if !self.font.0.is_null() {
+                    let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                        windows::Win32::Graphics::Gdi::HGDIOBJ(self.font.0),
+                    );
+                }
+                self.font = new_font;
+                self.font_dpi = self.dpi;
+            }
+        }
         self.hovered_idx = None;
         self.visible = true;
 
@@ -248,8 +292,8 @@ unsafe extern "system" fn overflow_wndproc(
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-        PostMessageW, GWLP_USERDATA, MA_NOACTIVATE, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-        WM_PAINT, WM_TIMER,
+        PostMessageW, GWLP_USERDATA, MA_NOACTIVATE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+        WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
     };
 
     let res = std::panic::catch_unwind(|| {
@@ -261,6 +305,7 @@ unsafe extern "system" fn overflow_wndproc(
 
         match msg {
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_DPICHANGED => LRESULT(0),
             WM_MOUSEMOVE => {
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 let new_hover = popup.row_at_y(y);
@@ -312,7 +357,12 @@ unsafe extern "system" fn overflow_wndproc(
                 let mem_dc = CreateCompatibleDC(hdc);
                 let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
                 let old_bmp = SelectObject(mem_dc, HGDIOBJ(mem_bmp.0));
-                let old_font = SelectObject(mem_dc, GetStockObject(DEFAULT_GUI_FONT));
+                let font_obj = if !popup.font.0.is_null() {
+                    HGDIOBJ(popup.font.0)
+                } else {
+                    GetStockObject(DEFAULT_GUI_FONT)
+                };
+                let old_font = SelectObject(mem_dc, font_obj);
 
                 FillRect(mem_dc, &client_rc, popup.bg_brush);
                 FrameRect(mem_dc, &client_rc, popup.border_brush);

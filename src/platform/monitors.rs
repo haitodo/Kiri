@@ -134,38 +134,100 @@ pub fn compute_saved_position(
     monitors: &[MonitorInfoData],
     snap_to_edges: bool,
 ) -> Option<SavedPosition> {
-    let launcher_rect = RectData {
-        left: x,
-        top: y,
-        right: x + width_px,
-        bottom: y + height_px,
-    };
-    let mon = find_best_monitor_for_rect(&launcher_rect, monitors)?;
-    let (clamped_x, clamped_y) = clamp_and_snap_in_work_area(
+    let (_, _, _, _, saved) = compute_saved_position_with_dpi(
         x,
         y,
         width_px,
         height_px,
+        None,
+        monitors,
+        |_dpi| (width_px, height_px),
+        snap_to_edges,
+    )?;
+    Some(saved)
+}
+
+/// Compute the target monitor, DPI-scaled `(width_px, height_px)`, clamped `(x, y)`, and `SavedPosition`
+/// when a launcher drag finishes. If `cursor_anchor` is provided, attributes the drop to the monitor
+/// containing the cursor (so dragging near a monitor edge does not accidentally jump to an adjacent monitor).
+pub fn compute_saved_position_with_dpi(
+    x: i32,
+    y: i32,
+    current_width_px: i32,
+    current_height_px: i32,
+    cursor_anchor: Option<(i32, i32)>,
+    monitors: &[MonitorInfoData],
+    launcher_size_for_dpi: impl Fn(u32) -> (i32, i32),
+    snap_to_edges: bool,
+) -> Option<(i32, i32, i32, i32, SavedPosition)> {
+    let mon = if let Some((cx, cy)) = cursor_anchor {
+        find_monitor_for_point(cx, cy, monitors)?
+    } else {
+        let launcher_rect = RectData {
+            left: x,
+            top: y,
+            right: x + current_width_px,
+            bottom: y + current_height_px,
+        };
+        find_best_monitor_for_rect(&launcher_rect, monitors)?
+    };
+
+    let (w_px, h_px) = launcher_size_for_dpi(mon.dpi);
+    let (clamped_x, clamped_y) = clamp_and_snap_in_work_area(
+        x,
+        y,
+        w_px,
+        h_px,
         mon.work_area,
         mon.dpi,
         snap_to_edges,
     );
 
-    let avail_w = (mon.work_area.width() - width_px).max(1) as f64;
-    let avail_h = (mon.work_area.height() - height_px).max(1) as f64;
+    let avail_w = (mon.work_area.width() - w_px).max(1) as f64;
+    let avail_h = (mon.work_area.height() - h_px).max(1) as f64;
     let rel_x = ((clamped_x - mon.work_area.left) as f64 / avail_w).clamp(0.0, 1.0);
     let rel_y = ((clamped_y - mon.work_area.top) as f64 / avail_h).clamp(0.0, 1.0);
 
-    Some(SavedPosition {
+    let saved = SavedPosition {
         monitor_id: mon.monitor_id.clone(),
         rel_x,
         rel_y,
         dpi: mon.dpi,
+    };
+
+    Some((clamped_x, clamped_y, w_px, h_px, saved))
+}
+
+/// Find the monitor containing `(px, py)`, falling back to the monitor whose `monitor_rect` is closest to `(px, py)`.
+pub fn find_monitor_for_point<'a>(
+    px: i32,
+    py: i32,
+    monitors: &'a [MonitorInfoData],
+) -> Option<&'a MonitorInfoData> {
+    if monitors.is_empty() {
+        return None;
+    }
+
+    if let Some(mon) = monitors.iter().find(|m| {
+        px >= m.monitor_rect.left
+            && px < m.monitor_rect.right
+            && py >= m.monitor_rect.top
+            && py < m.monitor_rect.bottom
+    }) {
+        return Some(mon);
+    }
+
+    monitors.iter().min_by_key(|mon| {
+        let clamped_x = px.clamp(mon.monitor_rect.left, mon.monitor_rect.right);
+        let clamped_y = py.clamp(mon.monitor_rect.top, mon.monitor_rect.bottom);
+        let dx = (px - clamped_x) as i64;
+        let dy = (py - clamped_y) as i64;
+        dx * dx + dy * dy
     })
 }
 
 /// Attribute a rectangle (e.g. a non-iconic window rect or pre-minimized normal rect) to the monitor
-/// with the largest intersection area, falling back to nearest center distance.
+/// with the largest intersection area, falling back to nearest monitor edge / center distance.
 pub fn find_best_monitor_for_rect<'a>(
     rect: &RectData,
     monitors: &'a [MonitorInfoData],
@@ -189,16 +251,24 @@ pub fn find_best_monitor_for_rect<'a>(
         return best_mon;
     }
 
-    // Fallback: closest monitor center to rect center
-    let cx = (rect.left as i64 + rect.right as i64) / 2;
-    let cy = (rect.top as i64 + rect.bottom as i64) / 2;
+    // Fallback: closest monitor rect to rect center, breaking ties by center distance
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
 
     monitors.iter().min_by_key(|mon| {
+        let clamped_x = cx.clamp(mon.monitor_rect.left, mon.monitor_rect.right);
+        let clamped_y = cy.clamp(mon.monitor_rect.top, mon.monitor_rect.bottom);
+        let edge_dx = (cx - clamped_x) as i64;
+        let edge_dy = (cy - clamped_y) as i64;
+        let edge_dist_sq = edge_dx * edge_dx + edge_dy * edge_dy;
+
         let mcx = (mon.monitor_rect.left as i64 + mon.monitor_rect.right as i64) / 2;
         let mcy = (mon.monitor_rect.top as i64 + mon.monitor_rect.bottom as i64) / 2;
-        let dx = cx - mcx;
-        let dy = cy - mcy;
-        dx * dx + dy * dy
+        let center_dx = cx as i64 - mcx;
+        let center_dy = cy as i64 - mcy;
+        let center_dist_sq = center_dx * center_dx + center_dy * center_dy;
+
+        (edge_dist_sq, center_dist_sq)
     })
 }
 
@@ -477,5 +547,92 @@ mod tests {
         assert_eq!(mon_id, "MON-1-PRIMARY");
         assert!(x >= 0 && x + 126 <= 1920);
         assert!(y >= 0 && y + 38 <= 1040);
+    }
+
+    #[test]
+    fn test_mixed_dpi_4k_150_and_2k_100_drag_and_edge_attribution() {
+        let monitors = vec![
+            MonitorInfoData {
+                monitor_id: "MON-4K-150".to_string(),
+                friendly_name: "4K Monitor".to_string(),
+                monitor_rect: RectData {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2160,
+                },
+                work_area: RectData {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2088,
+                },
+                dpi: 144, // 150%
+                is_primary: true,
+            },
+            MonitorInfoData {
+                monitor_id: "MON-2K-100".to_string(),
+                friendly_name: "2K Monitor".to_string(),
+                monitor_rect: RectData {
+                    left: 3840,
+                    top: 0,
+                    right: 6400,
+                    bottom: 1440,
+                },
+                work_area: RectData {
+                    left: 3840,
+                    top: 0,
+                    right: 6400,
+                    bottom: 1392,
+                },
+                dpi: 96, // 100%
+                is_primary: false,
+            },
+        ];
+
+        let size_for_dpi = |dpi: u32| (dip_to_px(126, dpi), dip_to_px(38, dpi));
+
+        // 1. Drag near the right edge of the 4K monitor (cursor at x=3800 on 4K monitor):
+        // Even if raw window rect (3788..3977) overhangs into 2K monitor, cursor_anchor keeps it on 4K monitor.
+        let (cx, cy, w, h, saved_4k) = compute_saved_position_with_dpi(
+            3788,
+            100,
+            189,
+            57,
+            Some((3800, 120)),
+            &monitors,
+            size_for_dpi,
+            false,
+        )
+        .unwrap();
+        assert_eq!(saved_4k.monitor_id, "MON-4K-150");
+        assert_eq!(saved_4k.dpi, 144);
+        assert_eq!((w, h), (189, 57));
+        assert_eq!(cx, 3840 - 189);
+        assert_eq!(cy, 100);
+
+        // 2. Drag onto the 2K monitor (cursor at x=4200 on 2K monitor):
+        // Resolves using 2K monitor's 96 DPI dimensions (126x38) with zero round-trip position shift.
+        let (cx2, cy2, w2, h2, saved_2k) = compute_saved_position_with_dpi(
+            4190,
+            200,
+            189,
+            57,
+            Some((4200, 215)),
+            &monitors,
+            size_for_dpi,
+            false,
+        )
+        .unwrap();
+        assert_eq!(saved_2k.monitor_id, "MON-2K-100");
+        assert_eq!(saved_2k.dpi, 96);
+        assert_eq!((w2, h2), (126, 38));
+        assert_eq!((cx2, cy2), (4190, 200));
+
+        let (rx, ry, rmon, rdpi) =
+            resolve_launcher_position(Some(&saved_2k), &monitors, size_for_dpi, false);
+        assert_eq!((rx, ry), (cx2, cy2));
+        assert_eq!(rmon, "MON-2K-100");
+        assert_eq!(rdpi, 96);
     }
 }

@@ -7,7 +7,7 @@ use crate::config::{AppConfig, ConfigManager, MonitorProfile, Orientation};
 use crate::diagnostics::{log_info, log_warn};
 use crate::launcher::input::LauncherLayout;
 use crate::platform::hooks::drain_minimize_events;
-use crate::platform::monitors::{compute_saved_position, resolve_launcher_position};
+use crate::platform::monitors::{compute_saved_position_with_dpi, resolve_launcher_position};
 use crate::platform::WindowSystem;
 use crate::recovery::{ManagedAction, RecoveryManager};
 use crate::scenes::bindings::BindingResolver;
@@ -102,25 +102,46 @@ impl AppController {
         (x, y, layout.width_px, layout.height_px)
     }
 
-    /// Persist launcher position when drag finishes (`WM_EXITSIZEMOVE`, Section 2.2).
-    pub fn on_launcher_drag_end(&mut self, screen_x: i32, screen_y: i32) -> (i32, i32) {
+    /// Persist launcher position when drag finishes (Section 2.2).
+    pub fn on_launcher_drag_end(&mut self, screen_x: i32, screen_y: i32) -> (i32, i32, i32, i32) {
+        self.on_launcher_drag_end_at(screen_x, screen_y, None)
+    }
+
+    /// Persist launcher position when drag finishes, optionally attributing the target monitor
+    /// using the mouse cursor / grip drop coordinate `cursor_anchor`.
+    pub fn on_launcher_drag_end_at(
+        &mut self,
+        screen_x: i32,
+        screen_y: i32,
+        cursor_anchor: Option<(i32, i32)>,
+    ) -> (i32, i32, i32, i32) {
         let monitors = self.sys.monitors();
-        let layout = self.compute_layout(self.launcher_dpi);
-        if let Some(saved) = compute_saved_position(
+        let cur_layout = self.compute_layout(self.launcher_dpi);
+        let (visible, overflow) = self.config.split_visible_and_overflow();
+        let has_overflow = !overflow.is_empty();
+        let launcher_cfg = self.config.launcher.clone();
+
+        if let Some((clamped_x, clamped_y, w_px, h_px, saved)) = compute_saved_position_with_dpi(
             screen_x,
             screen_y,
-            layout.width_px,
-            layout.height_px,
+            cur_layout.width_px,
+            cur_layout.height_px,
+            cursor_anchor,
             &monitors,
+            |d| {
+                let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+                (l.width_px, l.height_px)
+            },
             self.config.launcher.snap_to_edges,
         ) {
             self.launcher_monitor_id = saved.monitor_id.clone();
             self.launcher_dpi = saved.dpi;
             self.config.launcher.position = Some(saved);
             let _ = self.config_mgr.save(&self.config);
+            return (clamped_x, clamped_y, w_px, h_px);
         }
-        let (x, y, _, _) = self.resolve_initial_or_updated_launcher_rect();
-        (x, y)
+
+        self.resolve_initial_or_updated_launcher_rect()
     }
 
     /// Reset launcher position to default on its current or primary monitor (Section 2.2).

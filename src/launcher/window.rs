@@ -41,12 +41,23 @@ const TIMER_DISPLAY_DEBOUNCE: usize = 102;
 const HOTKEY_BASE_ID: i32 = 4000;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
+#[derive(Debug, Clone, Copy)]
+pub struct LauncherDragState {
+    pub grab_rel_x: f64,
+    pub grab_rel_y: f64,
+    pub start_cursor_x: i32,
+    pub start_cursor_y: i32,
+    pub moved: bool,
+}
+
 #[cfg(windows)]
 pub struct LauncherWindowHost {
     pub hwnd: windows::Win32::Foundation::HWND,
     pub tooltip_hwnd: windows::Win32::Foundation::HWND,
     pub tooltip_visible: bool,
     pub tracking_mouse_leave: bool,
+    pub drag_state: Option<LauncherDragState>,
+    pub applying_bounds: bool,
     pub app: AppController,
     pub layout: LauncherLayout,
     pub hovered: HitTarget,
@@ -166,6 +177,8 @@ impl LauncherWindowHost {
                 tooltip_hwnd,
                 tooltip_visible: false,
                 tracking_mouse_leave: false,
+                drag_state: None,
+                applying_bounds: false,
                 app,
                 layout,
                 hovered: HitTarget::None,
@@ -254,16 +267,55 @@ impl LauncherWindowHost {
             SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
         };
 
+        self.theme.ensure_dpi(self.app.launcher_dpi);
         self.layout = self.app.compute_layout(self.app.launcher_dpi);
         let z_hwnd = if self.app.config.launcher.always_on_top {
             HWND_TOPMOST
         } else {
             HWND_NOTOPMOST
         };
+        self.applying_bounds = true;
         unsafe {
             let _ = SetWindowPos(self.hwnd, z_hwnd, x, y, w, h, SWP_NOACTIVATE);
             let _ = InvalidateRect(self.hwnd, None, false);
         }
+        self.applying_bounds = false;
+    }
+
+    pub fn update_drag_position(
+        &mut self,
+        cursor_x: i32,
+        cursor_y: i32,
+        grab_rel_x: f64,
+        grab_rel_y: f64,
+    ) {
+        use crate::platform::monitors::{clamp_and_snap_in_work_area, find_monitor_for_point};
+
+        let monitors = self.app.sys.monitors();
+        let Some(mon) = find_monitor_for_point(cursor_x, cursor_y, &monitors) else {
+            return;
+        };
+
+        let target_dpi = mon.dpi.max(96);
+        self.app.launcher_monitor_id = mon.monitor_id.clone();
+        self.app.launcher_dpi = target_dpi;
+        self.theme.ensure_dpi(target_dpi);
+        self.layout = self.app.compute_layout(target_dpi);
+
+        let w = self.layout.width_px;
+        let h = self.layout.height_px;
+        let raw_x = cursor_x - (grab_rel_x * w as f64).round() as i32;
+        let raw_y = cursor_y - (grab_rel_y * h as f64).round() as i32;
+        let (x, y) = clamp_and_snap_in_work_area(
+            raw_x,
+            raw_y,
+            w,
+            h,
+            mon.work_area,
+            target_dpi,
+            self.app.config.launcher.snap_to_edges,
+        );
+        self.apply_window_bounds(x, y, w, h);
     }
 
     pub fn hide_tooltip(&mut self) {
@@ -340,7 +392,11 @@ impl LauncherWindowHost {
                     WPARAM(0),
                     LPARAM(&mut ti as *mut _ as isize),
                 );
-                let pos = (((screen_y + 22) as u32) << 16) | (((screen_x + 12) as u32) & 0xFFFF);
+                let off_x = crate::platform::monitors::dip_to_px(12, self.app.launcher_dpi);
+                let off_y = crate::platform::monitors::dip_to_px(22, self.app.launcher_dpi);
+                let tx = (screen_x + off_x) as i16 as u16 as u32;
+                let ty = (screen_y + off_y) as i16 as u16 as u32;
+                let pos = (ty << 16) | tx;
                 let _ = SendMessageW(
                     self.tooltip_hwnd,
                     TTM_TRACKPOSITION,
@@ -468,14 +524,16 @@ unsafe extern "system" fn launcher_wndproc(
     use crate::config::RectData;
     use windows::Win32::Foundation::{LRESULT, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
+        BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, SetTimer,
-        GWLP_USERDATA, HTCAPTION, HTCLIENT, MA_NOACTIVATE, WM_CONTEXTMENU, WM_DESTROY,
-        WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONUP,
+        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
+        SetCursor, SetTimer, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_SIZEALL, MA_NOACTIVATE,
+        WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+        WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WM_NCHITTEST,
-        WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER,
+        WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
         WM_WTSSESSION_CHANGE,
     };
 
@@ -501,22 +559,35 @@ unsafe extern "system" fn launcher_wndproc(
             // Section 2.1: Never activate the launcher window on mouse click
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
 
-            // Section 2.2: Only the dedicated grip area returns HTCAPTION for native OS window dragging
-            WM_NCHITTEST => {
-                let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut pt = POINT {
-                    x: screen_x,
-                    y: screen_y,
-                };
-                let _ = ScreenToClient(hwnd, &mut pt);
-                match host.layout.hit_test(pt.x, pt.y) {
-                    HitTarget::Grip => LRESULT(HTCAPTION as isize),
-                    _ => LRESULT(HTCLIENT as isize),
+            // Section 2.2: All client points use HTCLIENT; custom pointer capture on HitTarget::Grip
+            // handles dragging smoothly across monitors with different DPIs without modal loop oscillation.
+            WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+
+            WM_SETCURSOR => {
+                if host.drag_state.is_some() || host.hovered == HitTarget::Grip {
+                    if let Ok(hcur) = LoadCursorW(None, IDC_SIZEALL) {
+                        let _ = SetCursor(hcur);
+                        return LRESULT(1);
+                    }
                 }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
 
-            // Section 2.2: Double-clicking the grip resets launcher position (do not pass to DefWindowProcW)
+            // Section 2.2: Double-clicking the grip resets launcher position
+            WM_LBUTTONDBLCLK => {
+                let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                if host.layout.hit_test(client_x, client_y) == HitTarget::Grip {
+                    if host.drag_state.take().is_some() {
+                        let _ = ReleaseCapture();
+                    }
+                    let (x, y, w, h) = host.app.reset_launcher_position();
+                    host.apply_window_bounds(x, y, w, h);
+                    return LRESULT(0);
+                }
+                LRESULT(0)
+            }
+
             WM_NCLBUTTONDBLCLK => {
                 if wparam.0 == HTCAPTION as usize {
                     let (x, y, w, h) = host.app.reset_launcher_position();
@@ -526,7 +597,7 @@ unsafe extern "system" fn launcher_wndproc(
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
 
-            // Section 2.1: Right-clicking the grip (non-client HTCAPTION) opens our context menu, not OS system menu
+            // Section 2.1: Right-clicking anywhere on the launcher opens our context menu
             WM_NCRBUTTONUP => {
                 host.hide_tooltip();
                 let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -543,6 +614,9 @@ unsafe extern "system" fn launcher_wndproc(
             }
 
             WM_CONTEXTMENU | WM_RBUTTONUP => {
+                if host.drag_state.take().is_some() {
+                    let _ = ReleaseCapture();
+                }
                 host.hide_tooltip();
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -554,22 +628,72 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
-            // Section 2.2: Persist position only once when dragging ends
-            WM_EXITSIZEMOVE => {
+            // Section 2.2: Start custom drag only when clicking on the dedicated grip area
+            WM_LBUTTONDOWN => {
                 host.hide_tooltip();
-                let mut rc = RECT::default();
-                if GetWindowRect(hwnd, &mut rc).is_ok() {
-                    let (clamped_x, clamped_y) = host.app.on_launcher_drag_end(rc.left, rc.top);
-                    if clamped_x != rc.left || clamped_y != rc.top {
-                        let w = host.layout.width_px;
-                        let h = host.layout.height_px;
-                        host.apply_window_bounds(clamped_x, clamped_y, w, h);
+                let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                if host.layout.hit_test(client_x, client_y) == HitTarget::Grip {
+                    if let Some(ref mut ov) = host.overflow_popup {
+                        ov.hide();
+                    }
+                    let mut cursor_pt = POINT::default();
+                    let mut win_rc = RECT::default();
+                    if GetCursorPos(&mut cursor_pt).is_ok()
+                        && GetWindowRect(hwnd, &mut win_rc).is_ok()
+                    {
+                        let w = (win_rc.right - win_rc.left).max(1) as f64;
+                        let h = (win_rc.bottom - win_rc.top).max(1) as f64;
+                        let grab_rel_x = ((cursor_pt.x - win_rc.left) as f64 / w).clamp(0.0, 1.0);
+                        let grab_rel_y = ((cursor_pt.y - win_rc.top) as f64 / h).clamp(0.0, 1.0);
+                        host.drag_state = Some(LauncherDragState {
+                            grab_rel_x,
+                            grab_rel_y,
+                            start_cursor_x: cursor_pt.x,
+                            start_cursor_y: cursor_pt.y,
+                            moved: false,
+                        });
+                        let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
+                        let _ = SetCapture(hwnd);
                     }
                 }
                 LRESULT(0)
             }
 
+            // Fallback if OS size/move occurs externally
+            WM_EXITSIZEMOVE => {
+                host.hide_tooltip();
+                let mut rc = RECT::default();
+                if GetWindowRect(hwnd, &mut rc).is_ok() {
+                    let (clamped_x, clamped_y, w, h) =
+                        host.app.on_launcher_drag_end(rc.left, rc.top);
+                    host.apply_window_bounds(clamped_x, clamped_y, w, h);
+                }
+                LRESULT(0)
+            }
+
             WM_MOUSEMOVE => {
+                if let Some(mut drag) = host.drag_state {
+                    let mut cursor_pt = POINT::default();
+                    if GetCursorPos(&mut cursor_pt).is_ok() {
+                        if !drag.moved
+                            && (cursor_pt.x - drag.start_cursor_x).abs() <= 1
+                            && (cursor_pt.y - drag.start_cursor_y).abs() <= 1
+                        {
+                            return LRESULT(0);
+                        }
+                        drag.moved = true;
+                        host.drag_state = Some(drag);
+                        host.update_drag_position(
+                            cursor_pt.x,
+                            cursor_pt.y,
+                            drag.grab_rel_x,
+                            drag.grab_rel_y,
+                        );
+                    }
+                    return LRESULT(0);
+                }
+
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
@@ -601,14 +725,51 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_MOUSELEAVE => {
                 host.tracking_mouse_leave = false;
-                host.hovered = HitTarget::None;
-                host.hide_tooltip();
-                let _ = InvalidateRect(hwnd, None, false);
+                if host.drag_state.is_none() {
+                    host.hovered = HitTarget::None;
+                    host.hide_tooltip();
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                LRESULT(0)
+            }
+
+            WM_CAPTURECHANGED => {
+                if let Some(drag) = host.drag_state.take() {
+                    if drag.moved {
+                        let mut rc = RECT::default();
+                        let mut cursor_pt = POINT::default();
+                        let anchor = GetCursorPos(&mut cursor_pt)
+                            .ok()
+                            .map(|_| (cursor_pt.x, cursor_pt.y));
+                        if GetWindowRect(hwnd, &mut rc).is_ok() {
+                            let (clamped_x, clamped_y, w, h) =
+                                host.app.on_launcher_drag_end_at(rc.left, rc.top, anchor);
+                            host.apply_window_bounds(clamped_x, clamped_y, w, h);
+                        }
+                    }
+                }
                 LRESULT(0)
             }
 
             WM_LBUTTONUP => {
                 host.hide_tooltip();
+                if let Some(drag) = host.drag_state.take() {
+                    let _ = ReleaseCapture();
+                    if drag.moved {
+                        let mut rc = RECT::default();
+                        let mut cursor_pt = POINT::default();
+                        let anchor = GetCursorPos(&mut cursor_pt)
+                            .ok()
+                            .map(|_| (cursor_pt.x, cursor_pt.y));
+                        if GetWindowRect(hwnd, &mut rc).is_ok() {
+                            let (clamped_x, clamped_y, w, h) =
+                                host.app.on_launcher_drag_end_at(rc.left, rc.top, anchor);
+                            host.apply_window_bounds(clamped_x, clamped_y, w, h);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 match host.layout.hit_test(client_x, client_y) {
@@ -726,9 +887,12 @@ unsafe extern "system" fn launcher_wndproc(
             }
 
             // Section 7.2: Aggregate rapid DPI / display / power / session change notifications via one-shot timer
+            // when not actively dragging or programmatically applying bounds.
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
-                let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
-                let _ = SetTimer(hwnd, TIMER_DISPLAY_DEBOUNCE, 200, None);
+                if host.drag_state.is_none() && !host.applying_bounds {
+                    let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
+                    let _ = SetTimer(hwnd, TIMER_DISPLAY_DEBOUNCE, 200, None);
+                }
                 LRESULT(0)
             }
 
