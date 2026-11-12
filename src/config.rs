@@ -22,6 +22,14 @@ impl Default for Orientation {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorPopupPosition {
+    #[default]
+    SceneCentered,
+    BesideCursor,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedPosition {
     /// Stable monitor identifier (from QueryDisplayConfig target path or fallback key)
@@ -44,6 +52,8 @@ pub struct LauncherConfig {
     pub show_bar: bool,
     #[serde(default = "default_true")]
     pub ctrl_double_tap: bool,
+    #[serde(default)]
+    pub cursor_popup_position: CursorPopupPosition,
     #[serde(default)]
     pub orientation: Orientation,
     #[serde(default = "default_button_size_dip")]
@@ -84,6 +94,7 @@ impl Default for LauncherConfig {
         Self {
             show_bar: true,
             ctrl_double_tap: true,
+            cursor_popup_position: CursorPopupPosition::default(),
             orientation: Orientation::Horizontal,
             button_size_dip: 32,
             grip_size_dip: 18,
@@ -843,11 +854,16 @@ mod tests {
         ).unwrap();
         assert!(config.launcher.show_bar);
         assert!(config.launcher.ctrl_double_tap);
+        assert_eq!(
+            config.launcher.cursor_popup_position,
+            CursorPopupPosition::SceneCentered
+        );
         assert_eq!(config.launcher.orientation, Orientation::Vertical);
         assert!(config.shortcuts.is_empty());
 
         config.launcher.show_bar = false;
         config.launcher.ctrl_double_tap = false;
+        config.launcher.cursor_popup_position = CursorPopupPosition::BesideCursor;
         config.shortcuts = vec![Shortcut {
             name: "プロジェクト".to_owned(),
             kind: ShortcutKind::Folder,

@@ -267,7 +267,7 @@ impl CursorPopup {
             }
         };
         if !self.scenes.is_empty() {
-            heading("シーン", self.layout.pad);
+            heading("シーン", self.layout.scene_header_top);
         }
         heading("ショートカット", self.layout.shortcut_header_top);
 

@@ -8,7 +8,7 @@
 //! 5. Shortcuts: Folders, files, and websites opened by the cursor launcher
 
 use crate::app::AppController;
-use crate::config::{MonitorPolicy, Orientation, Scene, Shortcut, ShortcutKind};
+use crate::config::{CursorPopupPosition, MonitorPolicy, Orientation, Scene, Shortcut, ShortcutKind};
 use crate::settings::{set_autostart_enabled, SettingsTab, SettingsViewModel};
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +70,18 @@ const IDC_LCH_FOCUS: usize = 407;
 const IDC_LCH_RESET_POS: usize = 408;
 const IDC_LCH_SHOW_BAR: usize = 409;
 const IDC_LCH_CTRL_DOUBLE_TAP: usize = 410;
+const IDC_LCH_POPUP_POSITION: usize = 411;
+
+const CURSOR_POPUP_POSITION_CHOICES: [(CursorPopupPosition, windows::core::PCWSTR); 2] = [
+    (
+        CursorPopupPosition::SceneCentered,
+        windows::core::w!("シーンをカーソルに寄せる"),
+    ),
+    (
+        CursorPopupPosition::BesideCursor,
+        windows::core::w!("カーソルの斜め横に表示"),
+    ),
+];
 
 // Tab 3 (Behavior)
 const IDC_BEH_MONITOR_COMBO: usize = 501;
@@ -363,8 +375,9 @@ impl SettingsWindow {
         use windows::Win32::UI::Controls::{TCIF_TEXT, TCITEMW, TCM_INSERTITEMW, WC_TABCONTROLW};
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, SendMessageW, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
-            CB_ADDSTRING, ES_AUTOHSCROLL, ES_MULTILINE, ES_READONLY, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WS_BORDER,
-            WS_CHILD, WS_HSCROLL, WS_VISIBLE, WS_VSCROLL,
+            CB_ADDSTRING, CB_SETCURSEL, ES_AUTOHSCROLL, ES_MULTILINE, ES_READONLY,
+            LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, WS_BORDER, WS_CHILD, WS_HSCROLL, WS_VISIBLE,
+            WS_VSCROLL,
         };
 
         let dpi = self.dpi.max(96);
@@ -951,8 +964,28 @@ impl SettingsWindow {
         ));
         t2.push(create_ctrl(
             w!("BUTTON"), w!("Ctrl の二度押しでカーソル付近にランチャーを開く"), BS_AUTOCHECKBOX as u32,
-            32, 445, 550, 28, IDC_LCH_CTRL_DOUBLE_TAP, ControlKind::Standard,
+            32, 438, 550, 28, IDC_LCH_CTRL_DOUBLE_TAP, ControlKind::Standard,
         ));
+        t2.push(create_ctrl(
+            w!("STATIC"), w!("ポップアップの表示位置"), 0,
+            32, 475, 210, 24, 0, ControlKind::Standard,
+        ));
+        let popup_position = create_ctrl(
+            w!("COMBOBOX"), w!(""), CBS_DROPDOWNLIST as u32,
+            250, 471, 260, 100, IDC_LCH_POPUP_POSITION, ControlKind::ComboBox,
+        );
+        for (index, (position, label)) in CURSOR_POPUP_POSITION_CHOICES.into_iter().enumerate() {
+            let _ = SendMessageW(
+                popup_position,
+                CB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(label.as_ptr() as isize),
+            );
+            if position == self.vm.config_draft.launcher.cursor_popup_position {
+                let _ = SendMessageW(popup_position, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+            }
+        }
+        t2.push(popup_position);
         self.tab_controls[2] = t2;
 
         // ===================== Tab 3: Behavior =====================
@@ -1838,6 +1871,11 @@ impl SettingsWindow {
             } else {
                 Orientation::Horizontal
             };
+            let h_popup_position = dlg_item(self.hwnd, IDC_LCH_POPUP_POSITION);
+            let popup_sel = SendMessageW(h_popup_position, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+            if let Some(&(position, _)) = CURSOR_POPUP_POSITION_CHOICES.get(popup_sel as usize) {
+                self.vm.config_draft.launcher.cursor_popup_position = position;
+            }
 
             let get_int = |id: usize, def: i32| -> i32 {
                 let h = dlg_item(self.hwnd, id);
