@@ -105,8 +105,8 @@ impl WindowSystem for Win32WindowSystem {
     fn show_window_async(&mut self, hwnd_val: u64, cmd: ShowCmd) -> Result<(), PlatformError> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindow, ShowWindow, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE,
-            SW_SHOWNOACTIVATE,
+            IsHungAppWindow, IsIconic, IsWindow, ShowWindow, ShowWindowAsync, SW_MINIMIZE,
+            SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
         };
 
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
@@ -122,17 +122,18 @@ impl WindowSystem for Win32WindowSystem {
                 ShowCmd::RestoreActivate => SW_RESTORE,
             };
 
-            // For restore operations, use ShowWindow synchronously so the window immediately
-            // exits iconic state before subsequent bring_to_top / set_foreground_window calls.
-            // For minimize operations, use ShowWindowAsync to prevent blocking if an app is slow.
-            match cmd {
-                ShowCmd::RestoreActivate | ShowCmd::RestoreNoActivate => {
-                    let _ = ShowWindow(hwnd, n_cmd);
+            if matches!(cmd, ShowCmd::RestoreActivate | ShowCmd::RestoreNoActivate) {
+                if !IsIconic(hwnd).as_bool() {
+                    return Ok(());
                 }
-                _ => {
-                    let _ = ShowWindowAsync(hwnd, n_cmd);
+                // Restore responsive windows before the initial Z-order pass.
+                if !IsHungAppWindow(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, n_cmd);
+                    return Ok(());
                 }
             }
+
+            let _ = ShowWindowAsync(hwnd, n_cmd);
             Ok(())
         }
     }
@@ -140,25 +141,27 @@ impl WindowSystem for Win32WindowSystem {
     fn bring_to_top(&mut self, hwnd_val: u64) -> bool {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, IsIconic, SetWindowPos, ShowWindow, HWND_TOP, SW_RESTORE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            IsHungAppWindow, IsIconic, IsWindowVisible, SetWindowPos, HWND_TOP, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
         };
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
-            // If the window is still iconic, restore it immediately so SetWindowPos succeeds
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
+            if !IsWindowVisible(hwnd).as_bool()
+                || IsIconic(hwnd).as_bool()
+                || IsHungAppWindow(hwnd).as_bool()
+            {
+                return false;
             }
-            let _ = SetWindowPos(
+            SetWindowPos(
                 hwnd,
                 HWND_TOP,
                 0,
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            BringWindowToTop(hwnd).is_ok()
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            .is_ok()
         }
     }
 
@@ -177,60 +180,56 @@ impl WindowSystem for Win32WindowSystem {
     fn set_foreground_window(&mut self, hwnd_val: u64) -> bool {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
         use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-            SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+            IsWindowVisible, SetForegroundWindow,
         };
 
         let target_hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
-            if windows::Win32::UI::WindowsAndMessaging::IsIconic(target_hwnd).as_bool() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    target_hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-                );
+            if !IsWindowVisible(target_hwnd).as_bool()
+                || !IsWindowEnabled(target_hwnd).as_bool()
+                || IsIconic(target_hwnd).as_bool()
+                || IsHungAppWindow(target_hwnd).as_bool()
+            {
+                return false;
             }
-            let _ = SetWindowPos(
-                target_hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            let _ = BringWindowToTop(target_hwnd);
-
-            let fg_hwnd = GetForegroundWindow();
-            if fg_hwnd == target_hwnd {
+            if GetForegroundWindow() == target_hwnd || SetForegroundWindow(target_hwnd).as_bool() {
                 return true;
             }
 
-            let cur_thread_id = GetCurrentThreadId();
-            let fg_thread_id = if !fg_hwnd.0.is_null() {
-                GetWindowThreadProcessId(fg_hwnd, None)
-            } else {
-                0
-            };
-            let target_thread_id = GetWindowThreadProcessId(target_hwnd, None);
-
-            if fg_thread_id != 0 && fg_thread_id != cur_thread_id {
-                let _ = AttachThreadInput(cur_thread_id, fg_thread_id, true);
-                if target_thread_id != 0 && target_thread_id != cur_thread_id {
-                    let _ = AttachThreadInput(cur_thread_id, target_thread_id, true);
-                }
-
-                let ok = SetForegroundWindow(target_hwnd).as_bool();
-                let _ = BringWindowToTop(target_hwnd);
-
-                if target_thread_id != 0 && target_thread_id != cur_thread_id {
-                    let _ = AttachThreadInput(cur_thread_id, target_thread_id, false);
-                }
-                let _ = AttachThreadInput(cur_thread_id, fg_thread_id, false);
-                ok
-            } else {
-                SetForegroundWindow(target_hwnd).as_bool()
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() || IsHungAppWindow(foreground).as_bool() {
+                return false;
             }
+            let current_thread = GetCurrentThreadId();
+            let foreground_thread = GetWindowThreadProcessId(foreground, None);
+            if foreground_thread == 0
+                || foreground_thread == current_thread
+                || !AttachThreadInput(current_thread, foreground_thread, true).as_bool()
+            {
+                return false;
+            }
+
+            // Avoid joining the target's input queue as well.
+            let requested = SetForegroundWindow(target_hwnd).as_bool();
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+            requested
+        }
+    }
+
+    fn last_input_tick(&self) -> Option<u32> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+        let mut input = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        unsafe {
+            GetLastInputInfo(&mut input)
+                .as_bool()
+                .then_some(input.dwTime)
         }
     }
 

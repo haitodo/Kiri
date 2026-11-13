@@ -1038,6 +1038,9 @@ unsafe extern "system" fn launcher_wndproc(
                 let ptr = wparam.0 as *mut crate::config::AppConfig;
                 if !ptr.is_null() {
                     host.hide_cursor_popup();
+                    if let Some(pending) = &mut host.app.pending_verification {
+                        pending.cancel_presentation_retry();
+                    }
                     let new_cfg = *Box::from_raw(ptr);
                     host.app.config = new_cfg;
                     let _ = host.app.config_mgr.save(&host.app.config);

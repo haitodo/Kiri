@@ -1032,7 +1032,8 @@ mod tests {
 
     #[test]
     fn test_switch_brings_already_non_iconic_target_app_to_front() {
-        let cfg = setup_standard_config();
+        let mut cfg = setup_standard_config();
+        cfg.launcher.restore_all_on_switch = false;
         let mut sys = FakeWindowSystem::new_dual_monitor();
 
         // Scene "code" app: VSCode (30), currently open and active in foreground
@@ -1081,6 +1082,87 @@ mod tests {
         assert!(!sys.query_window(20).unwrap().is_iconic);
         assert_eq!(sys.windows[0].hwnd, 20); // Front of Z-order
         assert_eq!(sys.get_foreground_window(), Some(20));
+
+        let _ = std::fs::remove_file(jpath);
+    }
+
+    #[test]
+    fn test_switch_reasserts_scene_after_delayed_foreground_minimize() {
+        let cfg = setup_standard_config();
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        sys.add_window(make_win(
+            30,
+            300,
+            r"C:\Apps\VSCode\Code.exe",
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+            "MON-2-TARGET",
+        ));
+        sys.add_window(make_win(
+            99,
+            999,
+            r"C:\Windows\notepad.exe",
+            "Notepad",
+            "Notes",
+            "MON-2-TARGET",
+        ));
+        let mut mt5 = make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5",
+            "MON-2-TARGET",
+        );
+        mt5.is_iconic = true;
+        mt5.is_maximized = true;
+        sys.add_window(mt5);
+        sys.add_window(make_win(
+            40,
+            400,
+            r"C:\Apps\Shared\shared.exe",
+            "SharedClass",
+            "Shared App",
+            "MON-2-TARGET",
+        ));
+        sys.foreground_hwnd = Some(30);
+        sys.ignore_commands_hwnds.insert(30);
+
+        let mut state_mgr = SceneStateManager::new(None);
+        let mut resolver = BindingResolver::new();
+        let jpath = test_journal_path("delayed_foreground_minimize");
+        let mut recovery = RecoveryManager::new(jpath.clone());
+        let out = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state_mgr,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert_eq!(out.restored_hwnds, vec![20]);
+        assert_eq!(out.minimized_hwnds, vec![30]);
+        assert_eq!(sys.get_foreground_window(), Some(20));
+
+        // Complete the minimize after Kiri's initial foreground request and simulate the OS
+        // activating an unrelated window as part of the delayed foreground handoff.
+        sys.simulate_user_minimize(30);
+        sys.simulate_user_restore(99);
+        let verification = out.verification.unwrap();
+        let warnings = verify_switch_results(&verification, &mut recovery, &mut sys);
+        assert!(warnings.is_empty());
+        assert_eq!(sys.get_foreground_window(), Some(20));
+        assert!(sys.query_window(20).unwrap().is_maximized);
+        assert!(sys.query_window(20).unwrap().z_order < sys.query_window(40).unwrap().z_order);
+        assert!(sys.query_window(40).unwrap().z_order < sys.query_window(99).unwrap().z_order);
+
+        // In the same state, a later user click takes precedence over the pending correction.
+        sys.simulate_user_restore(99);
+        sys.last_input_tick += 1;
+        let warnings = verify_switch_results(&verification, &mut recovery, &mut sys);
+        assert!(warnings.is_empty());
+        assert_eq!(sys.get_foreground_window(), Some(99));
 
         let _ = std::fs::remove_file(jpath);
     }

@@ -25,6 +25,7 @@ pub struct FakeWindowSystem {
     pub windows: Vec<WindowInstance>,
     pub monitors: Vec<MonitorInfoData>,
     pub foreground_hwnd: Option<u64>,
+    pub last_input_tick: u32,
     pub issued_commands: Vec<IssuedCommand>,
     /// HWNDs that hide themselves to the system tray (`is_visible = false, is_iconic = false`) when minimized.
     pub tray_hiding_hwnds: HashSet<u64>,
@@ -80,6 +81,7 @@ impl FakeWindowSystem {
             windows: Vec::new(),
             monitors: vec![mon1, mon2],
             foreground_hwnd: None,
+            last_input_tick: 0,
             issued_commands: Vec::new(),
             tray_hiding_hwnds: HashSet::new(),
             ignore_commands_hwnds: HashSet::new(),
@@ -203,7 +205,11 @@ impl WindowSystem for FakeWindowSystem {
     }
 
     fn bring_to_top(&mut self, hwnd: u64) -> bool {
-        if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd) {
+        if let Some(pos) = self
+            .windows
+            .iter()
+            .position(|w| w.hwnd == hwnd && w.is_visible && !w.is_iconic && !w.is_hung)
+        {
             let win = self.windows.remove(pos);
             self.windows.insert(0, win);
             self.recompute_z_order();
@@ -218,16 +224,15 @@ impl WindowSystem for FakeWindowSystem {
     }
 
     fn set_foreground_window(&mut self, hwnd: u64) -> bool {
-        if let Some(pos) = self.windows.iter().position(|w| w.hwnd == hwnd) {
-            if self.windows[pos].is_visible && !self.windows[pos].is_iconic {
-                let win = self.windows.remove(pos);
-                self.windows.insert(0, win);
-                self.recompute_z_order();
-                self.foreground_hwnd = Some(hwnd);
-                return true;
-            }
+        if self.windows.iter().any(|w| w.hwnd == hwnd && w.is_enabled) && self.bring_to_top(hwnd) {
+            self.foreground_hwnd = Some(hwnd);
+            return true;
         }
         false
+    }
+
+    fn last_input_tick(&self) -> Option<u32> {
+        Some(self.last_input_tick)
     }
 
     fn set_window_placement(

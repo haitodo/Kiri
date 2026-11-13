@@ -111,7 +111,7 @@ pub trait WindowSystem {
     /// Issue an asynchronous `ShowWindowAsync` command to another process's window.
     fn show_window_async(&mut self, hwnd: u64, cmd: ShowCmd) -> Result<(), PlatformError>;
 
-    /// Bring a window to the top of the Z-order without necessarily activating it.
+    /// Raise a visible, non-minimized window in Z-order without activating it.
     fn bring_to_top(&mut self, hwnd: u64) -> bool;
 
     /// Get the current foreground window HWND (`GetForegroundWindow`).
@@ -119,6 +119,9 @@ pub trait WindowSystem {
 
     /// Request moving foreground focus to `hwnd` (`SetForegroundWindow`).
     fn set_foreground_window(&mut self, hwnd: u64) -> bool;
+
+    /// Session input timestamp used to avoid changing focus after subsequent user input.
+    fn last_input_tick(&self) -> Option<u32>;
 
     /// Apply explicit saved placement (`SetWindowPlacement`) during manual layout restoration.
     fn set_window_placement(

@@ -16,7 +16,7 @@ use crate::config::AppConfig;
 use crate::diagnostics::{log_info, log_warn, mask_title};
 use crate::platform::{ShowCmd, WindowInstance, WindowSystem};
 use crate::recovery::RecoveryManager;
-use crate::scenes::bindings::{BindingResolution, BindingResolver};
+use crate::scenes::bindings::{BindingResolution, BindingResolver, BoundRuntimeIdentity};
 use crate::scenes::manager::SceneStateManager;
 use std::collections::HashSet;
 
@@ -68,6 +68,8 @@ pub enum SwitchWarning {
         binding_id: String,
         hwnd: u64,
     },
+    /// Windows did not accept a Z-order or focus request on the verification pass.
+    ScenePresentationFailed { scene_id: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +78,21 @@ pub struct PendingVerification {
     pub target_monitor_id: String,
     pub minimized: Vec<(String, u64)>,
     pub restored: Vec<(String, u64)>,
+    presentation: Option<PendingPresentation>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPresentation {
+    windows: Vec<BoundRuntimeIdentity>,
+    focus_target: Option<u64>,
+    input_tick: u32,
+    retry_raise: bool,
+}
+
+impl PendingVerification {
+    pub fn cancel_presentation_retry(&mut self) {
+        self.presentation = None;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +146,26 @@ fn binding_specificity_rank(binding: &crate::config::WindowBinding, resolver: &B
     }
 }
 
+/// Raise scene windows from bottom to top and choose the top eligible window for activation.
+fn raise_scene_windows(
+    sys: &mut dyn WindowSystem,
+    windows: &[&WindowInstance],
+    focus: bool,
+) -> (Option<u64>, bool) {
+    let mut raise_failed = false;
+    let mut focus_target = None;
+    for win in windows {
+        if win.is_hung {
+            continue;
+        }
+        raise_failed |= !sys.bring_to_top(win.hwnd);
+        if focus && win.is_enabled {
+            focus_target = Some(win.hwnd);
+        }
+    }
+    (focus_target, raise_failed)
+}
+
 /// Execute the 10-step `switch_scene` algorithm (Section 5.1).
 pub fn execute_scene_switch(
     next_scene_id: &str,
@@ -140,6 +177,7 @@ pub fn execute_scene_switch(
     launcher_monitor_id: Option<&str>,
 ) -> SwitchOutcome {
     let mut warnings = Vec::new();
+    let input_tick = sys.last_input_tick();
 
     // Verify scene exists
     if !config.scenes.iter().any(|s| s.id == next_scene_id) {
@@ -344,46 +382,38 @@ pub fn execute_scene_switch(
     // that are currently `IsIconic`. Also compute `to_bring_to_front` = windows belonging to `next`
     // that are already open (non-iconic) so they are brought above previously open/unregistered apps.
     let mut to_restore: Vec<(String, WindowInstance, usize)> = Vec::new();
-    let mut to_bring_to_front: Vec<(String, WindowInstance, usize)> = Vec::new();
+    let mut to_bring_to_front: Vec<(WindowInstance, usize)> = Vec::new();
     let mut seen_restore_hwnds: HashSet<u64> = HashSet::new();
 
-    if config.launcher.restore_all_on_switch {
-        // Mode A (Default): Restore ALL windows registered to `next` that are currently iconic,
-        // regardless of whether they were minimized by Kiri or manually by the user.
-        for (binding_id, win, in_next, always_visible) in &resolved_bindings {
-            if !*in_next || *always_visible {
-                continue;
-            }
-            let on_valid_monitor = if is_all_monitors {
-                connected_monitor_ids.iter().any(|m| m == &win.monitor_id)
-            } else {
-                win.monitor_id == target_mon_id
-            };
-            if on_valid_monitor {
-                if win.is_iconic {
-                    if seen_restore_hwnds.insert(win.hwnd) {
-                        if win.is_hung {
-                            warnings.push(SwitchWarning::HungWindowDetected {
-                                binding_id: binding_id.clone(),
-                                hwnd: win.hwnd,
-                            });
-                        }
-                        let z = recovery
-                            .actions()
-                            .get(&win.hwnd)
-                            .map(|a| a.z_order_at_minimize)
-                            .unwrap_or(win.z_order);
-                        to_restore.push((binding_id.clone(), win.clone(), z));
-                    }
-                } else if win.is_visible {
-                    let z = recovery
-                        .actions()
-                        .get(&win.hwnd)
-                        .map(|a| a.z_order_at_minimize)
-                        .unwrap_or(win.z_order);
-                    to_bring_to_front.push((binding_id.clone(), win.clone(), z));
+    for (binding_id, win, in_next, always_visible) in &resolved_bindings {
+        if !*in_next || *always_visible {
+            continue;
+        }
+        let on_valid_monitor = if is_all_monitors {
+            connected_monitor_ids.iter().any(|m| m == &win.monitor_id)
+        } else {
+            win.monitor_id == target_mon_id
+        };
+        if !on_valid_monitor {
+            continue;
+        }
+        let z = recovery
+            .actions()
+            .get(&win.hwnd)
+            .map(|a| a.z_order_at_minimize)
+            .unwrap_or(win.z_order);
+        if win.is_iconic {
+            if config.launcher.restore_all_on_switch && seen_restore_hwnds.insert(win.hwnd) {
+                if win.is_hung {
+                    warnings.push(SwitchWarning::HungWindowDetected {
+                        binding_id: binding_id.clone(),
+                        hwnd: win.hwnd,
+                    });
                 }
+                to_restore.push((binding_id.clone(), win.clone(), z));
             }
+        } else if win.is_visible {
+            to_bring_to_front.push((win.clone(), z));
         }
     }
 
@@ -497,31 +527,30 @@ pub fn execute_scene_switch(
     // Step 8: Restore `to_restore` windows from bottom to top of Z-order
     let mut restored_hwnds = Vec::new();
     let mut verification_restored = Vec::new();
+    let mut scene_windows = Vec::new();
 
-    for (binding_id, win, _z) in &to_restore {
+    let restore_cmd = if config.launcher.focus_on_switch && deferred_foreground_minimize.is_none() {
+        ShowCmd::RestoreActivate
+    } else {
+        ShowCmd::RestoreNoActivate
+    };
+    for (binding_id, win, z) in to_restore {
         // Section 5.3: Always re-verify `is_iconic` immediately before sending restore command
-        let still_iconic = sys
-            .query_window(win.hwnd)
-            .map(|w| w.is_iconic)
-            .unwrap_or(false);
+        let still_iconic = sys.query_window(win.hwnd).is_some_and(|live| {
+            live.is_iconic
+                && live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
+        });
         if !still_iconic {
             recovery.invalidate_hwnd(win.hwnd);
             continue;
         }
 
-        let cmd = if config.launcher.focus_on_switch && deferred_foreground_minimize.is_none() {
-            // In normal switch, activate restored windows (especially maximized windows like MT5)
-            // so Windows DWM never pushes them behind previously open or active background windows.
-            ShowCmd::RestoreActivate
-        } else {
-            ShowCmd::RestoreNoActivate
-        };
-
         recovery.mark_restoring_by_us(win.hwnd);
-        match sys.show_window_async(win.hwnd, cmd) {
+        match sys.show_window_async(win.hwnd, restore_cmd) {
             Ok(()) => {
                 restored_hwnds.push(win.hwnd);
-                verification_restored.push((binding_id.clone(), win.hwnd));
+                verification_restored.push((binding_id, win.hwnd));
+                scene_windows.push((win, z));
             }
             Err(e) => {
                 log_warn(
@@ -535,12 +564,14 @@ pub fn execute_scene_switch(
     // Step 7b (Section 5.4, FR-18, AT-25): If the foreground window was in `to_minimize`,
     // minimize it AFTER restoring next-scene windows using `SW_MINIMIZE` (`MinimizeActivateNext`)
     // so keyboard focus never stays trapped on an invisible minimized window.
-    if let Some((binding_id, fg_win)) = &deferred_foreground_minimize {
+    let mut foreground_minimize_issued = false;
+    if let Some((binding_id, fg_win)) = deferred_foreground_minimize {
         match sys.show_window_async(fg_win.hwnd, ShowCmd::MinimizeActivateNext) {
             Ok(()) => {
                 recovery.mark_minimize_issued(fg_win.hwnd);
                 minimized_hwnds.push(fg_win.hwnd);
-                verification_minimized.push((binding_id.clone(), fg_win.hwnd));
+                verification_minimized.push((binding_id, fg_win.hwnd));
+                foreground_minimize_issued = true;
             }
             Err(e) => {
                 log_warn(
@@ -555,35 +586,35 @@ pub fn execute_scene_switch(
     // Step 8b: Bring all next-scene windows (restored + already non-iconic) to the top of Z-order
     // in bottom-to-top order so they appear above previously open/unregistered apps,
     // and activate the topmost window so it doesn't get obscured behind active apps.
-    let mut all_target_scene_windows: Vec<(u64, usize, bool)> = Vec::new(); // (hwnd, z_order, is_hung)
-    for (_bid, win, z) in &to_restore {
-        if restored_hwnds.contains(&win.hwnd) {
-            all_target_scene_windows.push((win.hwnd, *z, win.is_hung));
-        }
+    scene_windows.append(&mut to_bring_to_front);
+    scene_windows.sort_by_key(|(_, z)| std::cmp::Reverse(*z));
+    let scene_windows: Vec<_> = scene_windows.iter().map(|(win, _)| win).collect();
+    let (focus_target, raise_failed) = raise_scene_windows(
+        sys,
+        &scene_windows,
+        config.launcher.focus_on_switch || foreground_minimize_issued,
+    );
+    if let Some(hwnd) = focus_target {
+        let _ = sys.set_foreground_window(hwnd);
     }
-    for (_bid, win, z) in &to_bring_to_front {
-        all_target_scene_windows.push((win.hwnd, *z, win.is_hung));
-    }
-
-    // Sort descending by Z-order (largest Z = bottom-most first, so topmost window is brought to top last)
-    all_target_scene_windows.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (h, _z, _is_hung) in &all_target_scene_windows {
-        sys.bring_to_top(*h);
-    }
-
-    // Determine the topmost candidate to focus
-    let topmost_candidate = all_target_scene_windows
-        .iter()
-        .rev()
-        .find(|(_, _, is_hung)| !*is_hung)
-        .or_else(|| all_target_scene_windows.last());
-
-    if let Some((top_hwnd, _, _)) = topmost_candidate {
-        if config.launcher.focus_on_switch || deferred_foreground_minimize.is_some() {
-            sys.set_foreground_window(*top_hwnd);
-        }
-    }
+    // A failed raise, a delayed restore, or the old foreground window's minimize can
+    // change the Z-order after the first pass.
+    let retry_raise = raise_failed || foreground_minimize_issued || !restored_hwnds.is_empty();
+    let presentation = input_tick
+        .filter(|_| !scene_windows.is_empty() && (retry_raise || focus_target.is_some()))
+        .map(|input_tick| PendingPresentation {
+            windows: scene_windows
+                .into_iter()
+                .map(|win| BoundRuntimeIdentity {
+                    hwnd: win.hwnd,
+                    pid: win.pid,
+                    process_start_time: win.process_start_time,
+                })
+                .collect(),
+            focus_target,
+            input_tick,
+            retry_raise,
+        });
 
     let _ = recovery.persist_journal();
 
@@ -601,12 +632,16 @@ pub fn execute_scene_switch(
         ),
     );
 
-    let verification = if !verification_minimized.is_empty() || !verification_restored.is_empty() {
+    let verification = if !verification_minimized.is_empty()
+        || !verification_restored.is_empty()
+        || presentation.is_some()
+    {
         Some(PendingVerification {
             scene_id: next_scene_id.to_string(),
             target_monitor_id: target_mon_id,
             minimized: verification_minimized,
             restored: verification_restored,
+            presentation,
         })
     } else {
         None
@@ -624,8 +659,7 @@ pub fn execute_scene_switch(
 
 /// Step 10 of `switch_scene` (called ~500ms after `execute_scene_switch` via a one-shot timer):
 /// Verifies that minimized and restored windows reached their expected state, detects apps that
-/// hid themselves to the system tray (`!is_visible && !is_iconic`, Section 8.2), and ensures
-/// keyboard focus is not stranded on a minimized window (Section 5.4, FR-18).
+/// hid themselves to the system tray, and checks Z-order and keyboard focus (FR-18).
 pub fn verify_switch_results(
     pending: &PendingVerification,
     recovery: &mut RecoveryManager,
@@ -685,6 +719,8 @@ pub fn verify_switch_results(
         }
     }
 
+    warnings.extend(verify_scene_presentation(pending, sys));
+
     // Section 5.4 (FR-18): Verify the current foreground window is not still a minimized window
     if let Some(fg_hwnd) = sys.get_foreground_window() {
         let fg_is_minimized = sys
@@ -692,17 +728,13 @@ pub fn verify_switch_results(
             .map(|w| w.is_iconic || !w.is_visible)
             .unwrap_or(false);
         if fg_is_minimized {
-            // Move focus to the topmost restored window or topmost visible window on target monitor
             let fallback_hwnd = pending
                 .restored
-                .last()
-                .map(|(_, h)| *h)
-                .or_else(|| {
-                    sys.enumerate_windows()
-                        .into_iter()
-                        .find(|w| w.is_visible && !w.is_iconic)
-                        .map(|w| w.hwnd)
-                });
+                .iter()
+                .rev()
+                .find_map(|(_, hwnd)| sys.query_window(*hwnd).filter(can_receive_focus))
+                .or_else(|| sys.enumerate_windows().into_iter().find(can_receive_focus))
+                .map(|w| w.hwnd);
             if let Some(safe_hwnd) = fallback_hwnd {
                 let _ = sys.set_foreground_window(safe_hwnd);
             }
@@ -714,4 +746,59 @@ pub fn verify_switch_results(
     }
 
     warnings
+}
+
+fn can_receive_focus(win: &WindowInstance) -> bool {
+    win.is_visible && !win.is_iconic && win.is_enabled && !win.is_hung
+}
+
+fn verify_scene_presentation(
+    pending: &PendingVerification,
+    sys: &mut dyn WindowSystem,
+) -> Option<SwitchWarning> {
+    let presentation = pending.presentation.as_ref()?;
+    let foreground = sys.get_foreground_window();
+    let focus_out_of_date =
+        presentation.focus_target.is_some() && presentation.focus_target != foreground;
+    if !(presentation.retry_raise || focus_out_of_date)
+        || sys.last_input_tick() != Some(presentation.input_tick)
+    {
+        return None;
+    }
+
+    // Revalidate candidates on the current desktop and keep their original Z-order.
+    let live_windows = sys.enumerate_windows();
+    let windows: Vec<_> = presentation
+        .windows
+        .iter()
+        .filter_map(|target| {
+            live_windows.iter().find(|live| {
+                live.matches_runtime_identity(target.hwnd, target.pid, target.process_start_time)
+                    && live.is_visible
+                    && !live.is_iconic
+                    && (pending.target_monitor_id == "ALL_MONITORS"
+                        || live.monitor_id == pending.target_monitor_id)
+            })
+        })
+        .collect();
+    if sys.last_input_tick() != Some(presentation.input_tick) {
+        return None;
+    }
+    let (focus_target, raise_failed) =
+        raise_scene_windows(sys, &windows, presentation.focus_target.is_some());
+    let focus_failed = sys.last_input_tick() == Some(presentation.input_tick)
+        && focus_target.is_some_and(|hwnd| !sys.set_foreground_window(hwnd));
+    if !raise_failed && !focus_failed {
+        return None;
+    }
+    log_warn(
+        "switch",
+        &format!(
+            "Could not bring scene '{}' to the front (raise_failed={}, focus_failed={}, focus_target={:?})",
+            pending.scene_id, raise_failed, focus_failed, focus_target,
+        ),
+    );
+    Some(SwitchWarning::ScenePresentationFailed {
+        scene_id: pending.scene_id.clone(),
+    })
 }
