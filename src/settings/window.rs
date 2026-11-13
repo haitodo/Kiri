@@ -71,6 +71,7 @@ const IDC_LCH_RESET_POS: usize = 408;
 const IDC_LCH_SHOW_BAR: usize = 409;
 const IDC_LCH_CTRL_DOUBLE_TAP: usize = 410;
 const IDC_LCH_POPUP_POSITION: usize = 411;
+const IDC_LCH_WHEEL_WRAP: usize = 412;
 
 const CURSOR_POPUP_POSITION_CHOICES: [(CursorPopupPosition, windows::core::PCWSTR); 2] = [
     (
@@ -930,7 +931,7 @@ impl SettingsWindow {
             w!("画面端にスナップする (snap_to_edges, 12 DIP以内)"),
             BS_AUTOCHECKBOX as u32,
             32,
-            272,
+            266,
             520,
             28,
             IDC_LCH_SNAP,
@@ -941,10 +942,21 @@ impl SettingsWindow {
             w!("シーン切替時に最前面ウィンドウへフォーカスを移動する (focus_on_switch)"),
             BS_AUTOCHECKBOX as u32,
             32,
-            310,
+            298,
             660,
             28,
             IDC_LCH_FOCUS,
+            ControlKind::Standard,
+        ));
+        t2.push(create_ctrl(
+            w!("BUTTON"),
+            w!("ホイールでシーンを一巡する"),
+            BS_AUTOCHECKBOX as u32,
+            32,
+            330,
+            440,
+            28,
+            IDC_LCH_WHEEL_WRAP,
             ControlKind::Standard,
         ));
         t2.push(create_ctrl(
@@ -1723,6 +1735,7 @@ impl SettingsWindow {
             set_chk(IDC_LCH_TOPMOST, self.vm.config_draft.launcher.always_on_top);
             set_chk(IDC_LCH_SNAP, self.vm.config_draft.launcher.snap_to_edges);
             set_chk(IDC_LCH_FOCUS, self.vm.config_draft.launcher.focus_on_switch);
+            set_chk(IDC_LCH_WHEEL_WRAP, self.vm.config_draft.launcher.wheel_wrap);
             set_chk(IDC_LCH_SHOW_BAR, self.vm.config_draft.launcher.show_bar);
             set_chk(IDC_LCH_CTRL_DOUBLE_TAP, self.vm.config_draft.launcher.ctrl_double_tap);
         }
@@ -1901,6 +1914,7 @@ impl SettingsWindow {
             self.vm.config_draft.launcher.always_on_top = get_chk(IDC_LCH_TOPMOST);
             self.vm.config_draft.launcher.snap_to_edges = get_chk(IDC_LCH_SNAP);
             self.vm.config_draft.launcher.focus_on_switch = get_chk(IDC_LCH_FOCUS);
+            self.vm.config_draft.launcher.wheel_wrap = get_chk(IDC_LCH_WHEEL_WRAP);
             self.vm.config_draft.launcher.show_bar = get_chk(IDC_LCH_SHOW_BAR);
             self.vm.config_draft.launcher.ctrl_double_tap = get_chk(IDC_LCH_CTRL_DOUBLE_TAP);
             self.vm.config_draft.launcher.restore_all_on_switch = get_chk(IDC_BEH_RESTORE_ALL_ON_SWITCH);
@@ -2250,18 +2264,25 @@ unsafe extern "system" fn settings_wndproc(
                         LRESULT(0)
                     }
 
-                    // Tab 2 Reset position
+                    // Tab 2 Launcher
                     IDC_LCH_RESET_POS => {
                         win.vm.config_draft.launcher.position = None;
                         let _ = MessageBoxW(hwnd, w!("ランチャー位置を初期化しました。[適用] または [OK] で反映されます。"), w!("Kiri"), MB_OK | MB_ICONINFORMATION);
                         LRESULT(0)
                     }
-                    IDC_LCH_SHOW_BAR | IDC_LCH_CTRL_DOUBLE_TAP => {
-                        let checked = SendMessageW(dlg_item(hwnd, id), BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED as isize;
-                        if id == IDC_LCH_SHOW_BAR {
-                            win.vm.config_draft.launcher.show_bar = checked;
-                        } else {
-                            win.vm.config_draft.launcher.ctrl_double_tap = checked;
+                    IDC_LCH_SHOW_BAR | IDC_LCH_CTRL_DOUBLE_TAP | IDC_LCH_WHEEL_WRAP => {
+                        let checked = SendMessageW(
+                            dlg_item(hwnd, id),
+                            BM_GETCHECK,
+                            WPARAM(0),
+                            LPARAM(0),
+                        ).0 == BST_CHECKED as isize;
+                        let launcher = &mut win.vm.config_draft.launcher;
+                        match id {
+                            IDC_LCH_SHOW_BAR => launcher.show_bar = checked,
+                            IDC_LCH_CTRL_DOUBLE_TAP => launcher.ctrl_double_tap = checked,
+                            IDC_LCH_WHEEL_WRAP => launcher.wheel_wrap = checked,
+                            _ => unreachable!(),
                         }
                         LRESULT(0)
                     }

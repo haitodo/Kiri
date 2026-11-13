@@ -518,7 +518,12 @@ impl LauncherWindowHost {
         let active_index = scenes
             .iter()
             .position(|scene| Some(scene.id.as_str()) == active_id);
-        let Some(index) = wheel_scene_index(scenes.len(), active_index, steps) else {
+        let Some(index) = wheel_scene_index(
+            scenes.len(),
+            active_index,
+            steps,
+            self.app.config.launcher.wheel_wrap,
+        ) else {
             return;
         };
         let scene_id = scenes[index].id.clone();

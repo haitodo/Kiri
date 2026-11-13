@@ -68,6 +68,9 @@ pub struct LauncherConfig {
     pub snap_to_edges: bool,
     #[serde(default = "default_true")]
     pub focus_on_switch: bool,
+    /// Wrap between the first and last scenes when switching with the mouse wheel.
+    #[serde(default)]
+    pub wheel_wrap: bool,
     /// When switching to a scene, restore ALL registered windows that are currently iconic,
     /// regardless of whether they were minimized by Kiri or manually by the user.
     #[serde(default = "default_true")]
@@ -102,6 +105,7 @@ impl Default for LauncherConfig {
             always_on_top: true,
             snap_to_edges: false,
             focus_on_switch: true,
+            wheel_wrap: false,
             restore_all_on_switch: true,
             position: None,
         }
@@ -848,12 +852,13 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_settings_round_trip_with_legacy_launcher_defaults() {
+    fn launcher_and_shortcut_settings_round_trip_with_legacy_defaults() {
         let mut config: AppConfig = serde_json::from_str(
             r#"{"schema_version":1,"launcher":{"orientation":"vertical"}}"#,
         ).unwrap();
         assert!(config.launcher.show_bar);
         assert!(config.launcher.ctrl_double_tap);
+        assert!(!config.launcher.wheel_wrap);
         assert_eq!(
             config.launcher.cursor_popup_position,
             CursorPopupPosition::SceneCentered
@@ -863,6 +868,7 @@ mod tests {
 
         config.launcher.show_bar = false;
         config.launcher.ctrl_double_tap = false;
+        config.launcher.wheel_wrap = true;
         config.launcher.cursor_popup_position = CursorPopupPosition::BesideCursor;
         config.shortcuts = vec![Shortcut {
             name: "プロジェクト".to_owned(),

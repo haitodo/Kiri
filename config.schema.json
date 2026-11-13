@@ -70,6 +70,10 @@
           "type": "boolean",
           "default": true
         },
+        "wheel_wrap": {
+          "type": "boolean",
+          "default": false
+        },
         "restore_all_on_switch": {
           "type": "boolean",
           "default": true

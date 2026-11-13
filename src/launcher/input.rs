@@ -32,12 +32,23 @@ pub(super) fn wheel_scene_index(
     scene_count: usize,
     active_index: Option<usize>,
     steps: i32,
+    wrap: bool,
 ) -> Option<usize> {
     if scene_count == 0 || steps == 0 {
         return None;
     }
-    let start = active_index.unwrap_or(if steps > 0 { scene_count - 1 } else { 0 });
-    let next = (start as i64 + i64::from(steps)).rem_euclid(scene_count as i64) as usize;
+    let scene_count = scene_count as i64;
+    let start = match active_index {
+        Some(index) => index as i64,
+        None if steps > 0 => -1,
+        None => scene_count,
+    };
+    let next = start + i64::from(steps);
+    let next = if wrap {
+        next.rem_euclid(scene_count)
+    } else {
+        next.clamp(0, scene_count - 1)
+    } as usize;
     (Some(next) != active_index).then_some(next)
 }
 
@@ -241,14 +252,28 @@ mod tests {
 
     #[test]
     fn wheel_wraps_around_the_scene_order() {
-        assert_eq!(wheel_scene_index(3, Some(0), -1), Some(2));
-        assert_eq!(wheel_scene_index(3, Some(2), 1), Some(0));
-        assert_eq!(wheel_scene_index(3, Some(0), 2), Some(2));
-        assert_eq!(wheel_scene_index(3, Some(0), -3), None);
-        assert_eq!(wheel_scene_index(3, None, 1), Some(0));
-        assert_eq!(wheel_scene_index(3, None, -1), Some(2));
-        assert_eq!(wheel_scene_index(0, None, 1), None);
-        assert_eq!(wheel_scene_index(1, Some(0), 1), None);
+        assert_eq!(wheel_scene_index(3, Some(0), -1, true), Some(2));
+        assert_eq!(wheel_scene_index(3, Some(2), 1, true), Some(0));
+        assert_eq!(wheel_scene_index(3, Some(0), 2, true), Some(2));
+        assert_eq!(wheel_scene_index(3, Some(0), -3, true), None);
+        assert_eq!(wheel_scene_index(3, None, 1, true), Some(0));
+        assert_eq!(wheel_scene_index(3, None, -1, true), Some(2));
+        assert_eq!(wheel_scene_index(0, None, 1, true), None);
+        assert_eq!(wheel_scene_index(1, Some(0), 1, true), None);
+    }
+
+    #[test]
+    fn wheel_stops_at_the_ends_of_the_scene_order() {
+        assert_eq!(wheel_scene_index(3, Some(1), -4, false), Some(0));
+        assert_eq!(wheel_scene_index(3, Some(1), 4, false), Some(2));
+        assert_eq!(wheel_scene_index(3, Some(0), -1, false), None);
+        assert_eq!(wheel_scene_index(3, Some(2), 1, false), None);
+        assert_eq!(wheel_scene_index(3, Some(0), 1, false), Some(1));
+        assert_eq!(wheel_scene_index(3, Some(2), -1, false), Some(1));
+        assert_eq!(wheel_scene_index(3, None, 1, false), Some(0));
+        assert_eq!(wheel_scene_index(3, None, -1, false), Some(2));
+        assert_eq!(wheel_scene_index(0, None, 1, false), None);
+        assert_eq!(wheel_scene_index(1, Some(0), 1, false), None);
     }
 
     #[test]
