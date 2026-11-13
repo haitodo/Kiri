@@ -5,8 +5,9 @@ use std::cell::Cell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_LCONTROL, VK_LWIN, VK_MBUTTON, VK_MENU,
-    VK_RBUTTON, VK_RCONTROL, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
+    GetAsyncKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LWIN,
+    VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
+    VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
@@ -18,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const WM_APP_TOGGLE_CURSOR_POPUP: u32 = 0x8000 + 7;
 pub const WM_APP_DISMISS_CURSOR_POPUP: u32 = 0x8000 + 8;
 pub const WM_APP_CURSOR_POPUP_WHEEL: u32 = 0x8000 + 11;
+pub const WM_APP_CURSOR_POPUP_KEY: u32 = 0x8000 + 12;
 const DOUBLE_TAP_MS: u32 = 450;
 const LEFT_CTRL: u8 = 1;
 const RIGHT_CTRL: u8 = 2;
@@ -121,6 +123,7 @@ thread_local! {
 }
 
 pub struct CursorInput {
+    ctrl_enabled: bool,
     keyboard_hook: Option<HHOOK>,
 }
 
@@ -131,12 +134,14 @@ impl CursorInput {
             ..InputState::default()
         });
         Self {
+            ctrl_enabled: false,
             keyboard_hook: None,
         }
     }
 
-    pub fn set_ctrl_enabled(&mut self, enabled: bool) -> windows::core::Result<()> {
-        if enabled && self.keyboard_hook.is_none() {
+    fn update_keyboard_hook(&mut self, popup_open: bool) -> windows::core::Result<()> {
+        let needed = self.ctrl_enabled || popup_open;
+        if needed && self.keyboard_hook.is_none() {
             self.keyboard_hook = Some(unsafe {
                 SetWindowsHookExW(
                     WH_KEYBOARD_LL,
@@ -145,13 +150,21 @@ impl CursorInput {
                     0,
                 )?
             });
-        } else if !enabled {
+        } else if !needed {
             if let Some(hook) = self.keyboard_hook.take() {
                 let _ = unsafe { UnhookWindowsHookEx(hook) };
             }
-            self.reset_gesture();
         }
         Ok(())
+    }
+
+    pub fn set_ctrl_enabled(&mut self, enabled: bool) -> windows::core::Result<()> {
+        self.ctrl_enabled = enabled;
+        if !enabled {
+            self.reset_gesture();
+        }
+        let popup_open = STATE.get().popup.is_some();
+        self.update_keyboard_hook(popup_open)
     }
 
     pub fn reset_gesture(&self) {
@@ -161,10 +174,11 @@ impl CursorInput {
         let _ = update_mouse_hook(state);
     }
 
-    pub fn set_popup(&self, popup: Option<PopupInput>) -> windows::core::Result<()> {
+    pub fn set_popup(&mut self, popup: Option<PopupInput>) -> windows::core::Result<()> {
         let mut state = STATE.get();
         state.popup = popup;
         STATE.set(state);
+        self.update_keyboard_hook(popup.is_some())?;
         update_mouse_hook(state)
     }
 
@@ -178,9 +192,10 @@ impl CursorInput {
 
 impl Drop for CursorInput {
     fn drop(&mut self) {
-        let _ = self.set_ctrl_enabled(false);
+        self.ctrl_enabled = false;
         let state = InputState::default();
         STATE.set(state);
+        let _ = self.update_keyboard_hook(false);
         let _ = update_mouse_hook(state);
     }
 }
@@ -201,13 +216,41 @@ fn update_mouse_hook(state: InputState) -> windows::core::Result<()> {
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let _ = std::panic::catch_unwind(|| {
+    let consumed = std::panic::catch_unwind(|| {
         if code != HC_ACTION as i32 {
-            return;
+            return false;
         }
         let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let mut state = STATE.get();
-        let side = match key.vkCode as u16 {
+        let down = !key.flags.contains(LLKHF_UP);
+        let vk = key.vkCode as u16;
+
+        // While the non-activating cursor popup is open, intercept Esc/Arrows/Enter without stealing focus
+        if state.popup.is_some()
+            && matches!(
+                vk,
+                v if v == VK_ESCAPE.0
+                    || v == VK_RETURN.0
+                    || v == VK_UP.0
+                    || v == VK_DOWN.0
+                    || v == VK_LEFT.0
+                    || v == VK_RIGHT.0
+            )
+        {
+            state.taps.interrupt();
+            STATE.set(state);
+            if down {
+                let _ = PostMessageW(
+                    state.hwnd,
+                    WM_APP_CURSOR_POPUP_KEY,
+                    WPARAM(vk as usize),
+                    LPARAM(0),
+                );
+            }
+            return true;
+        }
+
+        let side = match vk {
             code if code == VK_LCONTROL.0 => LEFT_CTRL,
             code if code == VK_RCONTROL.0 => RIGHT_CTRL,
             code if code == VK_CONTROL.0 && key.flags.contains(LLKHF_EXTENDED) => RIGHT_CTRL,
@@ -215,10 +258,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             _ => {
                 state.taps.interrupt();
                 STATE.set(state);
-                return;
+                return false;
             }
         };
-        let down = !key.flags.contains(LLKHF_UP);
         let was_held = state.taps.held;
         let chord_held = down && was_held == 0 && {
             let other_ctrl = if side == LEFT_CTRL {
@@ -249,7 +291,12 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         if toggle {
             let _ = PostMessageW(state.hwnd, WM_APP_TOGGLE_CURSOR_POPUP, WPARAM(0), LPARAM(0));
         }
-    });
+        false
+    })
+    .unwrap_or(false);
+    if consumed {
+        return LRESULT(1);
+    }
     CallNextHookEx(None, code, wparam, lparam)
 }
 
@@ -334,7 +381,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            let input = CursorInput::new(hwnd);
+            let mut input = CursorInput::new(hwnd);
             let mouse = MSLLHOOKSTRUCT {
                 pt: POINT { x: -350, y: 175 },
                 mouseData: u32::from(-120i16 as u16) << 16,
@@ -450,5 +497,76 @@ mod tests {
         assert!(!taps.ctrl(RIGHT_CTRL, false, 340, false));
         assert!(!tap(&mut taps, RIGHT_CTRL, 400));
         assert!(tap(&mut taps, RIGHT_CTRL, 480));
+    }
+
+    #[test]
+    fn popup_navigation_keys_are_intercepted_only_when_popup_is_open() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+            WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                GetModuleHandleW(None).unwrap(),
+                None,
+            )
+            .unwrap();
+            let mut input = CursorInput::new(hwnd);
+            let kb = KBDLLHOOKSTRUCT {
+                vkCode: u32::from(VK_ESCAPE.0),
+                ..Default::default()
+            };
+            let send_esc = || {
+                keyboard_proc(
+                    HC_ACTION as i32,
+                    WPARAM(0x0100),
+                    LPARAM(&kb as *const _ as isize),
+                )
+            };
+
+            // Closed -> not intercepted
+            assert_eq!(send_esc().0, 0);
+
+            let popup = PopupInput {
+                rect: RectData {
+                    left: 0,
+                    top: 0,
+                    right: 200,
+                    bottom: 200,
+                },
+                corner_radius: 10,
+                has_scenes: true,
+            };
+            input.set_popup(Some(popup)).unwrap();
+            assert_eq!(send_esc().0, 1);
+
+            let mut msg = MSG::default();
+            assert!(PeekMessageW(
+                &mut msg,
+                hwnd,
+                WM_APP_CURSOR_POPUP_KEY,
+                WM_APP_CURSOR_POPUP_KEY,
+                PM_REMOVE,
+            )
+            .as_bool());
+            assert_eq!(msg.wParam.0, usize::from(VK_ESCAPE.0));
+
+            input.set_popup(None).unwrap();
+            assert_eq!(send_esc().0, 0);
+            drop(input);
+            DestroyWindow(hwnd).unwrap();
+        }
     }
 }

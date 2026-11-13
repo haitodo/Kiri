@@ -1076,3 +1076,166 @@ fn repair_scene_presentation(
     };
     (raise_failed, failed_focus_target)
 }
+
+fn binding_display_name(
+    binding_id: &str,
+    bindings: &[crate::config::WindowBinding],
+) -> String {
+    if let Some(b) = bindings.iter().find(|b| b.id == binding_id) {
+        let exe = std::path::Path::new(&b.match_rule.exe_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&b.match_rule.exe_path);
+        if exe.is_empty() {
+            binding_id.to_string()
+        } else {
+            format!("{} ({})", exe, binding_id)
+        }
+    } else {
+        binding_id.to_string()
+    }
+}
+
+/// Formats `SwitchWarning` entries into user-readable Japanese explanation lines.
+pub fn format_switch_warnings(
+    warnings: &[SwitchWarning],
+    bindings: &[crate::config::WindowBinding],
+    scenes: &[crate::config::Scene],
+) -> Vec<String> {
+    warnings
+        .iter()
+        .map(|w| match w {
+            SwitchWarning::TargetMonitorNotConfigured => {
+                "切替対象のモニタが設定されていません。設定画面の「動作・モニタ」タブで対象モニタを指定してください。".to_string()
+            }
+            SwitchWarning::TargetMonitorDisconnected { monitor_id } => {
+                format!(
+                    "設定された対象モニタ ({}) が現在接続されていません。",
+                    monitor_id
+                )
+            }
+            SwitchWarning::SceneNotFound { scene_id } => {
+                format!("指定されたシーン ID ({}) が見つかりませんでした。", scene_id)
+            }
+            SwitchWarning::AmbiguousBindingSameMonitor {
+                binding_id,
+                candidate_hwnds,
+            } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 同一モニタ上に一致するウィンドウが {} 個あり、特定できないため安全のためスキップしました。設定の「アプリ一覧」タブで候補を特定してください。",
+                    app,
+                    candidate_hwnds.len()
+                )
+            }
+            SwitchWarning::AmbiguousBindingCrossMonitor {
+                binding_id,
+                target_hwnd,
+            } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 別モニタにも同名ウィンドウが存在します（対象モニタ上の HWND 0x{:X} を優先しました）。",
+                    app, target_hwnd
+                )
+            }
+            SwitchWarning::SkippedModalDisabledWindow { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] モーダルダイアログ等が表示中のため、最小化をスキップしました。",
+                    app
+                )
+            }
+            SwitchWarning::SkippedElevatedWindow { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 管理者権限プロセスまたはアクセス拒否のため、操作をスキップしました。",
+                    app
+                )
+            }
+            SwitchWarning::HungWindowDetected { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] ウィンドウが応答なし状態のため、操作をスキップしました。",
+                    app
+                )
+            }
+            SwitchWarning::HiddenToTrayOnMinimize { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 最小化時にシステムトレイ等へ格納されたため、Kiri からの自動復元対象外となりました。",
+                    app
+                )
+            }
+            SwitchWarning::MinimizeVerificationFailed { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 最小化要求後の状態確認で最小化を確認できませんでした。",
+                    app
+                )
+            }
+            SwitchWarning::RestoreVerificationFailed { binding_id, .. } => {
+                let app = binding_display_name(binding_id, bindings);
+                format!(
+                    "[{}] 復元要求後の状態確認で表示を確認できませんでした。",
+                    app
+                )
+            }
+            SwitchWarning::ScenePresentationFailed { scene_id } => {
+                let scene_name = scenes
+                    .iter()
+                    .find(|s| s.id == *scene_id)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or(scene_id.as_str());
+                format!(
+                    "シーン「{}」の重なり順またはフォーカス更新が Windows に拒否されました。",
+                    scene_name
+                )
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod format_warning_tests {
+    use super::*;
+    use crate::config::{Scene, TitleRule, WindowBinding, WindowMatch};
+
+    #[test]
+    fn formats_warnings_with_app_and_scene_names() {
+        let bindings = vec![WindowBinding {
+            id: "b1".to_string(),
+            match_rule: WindowMatch {
+                exe_path: r"C:\Apps\Code.exe".to_string(),
+                window_class: String::new(),
+                title_rule: TitleRule::any(),
+                aumid: None,
+                monitor_id: None,
+            },
+            instance_hint: None,
+            scene_ids: vec!["code".to_string()],
+            always_visible: false,
+            enabled: true,
+        }];
+        let scenes = vec![Scene {
+            id: "code".to_string(),
+            name: "コード".to_string(),
+            icon: "code".to_string(),
+            pinned: true,
+            order: 0,
+        }];
+        let warnings = vec![
+            SwitchWarning::AmbiguousBindingSameMonitor {
+                binding_id: "b1".to_string(),
+                candidate_hwnds: vec![1, 2],
+            },
+            SwitchWarning::ScenePresentationFailed {
+                scene_id: "code".to_string(),
+            },
+        ];
+        let lines = format_switch_warnings(&warnings, &bindings, &scenes);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Code.exe"));
+        assert!(lines[0].contains("2 個"));
+        assert!(lines[1].contains("コード"));
+    }
+}

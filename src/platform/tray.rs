@@ -12,6 +12,8 @@ const TRAY_ICON_ID: u32 = 1001;
 pub struct TrayIcon {
     #[cfg(windows)]
     owner_hwnd: windows::Win32::Foundation::HWND,
+    #[cfg(windows)]
+    custom_hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created_msg: u32,
     registered: bool,
 }
@@ -23,8 +25,10 @@ impl TrayIcon {
         use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 
         let taskbar_created_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        let custom_hicon = crate::launcher::paint::create_kiri_hicon(32).unwrap_or_default();
         let mut tray = Self {
             owner_hwnd,
+            custom_hicon,
             taskbar_created_msg,
             registered: false,
         };
@@ -47,7 +51,11 @@ impl TrayIcon {
         use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
 
         unsafe {
-            let hicon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+            let hicon = if !self.custom_hicon.0.is_null() {
+                self.custom_hicon
+            } else {
+                LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+            };
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: self.owner_hwnd,
@@ -69,6 +77,48 @@ impl TrayIcon {
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
                 self.registered = true;
             }
+        }
+    }
+
+    /// Show a non-activating Windows tray balloon/toast notification.
+    #[cfg(windows)]
+    pub fn show_notification(&self, title: &str, message: &str, is_warning: bool) {
+        use windows::Win32::UI::Shell::{
+            Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_MODIFY,
+            NOTIFYICONDATAW,
+        };
+
+        if !self.registered {
+            return;
+        }
+
+        fn copy_utf16_into(dst: &mut [u16], text: &str) {
+            if dst.is_empty() {
+                return;
+            }
+            dst.fill(0);
+            let max_len = dst.len() - 1;
+            for (i, unit) in text.encode_utf16().take(max_len).enumerate() {
+                dst[i] = unit;
+            }
+        }
+
+        unsafe {
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.owner_hwnd,
+                uID: TRAY_ICON_ID,
+                uFlags: NIF_INFO,
+                dwInfoFlags: if is_warning {
+                    NIIF_WARNING | NIIF_NOSOUND
+                } else {
+                    NIIF_INFO | NIIF_NOSOUND
+                },
+                ..Default::default()
+            };
+            copy_utf16_into(&mut nid.szInfoTitle, title);
+            copy_utf16_into(&mut nid.szInfo, message);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 
@@ -95,5 +145,11 @@ impl TrayIcon {
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         self.remove();
+        if !self.custom_hicon.0.is_null() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(self.custom_hicon);
+            }
+            self.custom_hicon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
+        }
     }
 }

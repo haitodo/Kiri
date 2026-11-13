@@ -468,6 +468,13 @@ impl AppConfig {
         }
         (visible, overflow)
     }
+
+    /// Clamps numeric launcher fields to the `config.schema.json` valid ranges.
+    pub fn validate_and_clamp(&mut self) {
+        self.launcher.button_size_dip = self.launcher.button_size_dip.clamp(20, 96);
+        self.launcher.grip_size_dip = self.launcher.grip_size_dip.clamp(8, 48);
+        self.launcher.visible_slots = self.launcher.visible_slots.clamp(1, 12);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +650,43 @@ impl ConfigManager {
         Ok(())
     }
 
+    /// Export configuration atomically to an arbitrary user-chosen file path.
+    pub fn export_config_to_path(&self, config: &AppConfig, path: &Path) -> Result<(), String> {
+        let mut normalized = config.clone();
+        normalized.validate_and_clamp();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create export dir: {}", e))?;
+            }
+        }
+        let json_bytes = serde_json::to_vec_pretty(&normalized)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        let tmp_path = path.with_extension("json.tmp");
+        {
+            let mut file = File::create(&tmp_path)
+                .map_err(|e| format!("Failed to create temporary export file: {}", e))?;
+            file.write_all(&json_bytes)
+                .map_err(|e| format!("Failed to write temporary export file: {}", e))?;
+            file.sync_all()
+                .map_err(|e| format!("Failed to flush temporary export file: {}", e))?;
+        }
+        atomic_replace_file(&tmp_path, path, None)
+    }
+
+    /// Validate and import configuration from an external JSON file without mutating `self.config_path` yet.
+    pub fn import_config_from_path(&self, path: &Path) -> Result<(AppConfig, Vec<String>), String> {
+        let (mut cfg, warnings) = self.read_and_validate_file(path)?;
+        if cfg.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(format!(
+                "このファイルは新しいスキーマバージョン (v{}) のためインポートできません。",
+                cfg.schema_version
+            ));
+        }
+        cfg.validate_and_clamp();
+        Ok((cfg, warnings))
+    }
+
     fn read_and_validate_file(&self, path: &Path) -> Result<(AppConfig, Vec<String>), String> {
         let mut file =
             File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
@@ -650,11 +694,20 @@ impl ConfigManager {
         file.read_to_string(&mut raw)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
+        let label = path.display().to_string();
+        self.parse_and_validate_str(&raw, &label)
+    }
+
+    pub fn parse_and_validate_str(
+        &self,
+        raw: &str,
+        source_label: &str,
+    ) -> Result<(AppConfig, Vec<String>), String> {
         // Strip UTF-8 BOM if a user edited the file in Notepad
-        let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let content = raw.strip_prefix('\u{feff}').unwrap_or(raw);
 
         let value: serde_json::Value = serde_json::from_str(content)
-            .map_err(|e| format!("Invalid JSON in {}: {}", path.display(), e))?;
+            .map_err(|e| format!("Invalid JSON in {}: {}", source_label, e))?;
 
         let obj = value
             .as_object()
@@ -690,8 +743,11 @@ impl ConfigManager {
             }
         }
 
-        let cfg: AppConfig = serde_json::from_value(value)
-            .map_err(|e| format!("Schema validation error in {}: {}", path.display(), e))?;
+        let mut cfg: AppConfig = serde_json::from_value(value)
+            .map_err(|e| format!("Schema validation error in {}: {}", source_label, e))?;
+        if cfg.schema_version <= CURRENT_SCHEMA_VERSION {
+            cfg.validate_and_clamp();
+        }
 
         Ok((cfg, warnings))
     }
@@ -905,6 +961,49 @@ mod tests {
         assert_eq!(*mgr.last_status(), ConfigLoadStatus::LoadedNormally);
         assert_eq!(mgr.warnings().len(), 1);
         assert!(mgr.warnings()[0].contains("experimental_future_flag"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_and_clamp_enforces_schema_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.launcher.button_size_dip = 4;
+        cfg.launcher.grip_size_dip = 120;
+        cfg.launcher.visible_slots = 0;
+        cfg.validate_and_clamp();
+        assert_eq!(cfg.launcher.button_size_dip, 20);
+        assert_eq!(cfg.launcher.grip_size_dip, 48);
+        assert_eq!(cfg.launcher.visible_slots, 1);
+
+        cfg.launcher.button_size_dip = 999;
+        cfg.launcher.grip_size_dip = 1;
+        cfg.launcher.visible_slots = 50;
+        cfg.validate_and_clamp();
+        assert_eq!(cfg.launcher.button_size_dip, 96);
+        assert_eq!(cfg.launcher.grip_size_dip, 8);
+        assert_eq!(cfg.launcher.visible_slots, 12);
+    }
+
+    #[test]
+    fn test_export_and_import_roundtrip_and_rejects_future_schema() {
+        let dir = temp_test_dir("export_import");
+        let cfg_path = dir.join("config.json");
+        let export_path = dir.join("exported.json");
+        let mgr = ConfigManager::new(cfg_path);
+
+        let mut cfg = AppConfig::default();
+        cfg.launcher.button_size_dip = 10; // should clamp on export
+        mgr.export_config_to_path(&cfg, &export_path).unwrap();
+
+        let (imported, warnings) = mgr.import_config_from_path(&export_path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(imported.launcher.button_size_dip, 20);
+        assert_eq!(imported.scenes.len(), cfg.scenes.len());
+
+        let future_path = dir.join("future.json");
+        fs::write(&future_path, r#"{"schema_version": 999, "scenes": []}"#).unwrap();
+        assert!(mgr.import_config_from_path(&future_path).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

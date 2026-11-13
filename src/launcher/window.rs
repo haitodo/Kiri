@@ -14,18 +14,24 @@
 
 use crate::app::AppController;
 use crate::diagnostics::{log_error, log_info, log_warn};
-use crate::launcher::cursor_popup::{CursorPopup, PopupAction, WM_APP_CURSOR_POPUP_ACTION};
-use crate::launcher::input::{wheel_scene_index, HitTarget, LauncherLayout, SceneWheel};
+use crate::launcher::cursor_popup::{
+    CursorKeyOutcome, CursorPopup, PopupAction, WM_APP_CURSOR_POPUP_ACTION,
+};
+use crate::launcher::input::{
+    wheel_scene_index, HitTarget, LauncherLayout, SceneWheel, CORNER_RADIUS_DIP,
+};
 use crate::launcher::menu::{show_context_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
 use crate::platform::cursor_input::{
-    CursorInput, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP, WM_APP_TOGGLE_CURSOR_POPUP,
+    CursorInput, WM_APP_CURSOR_POPUP_KEY, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP,
+    WM_APP_TOGGLE_CURSOR_POPUP,
 };
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
-use crate::platform::monitors::find_monitor_for_point;
+use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
-use crate::scenes::switch::{SwitchSource, SwitchWarning};
+use crate::scenes::manager::SceneState;
+use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
 use windows::core::PWSTR;
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
@@ -66,6 +72,7 @@ pub struct LauncherWindowHost {
     pub app: AppController,
     pub layout: LauncherLayout,
     pub hovered: HitTarget,
+    pub pressed: HitTarget,
     pub theme: GdiThemeCache,
     pub overflow_popup: Option<Box<OverflowPopup>>,
     cursor_input: CursorInput,
@@ -138,7 +145,8 @@ impl LauncherWindowHost {
             )
             .map_err(|e| format!("CreateWindowExW failed: {}", e))?;
 
-            let overflow_popup = OverflowPopup::create(hwnd).ok();
+            let theme = GdiThemeCache::new(dpi);
+            let overflow_popup = OverflowPopup::create(hwnd, theme.gdiplus.clone()).ok();
             let tray = Some(TrayIcon::new(hwnd));
             let win_event_hook = WinEventHookGuard::install(hwnd);
 
@@ -190,7 +198,8 @@ impl LauncherWindowHost {
                 app,
                 layout,
                 hovered: HitTarget::None,
-                theme: GdiThemeCache::new(dpi),
+                pressed: HitTarget::None,
+                theme,
                 overflow_popup,
                 cursor_input: CursorInput::new(hwnd),
                 cursor_popup: None,
@@ -205,8 +214,15 @@ impl LauncherWindowHost {
 
             host.register_configured_hotkeys();
             host.check_startup_recovery_prompt();
-
+            host.apply_window_bounds(x, y, w, h);
             host.apply_launcher_settings();
+            if host.app.config_mgr.is_read_only() {
+                host.notify_tray(
+                    "Kiri - 読み取り専用モード",
+                    "新しいバージョンの config.json が読み込まれたため、設定の自動保存は無効です。",
+                    true,
+                );
+            }
             log_info("startup", "Launcher window created and ready");
             Ok(host)
         }
@@ -236,11 +252,18 @@ impl LauncherWindowHost {
         }
     }
 
+    pub fn notify_tray(&self, title: &str, message: &str, is_warning: bool) {
+        if let Some(ref tray) = self.tray {
+            tray.show_notification(title, message, is_warning);
+        }
+    }
+
     pub fn register_configured_hotkeys(&mut self) {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
         };
 
+        let mut failed_scenes: Vec<String> = Vec::new();
         unsafe {
             for i in 0..self.registered_hotkey_count {
                 let _ = UnregisterHotKey(self.hwnd, HOTKEY_BASE_ID + i as i32);
@@ -266,9 +289,28 @@ impl LauncherWindowHost {
                             hk.scene_id, hk.modifiers, hk.vk
                         ),
                     );
+                    let scene_name = self
+                        .app
+                        .config
+                        .scenes
+                        .iter()
+                        .find(|s| s.id == hk.scene_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| hk.scene_id.clone());
+                    failed_scenes.push(scene_name);
                 }
                 self.registered_hotkey_count = idx + 1;
             }
+        }
+        if !failed_scenes.is_empty() {
+            self.notify_tray(
+                "Kiri - ホットキー登録の競合",
+                &format!(
+                    "他アプリとの競合により登録できないホットキーがありました: {}",
+                    failed_scenes.join(", ")
+                ),
+                true,
+            );
         }
     }
 
@@ -348,7 +390,9 @@ impl LauncherWindowHost {
     }
 
     pub fn apply_window_bounds(&mut self, x: i32, y: i32, w: i32, h: i32) {
-        use windows::Win32::Graphics::Gdi::InvalidateRect;
+        use windows::Win32::Graphics::Gdi::{
+            CreateRoundRectRgn, DeleteObject, InvalidateRect, SetWindowRgn, HGDIOBJ,
+        };
         use windows::Win32::UI::WindowsAndMessaging::{
             SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
         };
@@ -360,9 +404,14 @@ impl LauncherWindowHost {
         } else {
             HWND_NOTOPMOST
         };
+        let diameter = dip_to_px(CORNER_RADIUS_DIP * 2, self.app.launcher_dpi);
         self.applying_bounds = true;
         unsafe {
             let _ = SetWindowPos(self.hwnd, z_hwnd, x, y, w, h, SWP_NOACTIVATE);
+            let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diameter, diameter);
+            if !rgn.is_invalid() && SetWindowRgn(self.hwnd, rgn, true) == 0 {
+                let _ = DeleteObject(HGDIOBJ(rgn.0));
+            }
             let _ = InvalidateRect(self.hwnd, None, false);
         }
         self.applying_bounds = false;
@@ -456,7 +505,16 @@ impl LauncherWindowHost {
                     Some("その他のシーン (⋯)".to_string())
                 }
             }
-            HitTarget::Grip => Some("Kiri (ドラッグ移動 / Wクリックでリセット)".to_string()),
+            HitTarget::Grip => {
+                if self.app.last_warnings.is_empty() {
+                    Some("Kiri (ドラッグ移動 / Wクリックでリセット)".to_string())
+                } else {
+                    Some(format!(
+                        "Kiri — ⚠️ 警告 {}件（右クリックメニューから確認）",
+                        self.app.last_warnings.len()
+                    ))
+                }
+            }
             HitTarget::None => None,
         };
 
@@ -599,14 +657,52 @@ impl LauncherWindowHost {
     }
 
     pub fn handle_menu_command(&mut self, cmd: MenuCommand) {
+        use windows::core::{w, HSTRING};
         use windows::Win32::Graphics::Gdi::InvalidateRect;
-        use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, PostQuitMessage, IDYES, MB_ICONWARNING, MB_TOPMOST, MB_YESNO,
+        };
 
         if let Some(ref mut ov) = self.overflow_popup {
             ov.hide();
         }
 
         match cmd {
+            MenuCommand::ShowWarnings => {
+                if self.app.last_warnings.is_empty() {
+                    self.notify_tray("Kiri - 警告", "現在記録されている警告はありません。", false);
+                    return;
+                }
+                let lines = format_switch_warnings(
+                    &self.app.last_warnings,
+                    &self.app.config.bindings,
+                    &self.app.config.scenes,
+                );
+                let numbered: Vec<String> = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}. {}", i + 1, l))
+                    .collect();
+                let body = format!(
+                    "直近のシーン切替で以下の警告が発生しました:\n\n{}\n\n確認後、ランチャーの警告インジケーター（オレンジ点）をクリアしますか？",
+                    numbered.join("\n")
+                );
+                let body_w = HSTRING::from(body);
+                let ans = unsafe {
+                    MessageBoxW(
+                        self.hwnd,
+                        &body_w,
+                        w!("Kiri - 最新の切替警告"),
+                        MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+                    )
+                };
+                if ans == IDYES {
+                    self.app.last_warnings.clear();
+                    unsafe {
+                        let _ = InvalidateRect(self.hwnd, None, false);
+                    }
+                }
+            }
             MenuCommand::OpenCursorPopup => self.toggle_cursor_popup(),
             MenuCommand::OpenSettings => {
                 self.open_settings_dialog();
@@ -620,13 +716,94 @@ impl LauncherWindowHost {
                 self.apply_window_bounds(x, y, w, h);
             }
             MenuCommand::SaveCurrentLayout => {
-                let _ = self.app.save_active_scene_layout();
+                if self.app.save_active_scene_layout() {
+                    let window_count = self
+                        .app
+                        .state_mgr
+                        .active_scene_id()
+                        .and_then(|id| {
+                            self.app
+                                .config
+                                .layouts
+                                .iter()
+                                .rfind(|l| l.scene_id == id)
+                                .map(|l| l.entries.len())
+                        })
+                        .unwrap_or(0);
+                    self.notify_tray(
+                        "Kiri - レイアウト保存",
+                        &format!(
+                            "現在シーンのレイアウトを保存しました（{} ウィンドウ）。",
+                            window_count
+                        ),
+                        false,
+                    );
+                } else {
+                    self.notify_tray(
+                        "Kiri - レイアウト保存",
+                        "アクティブなシーンがないか保存可能なウィンドウが見つかりませんでした。",
+                        true,
+                    );
+                }
             }
             MenuCommand::RestoreSavedLayout => {
-                let _ = self.app.restore_active_scene_layout();
+                if !matches!(self.app.state_mgr.state(), SceneState::Active(_)) {
+                    self.notify_tray(
+                        "Kiri - レイアウト復元",
+                        "アクティブなシーンが未確定のため復元できません。先にシーンを選択してください。",
+                        true,
+                    );
+                    return;
+                }
+                let restored = self.app.restore_active_scene_layout();
+                if restored > 0 {
+                    self.notify_tray(
+                        "Kiri - レイアウト復元",
+                        &format!("保存済みレイアウトを復元しました（{} ウィンドウ）。", restored),
+                        false,
+                    );
+                } else {
+                    self.notify_tray(
+                        "Kiri - レイアウト復元",
+                        "このシーン・モニタに一致する保存済みレイアウトまたは起動中ウィンドウがありません。",
+                        true,
+                    );
+                }
+            }
+            MenuCommand::LaunchMissingSceneApps => {
+                let (launched, skipped, errors) = self.app.launch_missing_apps_for_active_scene();
+                if !errors.is_empty() {
+                    self.notify_tray(
+                        "Kiri - アプリ起動",
+                        &format!(
+                            "起動: {}件 / スキップ: {}件\n{}",
+                            launched,
+                            skipped,
+                            errors.join("\n")
+                        ),
+                        true,
+                    );
+                } else if launched > 0 {
+                    self.notify_tray(
+                        "Kiri - アプリ起動",
+                        &format!("現在シーンの未起動アプリを {} 件起動しました。", launched),
+                        false,
+                    );
+                } else {
+                    self.notify_tray(
+                        "Kiri - アプリ起動",
+                        "起動が必要な未起動アプリはありませんでした（UWP/未設定パスは対象外）。",
+                        false,
+                    );
+                }
             }
             MenuCommand::RestoreAllMinimized => {
-                let _ = self.app.restore_all_minimized_windows();
+                let count = self.app.restore_all_minimized_windows();
+                self.notify_tray(
+                    "Kiri - 一括復元",
+                    &format!("Kiri が最小化したウィンドウを {} 件復元しました。", count),
+                    false,
+                );
                 unsafe {
                     let _ = InvalidateRect(self.hwnd, None, false);
                 }
@@ -640,6 +817,21 @@ impl LauncherWindowHost {
                     PostQuitMessage(0);
                 }
             }
+        }
+    }
+
+    fn execute_cursor_popup_action(&mut self, action: PopupAction) {
+        self.hide_cursor_popup();
+        match action {
+            PopupAction::SwitchScene(scene_id) => {
+                self.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
+            }
+            PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
+            PopupAction::OpenSettings => crate::settings::window::SettingsWindow::show(
+                self.hwnd,
+                &self.app,
+                Some(crate::settings::SettingsTab::Shortcuts),
+            ),
         }
     }
 
@@ -738,11 +930,14 @@ unsafe extern "system" fn launcher_wndproc(
                 host.hide_tooltip();
                 let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                let has_active_scene = matches!(host.app.state_mgr.state(), SceneState::Active(_));
                 if let Some(cmd) = show_context_menu(
                     hwnd,
                     screen_x,
                     screen_y,
                     host.app.config.launcher.orientation,
+                    host.app.last_warnings.len(),
+                    has_active_scene,
                 ) {
                     host.handle_menu_command(cmd);
                 }
@@ -753,13 +948,20 @@ unsafe extern "system" fn launcher_wndproc(
                 if host.drag_state.take().is_some() {
                     let _ = ReleaseCapture();
                 }
+                host.pressed = HitTarget::None;
                 host.hide_cursor_popup();
                 host.hide_tooltip();
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                if let Some(cmd) =
-                    show_context_menu(hwnd, pt.x, pt.y, host.app.config.launcher.orientation)
-                {
+                let has_active_scene = matches!(host.app.state_mgr.state(), SceneState::Active(_));
+                if let Some(cmd) = show_context_menu(
+                    hwnd,
+                    pt.x,
+                    pt.y,
+                    host.app.config.launcher.orientation,
+                    host.app.last_warnings.len(),
+                    has_active_scene,
+                ) {
                     host.handle_menu_command(cmd);
                 }
                 LRESULT(0)
@@ -770,29 +972,37 @@ unsafe extern "system" fn launcher_wndproc(
                 host.hide_tooltip();
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                if host.layout.hit_test(client_x, client_y) == HitTarget::Grip {
-                    if let Some(ref mut ov) = host.overflow_popup {
-                        ov.hide();
+                let hit = host.layout.hit_test(client_x, client_y);
+                match hit {
+                    HitTarget::Grip => {
+                        if let Some(ref mut ov) = host.overflow_popup {
+                            ov.hide();
+                        }
+                        let mut cursor_pt = POINT::default();
+                        let mut win_rc = RECT::default();
+                        if GetCursorPos(&mut cursor_pt).is_ok()
+                            && GetWindowRect(hwnd, &mut win_rc).is_ok()
+                        {
+                            let w = (win_rc.right - win_rc.left).max(1) as f64;
+                            let h = (win_rc.bottom - win_rc.top).max(1) as f64;
+                            let grab_rel_x = ((cursor_pt.x - win_rc.left) as f64 / w).clamp(0.0, 1.0);
+                            let grab_rel_y = ((cursor_pt.y - win_rc.top) as f64 / h).clamp(0.0, 1.0);
+                            host.drag_state = Some(LauncherDragState {
+                                grab_rel_x,
+                                grab_rel_y,
+                                start_cursor_x: cursor_pt.x,
+                                start_cursor_y: cursor_pt.y,
+                                moved: false,
+                            });
+                            let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
+                            let _ = SetCapture(hwnd);
+                        }
                     }
-                    let mut cursor_pt = POINT::default();
-                    let mut win_rc = RECT::default();
-                    if GetCursorPos(&mut cursor_pt).is_ok()
-                        && GetWindowRect(hwnd, &mut win_rc).is_ok()
-                    {
-                        let w = (win_rc.right - win_rc.left).max(1) as f64;
-                        let h = (win_rc.bottom - win_rc.top).max(1) as f64;
-                        let grab_rel_x = ((cursor_pt.x - win_rc.left) as f64 / w).clamp(0.0, 1.0);
-                        let grab_rel_y = ((cursor_pt.y - win_rc.top) as f64 / h).clamp(0.0, 1.0);
-                        host.drag_state = Some(LauncherDragState {
-                            grab_rel_x,
-                            grab_rel_y,
-                            start_cursor_x: cursor_pt.x,
-                            start_cursor_y: cursor_pt.y,
-                            moved: false,
-                        });
-                        let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
-                        let _ = SetCapture(hwnd);
+                    HitTarget::SceneButton { .. } | HitTarget::OverflowButton => {
+                        host.pressed = hit;
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
+                    HitTarget::None => {}
                 }
                 LRESULT(0)
             }
@@ -868,6 +1078,7 @@ unsafe extern "system" fn launcher_wndproc(
                 host.bar_wheel = SceneWheel::default();
                 if host.drag_state.is_none() {
                     host.hovered = HitTarget::None;
+                    host.pressed = HitTarget::None;
                     host.hide_tooltip();
                     let _ = InvalidateRect(hwnd, None, false);
                 }
@@ -924,6 +1135,8 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_LBUTTONUP => {
                 host.hide_tooltip();
+                let had_pressed = host.pressed != HitTarget::None;
+                host.pressed = HitTarget::None;
                 if let Some(drag) = host.drag_state.take() {
                     let _ = ReleaseCapture();
                     if drag.moved {
@@ -939,6 +1152,9 @@ unsafe extern "system" fn launcher_wndproc(
                         }
                     }
                     return LRESULT(0);
+                }
+                if had_pressed {
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
 
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -1015,9 +1231,16 @@ unsafe extern "system" fn launcher_wndproc(
                     host.hide_cursor_popup();
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
-                    if let Some(cmd) =
-                        show_context_menu(hwnd, pt.x, pt.y, host.app.config.launcher.orientation)
-                    {
+                    let has_active_scene =
+                        matches!(host.app.state_mgr.state(), SceneState::Active(_));
+                    if let Some(cmd) = show_context_menu(
+                        hwnd,
+                        pt.x,
+                        pt.y,
+                        host.app.config.launcher.orientation,
+                        host.app.last_warnings.len(),
+                        has_active_scene,
+                    ) {
                         host.handle_menu_command(cmd);
                     }
                 }
@@ -1036,20 +1259,29 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
+            WM_APP_CURSOR_POPUP_KEY => {
+                let vk = wparam.0 as u16;
+                let outcome = host
+                    .cursor_popup
+                    .as_mut()
+                    .map_or(CursorKeyOutcome::Ignored, |p| p.handle_key(vk));
+                match outcome {
+                    CursorKeyOutcome::Dismiss => host.hide_cursor_popup(),
+                    CursorKeyOutcome::Execute => {
+                        if let Some(action) =
+                            host.cursor_popup.as_mut().and_then(|p| p.pending_action.take())
+                        {
+                            host.execute_cursor_popup_action(action);
+                        }
+                    }
+                    CursorKeyOutcome::Redrawn | CursorKeyOutcome::Ignored => {}
+                }
+                LRESULT(0)
+            }
+
             WM_APP_CURSOR_POPUP_ACTION => {
                 if let Some(action) = host.cursor_popup.as_mut().and_then(|p| p.pending_action.take()) {
-                    host.hide_cursor_popup();
-                    match action {
-                        PopupAction::SwitchScene(scene_id) => {
-                            host.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
-                        }
-                        PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
-                        PopupAction::OpenSettings => crate::settings::window::SettingsWindow::show(
-                            hwnd,
-                            &host.app,
-                            Some(crate::settings::SettingsTab::Shortcuts),
-                        ),
-                    }
+                    host.execute_cursor_popup_action(action);
                 }
                 LRESULT(0)
             }
@@ -1139,6 +1371,7 @@ unsafe extern "system" fn launcher_wndproc(
                     last_known_scene_id: host.app.state_mgr.last_known_scene_id(),
                     active_in_overflow,
                     hovered: &host.hovered,
+                    pressed: &host.pressed,
                     has_warnings: !host.app.last_warnings.is_empty(),
                 };
                 paint_launcher(hdc, &mut host.theme, &paint_state);

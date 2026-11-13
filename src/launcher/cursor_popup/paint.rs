@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::GdiPlus::{
     DashCapRound, FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC,
     GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
-    GdipDeletePath, GdipDeletePen, GdipDrawEllipse, GdipDrawImageRect, GdipDrawLines, GdipFillPath,
+    GdipDeletePath, GdipDeletePen, GdipDrawImageRect, GdipDrawLines, GdipFillPath,
     GdipFillRectangleI, GdipSetInterpolationMode, GdipSetPenLineCap197819, GdipSetPenLineJoin,
     GdipSetSmoothingMode, GdipSetSolidFillColor, GpGraphics, GpSolidFill,
     InterpolationModeHighQualityBicubic, LineCapRound, LineJoinRound, Ok as GpOk, PointF,
@@ -189,10 +189,14 @@ impl CursorPopup {
                 continue;
             };
             let active = self.active_scene_id.as_deref() == Some(scene.id.as_str());
+            let focused = self.keyboard_focus == Some(Hit::Scene(index));
             let radius = px(6);
             if active {
                 canvas.fill(rect, radius, palette.active_border);
                 canvas.fill(inset(rect, border), radius - border, palette.active);
+            } else if focused {
+                canvas.fill(rect, radius, palette.active_border);
+                canvas.fill(inset(rect, border), radius - border, palette.hover);
             } else {
                 let fill = if self.hover == Some(Hit::Scene(index)) {
                     palette.hover
@@ -214,14 +218,16 @@ impl CursorPopup {
                     icon_size as f32,
                 );
             } else {
-                let icon = match scene.icon.as_str() {
-                    "chart" => Icon::Chart,
-                    "code" => Icon::Code,
-                    "globe" => Icon::Globe,
-                    _ => Icon::Circle,
-                };
-                let color = if active { palette.accent } else { palette.text };
-                canvas.icon(icon, x, y, icon_size, color);
+                let color = 0xFF00_0000 | if active { palette.accent } else { palette.text };
+                crate::launcher::paint::draw_builtin_icon_gdiplus(
+                    canvas.graphics,
+                    x as f32 + icon_size as f32 / 2.0,
+                    y as f32 + icon_size as f32 / 2.0,
+                    icon_size as f32 * 0.45,
+                    self.dpi,
+                    &scene.icon,
+                    color,
+                );
             }
         }
 
@@ -235,7 +241,10 @@ impl CursorPopup {
             } else {
                 Hit::Settings
             };
-            if self.hover == Some(hit) {
+            if self.keyboard_focus == Some(hit) {
+                canvas.fill(rect, px(5), palette.active_border);
+                canvas.fill(inset(rect, border), px(5) - border, palette.hover);
+            } else if self.hover == Some(hit) {
                 canvas.fill(rect, px(5), palette.hover);
             }
             if let Some(shortcut) = shortcut {
@@ -467,39 +476,7 @@ impl Canvas {
                 .collect();
             let _ = GdipDrawLines(self.graphics, pen, points.as_ptr(), points.len() as i32);
         };
-        let ellipse = |left: f32, top: f32, width: f32, height: f32| {
-            let _ = GdipDrawEllipse(
-                self.graphics,
-                pen,
-                x as f32 + left * scale,
-                y as f32 + top * scale,
-                width * scale,
-                height * scale,
-            );
-        };
         match icon {
-            Icon::Chart => {
-                line(&[(2.0, 15.0), (9.0, 8.0), (13.0, 12.0), (22.0, 3.0)]);
-                for (x, top) in [
-                    (4.0, 18.0),
-                    (8.0, 14.0),
-                    (12.0, 16.0),
-                    (16.0, 14.0),
-                    (20.0, 10.0),
-                ] {
-                    line(&[(x, top), (x, 21.0)]);
-                }
-            }
-            Icon::Code => {
-                line(&[(8.0, 6.0), (2.0, 12.0), (8.0, 18.0)]);
-                line(&[(16.0, 6.0), (22.0, 12.0), (16.0, 18.0)]);
-                line(&[(14.0, 4.0), (10.0, 20.0)]);
-            }
-            Icon::Globe => {
-                ellipse(2.0, 2.0, 20.0, 20.0);
-                ellipse(8.0, 2.0, 8.0, 20.0);
-                line(&[(2.0, 12.0), (22.0, 12.0)]);
-            }
             Icon::Folder => {
                 line(&[
                     (3.0, 7.0),
@@ -542,7 +519,6 @@ impl Canvas {
                 line(&[(14.0, 3.0), (21.0, 3.0), (21.0, 10.0)]);
                 line(&[(10.0, 14.0), (21.0, 3.0)]);
             }
-            Icon::Circle => ellipse(4.0, 4.0, 16.0, 16.0),
         }
         let _ = GdipDeletePen(pen);
     }
@@ -558,11 +534,7 @@ impl Drop for Canvas {
 }
 
 enum Icon {
-    Chart,
-    Code,
-    Globe,
     Folder,
     File,
     Website,
-    Circle,
 }

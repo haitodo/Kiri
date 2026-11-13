@@ -10,12 +10,14 @@ use crate::config::Orientation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
+    ShowWarnings,
     OpenCursorPopup,
     OpenSettings,
     ToggleOrientation,
     ResetPosition,
     SaveCurrentLayout,
     RestoreSavedLayout,
+    LaunchMissingSceneApps,
     RestoreAllMinimized,
     ExitAndRestore,
 }
@@ -28,6 +30,8 @@ const IDM_RESTORE_LAYOUT: usize = 2005;
 const IDM_RESTORE_ALL_MINIMIZED: usize = 2006;
 const IDM_EXIT: usize = 2007;
 const IDM_CURSOR_POPUP: usize = 2008;
+const IDM_SHOW_WARNINGS: usize = 2009;
+const IDM_LAUNCH_MISSING_APPS: usize = 2010;
 
 #[cfg(windows)]
 pub fn show_context_menu(
@@ -35,17 +39,25 @@ pub fn show_context_menu(
     screen_x: i32,
     screen_y: i32,
     current_orientation: Orientation,
+    warning_count: usize,
+    has_active_scene: bool,
 ) -> Option<MenuCommand> {
-    use windows::core::w;
+    use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow,
-        TrackPopupMenu, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+        TrackPopupMenu, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
     };
 
     unsafe {
         let hmenu = CreatePopupMenu().ok()?;
+
+        if warning_count > 0 {
+            let warn_text = HSTRING::from(format!("最新の警告を確認 ({}件)(&W)", warning_count));
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_SHOW_WARNINGS, &warn_text);
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+        }
 
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_CURSOR_POPUP, w!("ランチャーを開く(&K)"));
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, w!("設定(&S)..."));
@@ -57,17 +69,28 @@ pub fn show_context_menu(
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_RESET_POSITION, w!("位置をリセット(&P)"));
 
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+        let active_flag = if has_active_scene {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
         let _ = AppendMenuW(
             hmenu,
-            MF_STRING,
+            active_flag,
             IDM_SAVE_LAYOUT,
             w!("現在シーンのレイアウトを保存(&L)"),
         );
         let _ = AppendMenuW(
             hmenu,
-            MF_STRING,
+            active_flag,
             IDM_RESTORE_LAYOUT,
             w!("保存済みレイアウトを復元(&Y)"),
+        );
+        let _ = AppendMenuW(
+            hmenu,
+            active_flag,
+            IDM_LAUNCH_MISSING_APPS,
+            w!("現在シーンの未起動アプリを起動(&A)"),
         );
 
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
@@ -96,12 +119,14 @@ pub fn show_context_menu(
         let _ = DestroyMenu(hmenu);
 
         match cmd_id.0 as usize {
+            IDM_SHOW_WARNINGS => Some(MenuCommand::ShowWarnings),
             IDM_CURSOR_POPUP => Some(MenuCommand::OpenCursorPopup),
             IDM_SETTINGS => Some(MenuCommand::OpenSettings),
             IDM_TOGGLE_ORIENTATION => Some(MenuCommand::ToggleOrientation),
             IDM_RESET_POSITION => Some(MenuCommand::ResetPosition),
             IDM_SAVE_LAYOUT => Some(MenuCommand::SaveCurrentLayout),
             IDM_RESTORE_LAYOUT => Some(MenuCommand::RestoreSavedLayout),
+            IDM_LAUNCH_MISSING_APPS => Some(MenuCommand::LaunchMissingSceneApps),
             IDM_RESTORE_ALL_MINIMIZED => Some(MenuCommand::RestoreAllMinimized),
             IDM_EXIT => Some(MenuCommand::ExitAndRestore),
             _ => None,

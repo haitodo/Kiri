@@ -317,6 +317,88 @@ impl AppController {
         total
     }
 
+    /// Explicitly launches unregistered/not-running executable apps belonging to the active scene.
+    /// NEVER called during automatic scene switching (only via explicit user menu action).
+    /// Returns `(launched_count, skipped_count, error_messages)`.
+    pub fn launch_missing_apps_for_active_scene(&mut self) -> (usize, usize, Vec<String>) {
+        let Some(scene_id) = self.state_mgr.active_scene_id().map(|s| s.to_string()) else {
+            return (0, 0, Vec::new());
+        };
+        let windows = self.sys.enumerate_windows();
+        let monitors = self.sys.monitors();
+        let target_monitors: Vec<String> =
+            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
+                monitors.iter().map(|m| m.monitor_id.clone()).collect()
+            } else {
+                let launcher_mon = if self.launcher_monitor_id.is_empty() {
+                    None
+                } else {
+                    Some(self.launcher_monitor_id.as_str())
+                };
+                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
+                    Some(mon) => vec![mon],
+                    None => Vec::new(),
+                }
+            };
+
+        let mut launched = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+        let mut seen_exes = std::collections::HashSet::new();
+
+        for binding in &self.config.bindings {
+            if !binding.enabled || !binding.scene_ids.iter().any(|s| s == &scene_id) {
+                continue;
+            }
+            let already_open = target_monitors.iter().any(|mon| {
+                !matches!(
+                    self.resolver.resolve_binding(binding, &windows, mon),
+                    crate::scenes::bindings::BindingResolution::NotFound
+                )
+            });
+            if already_open {
+                continue;
+            }
+            let exe = binding.match_rule.exe_path.trim();
+            if exe.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let exe_lower = exe.to_ascii_lowercase();
+            // UWP / ApplicationFrameHost cannot be meaningfully re-launched directly via exe path
+            if exe_lower.ends_with("\\applicationframehost.exe") {
+                skipped += 1;
+                continue;
+            }
+            if !seen_exes.insert(exe_lower) {
+                continue;
+            }
+            if !std::path::Path::new(exe).is_file() {
+                skipped += 1;
+                errors.push(format!("実行ファイルが見つかりません: {}", exe));
+                continue;
+            }
+            match std::process::Command::new(exe).spawn() {
+                Ok(_) => {
+                    launched += 1;
+                    log_info(
+                        "app",
+                        &format!(
+                            "Explicitly launched missing app for scene '{}': {}",
+                            scene_id, exe
+                        ),
+                    );
+                }
+                Err(e) => {
+                    skipped += 1;
+                    errors.push(format!("{}: {}", exe, e));
+                }
+            }
+        }
+
+        (launched, skipped, errors)
+    }
+
     /// Returns true if the currently active scene is in the `⋯` overflow list (Section 2.3).
     pub fn is_active_scene_in_overflow(&self) -> bool {
         let Some(active_id) = self.state_mgr.active_scene_id() else {

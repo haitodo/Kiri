@@ -59,6 +59,10 @@ pub enum RegistrationWarning {
     OutsideTargetMonitor { window_monitor: String },
     /// Window title appears to contain digits (e.g. MT5 account number) or dynamic document/tab info.
     TitleMayContainSensitiveOrDynamicText,
+    /// Multiple windows on the target monitor match this rule without disambiguation.
+    AmbiguousSameMonitor { count: usize },
+    /// Matching windows span multiple monitors without monitor/instance disambiguation.
+    AmbiguousCrossMonitor { count: usize },
 }
 
 /// Normalize an executable path for case-insensitive comparison.

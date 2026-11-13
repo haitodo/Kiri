@@ -176,7 +176,7 @@ impl PopupLayout {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Scene(usize),
     Shortcut(usize),
@@ -187,6 +187,103 @@ pub enum PopupAction {
     SwitchScene(String),
     OpenShortcut(Shortcut),
     OpenSettings,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CursorKeyOutcome {
+    Ignored,
+    Redrawn,
+    Dismiss,
+    Execute,
+}
+
+fn next_focus_hit(
+    current: Option<Hit>,
+    scenes_len: usize,
+    shortcuts_len: usize,
+    vk: u16,
+) -> Option<Hit> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
+
+    let bottom_count = shortcuts_len.max(1);
+    let bottom_hit = |idx: usize| -> Hit {
+        if shortcuts_len == 0 {
+            Hit::Settings
+        } else {
+            Hit::Shortcut(idx.min(shortcuts_len - 1))
+        }
+    };
+    let first_hit = || -> Hit {
+        if scenes_len > 0 {
+            Hit::Scene(0)
+        } else {
+            bottom_hit(0)
+        }
+    };
+
+    let Some(cur) = current else {
+        return Some(first_hit());
+    };
+
+    match cur {
+        Hit::Scene(i) => {
+            if vk == VK_LEFT.0 {
+                if i > 0 {
+                    Some(Hit::Scene(i - 1))
+                } else {
+                    Some(bottom_hit(bottom_count - 1))
+                }
+            } else if vk == VK_RIGHT.0 {
+                if i + 1 < scenes_len {
+                    Some(Hit::Scene(i + 1))
+                } else {
+                    Some(bottom_hit(0))
+                }
+            } else if vk == VK_UP.0 {
+                if i >= SCENE_COLUMNS {
+                    Some(Hit::Scene(i - SCENE_COLUMNS))
+                } else {
+                    Some(bottom_hit(bottom_count - 1))
+                }
+            } else if vk == VK_DOWN.0 {
+                if i + SCENE_COLUMNS < scenes_len {
+                    Some(Hit::Scene(i + SCENE_COLUMNS))
+                } else {
+                    Some(bottom_hit(0))
+                }
+            } else {
+                Some(cur)
+            }
+        }
+        Hit::Shortcut(i) => {
+            if vk == VK_UP.0 || vk == VK_LEFT.0 {
+                if i > 0 {
+                    Some(Hit::Shortcut(i - 1))
+                } else if scenes_len > 0 {
+                    Some(Hit::Scene(scenes_len - 1))
+                } else {
+                    Some(Hit::Shortcut(bottom_count - 1))
+                }
+            } else if vk == VK_DOWN.0 || vk == VK_RIGHT.0 {
+                if i + 1 < bottom_count {
+                    Some(Hit::Shortcut(i + 1))
+                } else {
+                    Some(first_hit())
+                }
+            } else {
+                Some(cur)
+            }
+        }
+        Hit::Settings => {
+            if (vk == VK_UP.0 || vk == VK_LEFT.0 || vk == VK_DOWN.0 || vk == VK_RIGHT.0)
+                && scenes_len > 0
+            {
+                Some(Hit::Scene(0))
+            } else {
+                Some(Hit::Settings)
+            }
+        }
+    }
 }
 
 pub struct CursorPopup {
@@ -205,6 +302,7 @@ pub struct CursorPopup {
     scene_wheel: SceneWheel,
     hover: Option<Hit>,
     pressed: Option<Hit>,
+    keyboard_focus: Option<Hit>,
     tracking_leave: bool,
     pub pending_action: Option<PopupAction>,
     icon_cache: GdiThemeCache,
@@ -258,6 +356,7 @@ impl CursorPopup {
                 scene_wheel: SceneWheel::default(),
                 hover: None,
                 pressed: None,
+                keyboard_focus: None,
                 tracking_leave: false,
                 pending_action: None,
                 icon_cache: GdiThemeCache::with_context(96, gdiplus),
@@ -300,6 +399,7 @@ impl CursorPopup {
         self.scene_wheel = SceneWheel::default();
         self.hover = None;
         self.pressed = None;
+        self.keyboard_focus = None;
         self.tracking_leave = false;
         self.pending_action = None;
         self.window_width = width;
@@ -357,12 +457,92 @@ impl CursorPopup {
 
     pub fn hide(&mut self) {
         self.pending_action = None;
+        self.keyboard_focus = None;
         if self.visible {
             self.visible = false;
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
         }
+    }
+
+    fn action_for_hit(&self, hit: Hit) -> PopupAction {
+        match hit {
+            Hit::Scene(index) => PopupAction::SwitchScene(self.scenes[index].id.clone()),
+            Hit::Shortcut(index) => PopupAction::OpenShortcut(self.shortcuts[index].clone()),
+            Hit::Settings => PopupAction::OpenSettings,
+        }
+    }
+
+    fn ensure_hit_visible(&mut self, hit: Hit) {
+        let rect = match hit {
+            Hit::Scene(index) => self.layout.scene(index, self.width),
+            Hit::Shortcut(index) => self.layout.shortcut(index, self.width),
+            Hit::Settings => self.layout.shortcut(0, self.width),
+        };
+        if rect.top < self.scroll {
+            self.scroll_to(rect.top);
+        } else if rect.bottom > self.scroll + self.height {
+            self.scroll_to(rect.bottom - self.height);
+        }
+    }
+
+    pub fn handle_key(&mut self, vk: u16) -> CursorKeyOutcome {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+        };
+        if !self.visible {
+            return CursorKeyOutcome::Ignored;
+        }
+        if vk == VK_ESCAPE.0 {
+            return CursorKeyOutcome::Dismiss;
+        }
+        if vk == VK_RETURN.0 {
+            if let Some(hit) = self.keyboard_focus.or(self.hover) {
+                self.pending_action = Some(self.action_for_hit(hit));
+                return CursorKeyOutcome::Execute;
+            }
+            return CursorKeyOutcome::Dismiss;
+        }
+        if matches!(
+            vk,
+            v if v == VK_UP.0 || v == VK_DOWN.0 || v == VK_LEFT.0 || v == VK_RIGHT.0
+        ) {
+            let initial = self.keyboard_focus.or_else(|| {
+                self.active_scene_id
+                    .as_deref()
+                    .and_then(|id| self.scenes.iter().position(|s| s.id == id))
+                    .map(Hit::Scene)
+            });
+            let next = next_focus_hit(
+                if self.keyboard_focus.is_some() {
+                    self.keyboard_focus
+                } else {
+                    initial.and_then(|h| {
+                        // On first arrow press, if active scene exists start from it cleanly
+                        if vk == VK_RIGHT.0 || vk == VK_DOWN.0 || vk == VK_LEFT.0 || vk == VK_UP.0 {
+                            Some(h)
+                        } else {
+                            None
+                        }
+                    })
+                },
+                self.scenes.len(),
+                self.shortcuts.len(),
+                vk,
+            );
+            if next != self.keyboard_focus {
+                self.keyboard_focus = next;
+                if let Some(hit) = next {
+                    self.ensure_hit_visible(hit);
+                }
+                unsafe {
+                    let _ = InvalidateRect(self.hwnd, None, false);
+                }
+            }
+            return CursorKeyOutcome::Redrawn;
+        }
+        CursorKeyOutcome::Ignored
     }
 
     pub fn wheel_steps(&mut self, delta: i16, mut point: POINT) -> i32 {
@@ -521,6 +701,7 @@ unsafe extern "system" fn window_proc(
                 let hit = popup.hit_test(lparam);
                 if hit != popup.hover {
                     popup.hover = hit;
+                    popup.keyboard_focus = None;
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -540,15 +721,7 @@ unsafe extern "system" fn window_proc(
                     && popup.hit_test(lparam) == Some(hit)
                     && popup.pending_action.is_none()
                 {
-                    popup.pending_action = Some(match hit {
-                        Hit::Scene(index) => {
-                            PopupAction::SwitchScene(popup.scenes[index].id.clone())
-                        }
-                        Hit::Shortcut(index) => {
-                            PopupAction::OpenShortcut(popup.shortcuts[index].clone())
-                        }
-                        Hit::Settings => PopupAction::OpenSettings,
-                    });
+                    popup.pending_action = Some(popup.action_for_hit(hit));
                     if PostMessageW(
                         popup.owner,
                         WM_APP_CURSOR_POPUP_ACTION,
@@ -788,5 +961,46 @@ mod tests {
             drop(popup);
             DestroyWindow(owner).unwrap();
         }
+    }
+
+    #[test]
+    fn keyboard_focus_moves_across_scenes_and_shortcuts() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
+
+        // 4 scenes (3x2 grid, bottom row has 1 item) + 2 shortcuts
+        assert_eq!(next_focus_hit(None, 4, 2, VK_DOWN.0), Some(Hit::Scene(0)));
+        assert_eq!(
+            next_focus_hit(Some(Hit::Scene(0)), 4, 2, VK_RIGHT.0),
+            Some(Hit::Scene(1))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Scene(0)), 4, 2, VK_DOWN.0),
+            Some(Hit::Scene(3))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Scene(3)), 4, 2, VK_DOWN.0),
+            Some(Hit::Shortcut(0))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Shortcut(0)), 4, 2, VK_DOWN.0),
+            Some(Hit::Shortcut(1))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Shortcut(1)), 4, 2, VK_DOWN.0),
+            Some(Hit::Scene(0))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Shortcut(0)), 4, 2, VK_UP.0),
+            Some(Hit::Scene(3))
+        );
+        assert_eq!(
+            next_focus_hit(Some(Hit::Scene(0)), 4, 2, VK_LEFT.0),
+            Some(Hit::Shortcut(1))
+        );
+        // Empty shortcuts falls back to Settings row
+        assert_eq!(
+            next_focus_hit(Some(Hit::Scene(2)), 3, 0, VK_DOWN.0),
+            Some(Hit::Settings)
+        );
     }
 }
