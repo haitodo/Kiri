@@ -13,7 +13,7 @@ mod tests {
     use crate::config::{AppConfig, MonitorPolicy, RectData, Scene, TitleRule, WindowBinding, WindowMatch};
     use crate::platform::fake::FakeWindowSystem;
     use crate::platform::hooks::{MinimizeEvent, MinimizeEventKind};
-    use crate::platform::{ShowCmd, WindowInstance, WindowSystem};
+    use crate::platform::{ShowCmd, WindowInstance, WindowRaise, WindowSystem};
     use crate::recovery::RecoveryManager;
     use std::path::PathBuf;
 
@@ -47,6 +47,7 @@ mod tests {
             monitor_id: monitor_id.to_string(),
             is_visible: true,
             is_iconic: false,
+            is_topmost: false,
             is_enabled: true,
             is_hung: false,
             is_maximized: false,
@@ -1084,6 +1085,76 @@ mod tests {
         assert_eq!(sys.get_foreground_window(), Some(20));
 
         let _ = std::fs::remove_file(jpath);
+    }
+
+    #[test]
+    fn test_switch_corrects_z_order_even_when_focus_is_correct() {
+        for (focus_on_switch, foreground_locked) in [(true, false), (false, false), (true, true)] {
+            let mut cfg = setup_standard_config();
+            cfg.launcher.focus_on_switch = focus_on_switch;
+            let mut sys = FakeWindowSystem::new_dual_monitor();
+            sys.add_window(make_win(
+                99,
+                999,
+                r"C:\Windows\notepad.exe",
+                "Notepad",
+                "Notes",
+                "MON-2-TARGET",
+            ));
+            sys.add_window(make_win(
+                20,
+                200,
+                r"C:\Apps\MT5\terminal64.exe",
+                "MetaQuotes::MetaTrader::5.00",
+                "MT5",
+                "MON-2-TARGET",
+            ));
+            sys.foreground_hwnd = Some(99);
+            sys.foreground_locked = foreground_locked;
+
+            let mut state_mgr = SceneStateManager::new(None);
+            let mut resolver = BindingResolver::new();
+            let jpath = test_journal_path("verify_z_order");
+            let mut recovery = RecoveryManager::new(jpath.clone());
+            let out = execute_scene_switch(
+                "trade",
+                &cfg,
+                &mut state_mgr,
+                &mut resolver,
+                &mut recovery,
+                &mut sys,
+                None,
+            );
+            assert!(out.restored_hwnds.is_empty() && out.minimized_hwnds.is_empty());
+            let foreground = Some(if focus_on_switch && !foreground_locked {
+                20
+            } else {
+                99
+            });
+            assert_eq!(sys.windows[0].hwnd, 20);
+            assert_eq!(sys.get_foreground_window(), foreground);
+
+            // An unrelated app can change the Z-order without taking keyboard focus.
+            assert!(sys
+                .bring_to_top(99, WindowRaise::ReorderWithinGroup)
+                .accepted());
+            let warnings =
+                verify_switch_results(&out.verification.unwrap(), &mut recovery, &mut sys);
+            if foreground_locked {
+                assert_eq!(
+                    warnings,
+                    vec![SwitchWarning::ScenePresentationFailed {
+                        scene_id: "trade".to_string(),
+                    }]
+                );
+            } else {
+                assert!(warnings.is_empty());
+            }
+            assert_eq!(sys.windows[0].hwnd, 20);
+            assert_eq!(sys.get_foreground_window(), foreground);
+
+            let _ = std::fs::remove_file(jpath);
+        }
     }
 
     #[test]

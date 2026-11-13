@@ -30,6 +30,108 @@ pub enum ShowCmd {
     RestoreActivate,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum WindowRaise {
+    Normal,
+    ReorderWithinGroup,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ShowWindowRequest {
+    AlreadyRestored,
+    Synchronous { was_visible: bool },
+    Asynchronous,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RaiseWindowResult {
+    Ineligible,
+    WindowPos {
+        error: Option<i32>,
+    },
+    Reordered {
+        promote_error: Option<i32>,
+        demote_error: Option<i32>,
+    },
+}
+
+impl RaiseWindowResult {
+    pub fn accepted(self) -> bool {
+        matches!(
+            self,
+            Self::WindowPos { error: None }
+                | Self::Reordered {
+                    promote_error: None,
+                    demote_error: None,
+                }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusRetry {
+    NoForeground,
+    ForegroundHung,
+    ForegroundThreadUnavailable,
+    SameThread,
+    AttachFailed(u32),
+    Retried {
+        accepted: bool,
+        detach_error: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FocusRequest {
+    Ineligible,
+    AlreadyForeground,
+    Accepted,
+    Rejected { retry: FocusRetry },
+}
+
+impl FocusRequest {
+    pub fn accepted(self) -> bool {
+        matches!(
+            self,
+            Self::AlreadyForeground
+                | Self::Accepted
+                | Self::Rejected {
+                    retry: FocusRetry::Retried { accepted: true, .. },
+                }
+        )
+    }
+}
+
+/// A read-only snapshot used to verify actual stacking and foreground ownership.
+#[derive(Debug, Serialize)]
+pub struct WindowStackEntry {
+    pub hwnd: u64,
+    pub pid: u32,
+    pub thread_id: Option<u32>,
+    pub class: String,
+    pub monitor: Option<String>,
+    pub rect: RectData,
+    pub iconic: bool,
+    pub topmost: bool,
+    pub owner: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForegroundState {
+    pub hwnd: Option<u64>,
+    pub pid: Option<u32>,
+    pub thread_id: Option<u32>,
+    pub class: Option<String>,
+    pub gui_flags: Option<u32>,
+    pub menu_owner: Option<u64>,
+    pub capture: Option<u64>,
+    pub focused_control: Option<u64>,
+}
+
 /// Runtime snapshot of a single top-level window (Section 4.1 `WindowInstance`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowInstance {
@@ -44,6 +146,8 @@ pub struct WindowInstance {
     pub monitor_id: String,
     pub is_visible: bool,
     pub is_iconic: bool,
+    /// Whether the window belongs to the always-on-top group.
+    pub is_topmost: bool,
     /// False when the window is disabled (e.g. a modal confirmation dialog is open, FR-17).
     pub is_enabled: bool,
     pub is_hung: bool,
@@ -83,6 +187,7 @@ pub enum PlatformError {
     WindowNotFound(u64),
     AccessDenied(u64),
     HungWindow(u64),
+    ShowRequestRejected(ShowCmd),
     OsError(String),
 }
 
@@ -94,6 +199,9 @@ impl std::fmt::Display for PlatformError {
                 write!(f, "Access denied (UIPI / elevated process) for window 0x{:X}", h)
             }
             PlatformError::HungWindow(h) => write!(f, "Window 0x{:X} is not responding", h),
+            PlatformError::ShowRequestRejected(cmd) => {
+                write!(f, "ShowWindowAsync({cmd:?}) returned false")
+            }
             PlatformError::OsError(msg) => write!(f, "OS error: {}", msg),
         }
     }
@@ -108,17 +216,27 @@ pub trait WindowSystem {
     /// Query the live state of a specific HWND (even if it became invisible after minimizing to system tray).
     fn query_window(&self, hwnd: u64) -> Option<WindowInstance>;
 
-    /// Issue an asynchronous `ShowWindowAsync` command to another process's window.
-    fn show_window_async(&mut self, hwnd: u64, cmd: ShowCmd) -> Result<(), PlatformError>;
+    /// Request a show-state change and report how the Win32 call responded.
+    fn show_window_async(
+        &mut self,
+        hwnd: u64,
+        cmd: ShowCmd,
+    ) -> Result<ShowWindowRequest, PlatformError>;
 
     /// Raise a visible, non-minimized window in Z-order without activating it.
-    fn bring_to_top(&mut self, hwnd: u64) -> bool;
+    /// `ReorderWithinGroup` is used when the normal request left a window covered.
+    fn bring_to_top(&mut self, hwnd: u64, method: WindowRaise) -> RaiseWindowResult;
 
     /// Get the current foreground window HWND (`GetForegroundWindow`).
     fn get_foreground_window(&self) -> Option<u64>;
 
     /// Request moving foreground focus to `hwnd` (`SetForegroundWindow`).
-    fn set_foreground_window(&mut self, hwnd: u64) -> bool;
+    fn set_foreground_window(&mut self, hwnd: u64) -> FocusRequest;
+
+    /// Includes visible owned and launcher windows that are excluded from scene matching.
+    fn window_stack(&self) -> Vec<WindowStackEntry>;
+
+    fn foreground_state(&self) -> ForegroundState;
 
     /// Session input timestamp used to avoid changing focus after subsequent user input.
     fn last_input_tick(&self) -> Option<u32>;

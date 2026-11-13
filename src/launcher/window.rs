@@ -25,7 +25,7 @@ use crate::platform::cursor_input::{
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
 use crate::platform::monitors::find_monitor_for_point;
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
-use crate::scenes::switch::SwitchWarning;
+use crate::scenes::switch::{SwitchSource, SwitchWarning};
 use windows::core::PWSTR;
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
@@ -504,12 +504,12 @@ impl LauncherWindowHost {
         }
     }
 
-    pub fn trigger_scene_switch(&mut self, scene_id: &str) {
+    fn trigger_scene_switch(&mut self, scene_id: &str, source: SwitchSource) {
         self.hide_cursor_popup();
-        self.switch_scene(scene_id);
+        self.switch_scene(scene_id, source);
     }
 
-    fn cycle_scene(&mut self, steps: i32) {
+    fn cycle_scene(&mut self, steps: i32, source: SwitchSource) {
         if steps == 0 {
             return;
         }
@@ -531,20 +531,20 @@ impl LauncherWindowHost {
         if let Some(overflow) = &mut self.overflow_popup {
             overflow.hide();
         }
-        self.switch_scene(&scene_id);
+        self.switch_scene(&scene_id, source);
         if let Some(popup) = &mut self.cursor_popup {
             popup.update_active_scene(self.app.state_mgr.active_scene_id());
         }
     }
 
-    fn switch_scene(&mut self, scene_id: &str) {
+    fn switch_scene(&mut self, scene_id: &str, source: SwitchSource) {
         use windows::core::w;
         use windows::Win32::Graphics::Gdi::InvalidateRect;
         use windows::Win32::UI::WindowsAndMessaging::{
-            KillTimer, MessageBoxW, SetTimer, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
+            MessageBoxW, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
         };
 
-        let outcome = self.app.switch_to_scene(scene_id);
+        let outcome = self.app.switch_to_scene(scene_id, source);
 
         if outcome
             .warnings
@@ -563,10 +563,9 @@ impl LauncherWindowHost {
                     self.app.config.target.monitor_id = Some(self.app.launcher_monitor_id.clone());
                     let _ = self.app.config_mgr.save(&self.app.config);
                     // Retry the switch now that target monitor is configured
-                    let retry = self.app.switch_to_scene(scene_id);
+                    let retry = self.app.switch_to_scene(scene_id, source);
                     if retry.verification.is_some() {
-                        let _ = KillTimer(self.hwnd, TIMER_VERIFY_SWITCH);
-                        let _ = SetTimer(self.hwnd, TIMER_VERIFY_SWITCH, 500, None);
+                        self.schedule_switch_verification();
                     }
                 }
                 let _ = InvalidateRect(self.hwnd, None, false);
@@ -577,10 +576,24 @@ impl LauncherWindowHost {
         if !outcome.was_noop_same_scene {
             unsafe {
                 if outcome.verification.is_some() {
-                    let _ = KillTimer(self.hwnd, TIMER_VERIFY_SWITCH);
-                    let _ = SetTimer(self.hwnd, TIMER_VERIFY_SWITCH, 500, None);
+                    self.schedule_switch_verification();
                 }
                 let _ = InvalidateRect(self.hwnd, None, false);
+            }
+        }
+    }
+
+    fn schedule_switch_verification(&self) {
+        use windows::Win32::Foundation::GetLastError;
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_VERIFY_SWITCH);
+            if SetTimer(self.hwnd, TIMER_VERIFY_SWITCH, 500, None) == 0 {
+                let error = GetLastError().0;
+                if let Some(pending) = &self.app.pending_verification {
+                    pending.record_timer_failure(error);
+                }
             }
         }
     }
@@ -882,7 +895,12 @@ unsafe extern "system" fn launcher_wndproc(
                 } else {
                     0
                 };
-                host.cycle_scene(steps);
+                let source = if msg == WM_APP_CURSOR_POPUP_WHEEL {
+                    SwitchSource::PopupWheel
+                } else {
+                    SwitchSource::BarWheel
+                };
+                host.cycle_scene(steps, source);
                 LRESULT(0)
             }
 
@@ -930,7 +948,7 @@ unsafe extern "system" fn launcher_wndproc(
                         if let Some(ref mut ov) = host.overflow_popup {
                             ov.hide();
                         }
-                        host.trigger_scene_switch(&scene_id);
+                        host.trigger_scene_switch(&scene_id, SwitchSource::BarClick);
                     }
                     HitTarget::OverflowButton => {
                         let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
@@ -979,7 +997,7 @@ unsafe extern "system" fn launcher_wndproc(
                 let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
                 if let Some(scene) = overflow_scenes.get(idx) {
                     let scene_id = scene.id.clone();
-                    host.trigger_scene_switch(&scene_id);
+                    host.trigger_scene_switch(&scene_id, SwitchSource::Overflow);
                 }
                 LRESULT(0)
             }
@@ -1022,7 +1040,9 @@ unsafe extern "system" fn launcher_wndproc(
                 if let Some(action) = host.cursor_popup.as_mut().and_then(|p| p.pending_action.take()) {
                     host.hide_cursor_popup();
                     match action {
-                        PopupAction::SwitchScene(scene_id) => host.trigger_scene_switch(&scene_id),
+                        PopupAction::SwitchScene(scene_id) => {
+                            host.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
+                        }
                         PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
                         PopupAction::OpenSettings => crate::settings::window::SettingsWindow::show(
                             hwnd,
@@ -1070,7 +1090,7 @@ unsafe extern "system" fn launcher_wndproc(
                 if hk_id >= 0 {
                     if let Some(hk) = host.app.config.hotkeys.get(hk_id as usize) {
                         let scene_id = hk.scene_id.clone();
-                        host.trigger_scene_switch(&scene_id);
+                        host.trigger_scene_switch(&scene_id, SwitchSource::Hotkey);
                     }
                 }
                 LRESULT(0)

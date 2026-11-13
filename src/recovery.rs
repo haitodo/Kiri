@@ -205,7 +205,7 @@ impl RecoveryManager {
         }
     }
 
-    /// Mark that Kiri is about to restore `hwnd` so the resulting `MINIMIZEEND` event
+    /// Record a restore requested by Kiri so the resulting `MINIMIZEEND` event
     /// is not treated as an external manual override, and remove it from active minimized set.
     pub fn mark_restoring_by_us(&mut self, hwnd: u64) {
         self.restoring_by_us.insert(hwnd);
@@ -294,11 +294,11 @@ impl RecoveryManager {
                     action.process_start_time,
                 ) && live.is_iconic
                 {
-                    self.mark_restoring_by_us(action.hwnd);
                     if sys
                         .show_window_async(action.hwnd, ShowCmd::RestoreNoActivate)
                         .is_ok()
                     {
+                        self.mark_restoring_by_us(action.hwnd);
                         restored_count += 1;
                     }
                 } else {

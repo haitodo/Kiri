@@ -7,11 +7,14 @@
 //! - Filters out cloaked windows (`DWMWA_CLOAKED`), other virtual desktops (`IVirtualDesktopManager`),
 //!   owned windows (`GW_OWNER`), and our own process windows.
 //! - Uses `SHGetPropertyStoreForWindow` (`PKEY_AppUserModel_ID`) for packaged apps (`ApplicationFrameHost.exe`).
-//! - Attributes minimized windows to their monitor using `WINDOWPLACEMENT.rcNormalPosition` / `MonitorFromWindow`.
+//! - Attributes minimized windows to their pre-minimize monitor using `MonitorFromWindow`.
 
 use crate::config::RectData;
 use crate::platform::monitors::{enumerate_connected_monitors, find_best_monitor_for_rect};
-use crate::platform::{MonitorInfoData, PlatformError, ShowCmd, WindowInstance, WindowSystem};
+use crate::platform::{
+    FocusRequest, FocusRetry, ForegroundState, MonitorInfoData, PlatformError, RaiseWindowResult,
+    ShowCmd, ShowWindowRequest, WindowInstance, WindowRaise, WindowStackEntry, WindowSystem,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -102,7 +105,11 @@ impl WindowSystem for Win32WindowSystem {
         unsafe { inspect_hwnd(hwnd, self.own_pid, &monitors, None, None, false) }
     }
 
-    fn show_window_async(&mut self, hwnd_val: u64, cmd: ShowCmd) -> Result<(), PlatformError> {
+    fn show_window_async(
+        &mut self,
+        hwnd_val: u64,
+        cmd: ShowCmd,
+    ) -> Result<ShowWindowRequest, PlatformError> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             IsHungAppWindow, IsIconic, IsWindow, ShowWindow, ShowWindowAsync, SW_MINIMIZE,
@@ -124,25 +131,29 @@ impl WindowSystem for Win32WindowSystem {
 
             if matches!(cmd, ShowCmd::RestoreActivate | ShowCmd::RestoreNoActivate) {
                 if !IsIconic(hwnd).as_bool() {
-                    return Ok(());
+                    return Ok(ShowWindowRequest::AlreadyRestored);
                 }
                 // Restore responsive windows before the initial Z-order pass.
                 if !IsHungAppWindow(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, n_cmd);
-                    return Ok(());
+                    let was_visible = ShowWindow(hwnd, n_cmd).as_bool();
+                    return Ok(ShowWindowRequest::Synchronous { was_visible });
                 }
             }
 
-            let _ = ShowWindowAsync(hwnd, n_cmd);
-            Ok(())
+            if ShowWindowAsync(hwnd, n_cmd).as_bool() {
+                Ok(ShowWindowRequest::Asynchronous)
+            } else {
+                Err(PlatformError::ShowRequestRejected(cmd))
+            }
         }
     }
 
-    fn bring_to_top(&mut self, hwnd_val: u64) -> bool {
+    fn bring_to_top(&mut self, hwnd_val: u64, method: WindowRaise) -> RaiseWindowResult {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsHungAppWindow, IsIconic, IsWindowVisible, SetWindowPos, HWND_TOP, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+            GetWindowLongW, IsHungAppWindow, IsIconic, IsWindowVisible, SetWindowPos, GWL_EXSTYLE,
+            HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+            SWP_NOSENDCHANGING, SWP_NOSIZE, WS_EX_TOPMOST,
         };
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
@@ -150,18 +161,36 @@ impl WindowSystem for Win32WindowSystem {
                 || IsIconic(hwnd).as_bool()
                 || IsHungAppWindow(hwnd).as_bool()
             {
-                return false;
+                return RaiseWindowResult::Ineligible;
             }
-            SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            )
-            .is_ok()
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+            if matches!(method, WindowRaise::Normal)
+                || (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0)
+            {
+                return RaiseWindowResult::WindowPos {
+                    error: SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags)
+                        .err()
+                        .map(|error| error.code().0),
+                };
+            }
+
+            // Moving a window out of the topmost group places it above other normal
+            // windows even when a request for keyboard focus was rejected.
+            let flags = flags | SWP_NOSENDCHANGING;
+            let promote_error = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+                .err()
+                .map(|error| error.code().0);
+            let demote_error = if promote_error.is_none() {
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+                    .err()
+                    .map(|error| error.code().0)
+            } else {
+                None
+            };
+            RaiseWindowResult::Reordered {
+                promote_error,
+                demote_error,
+            }
         }
     }
 
@@ -177,13 +206,11 @@ impl WindowSystem for Win32WindowSystem {
         }
     }
 
-    fn set_foreground_window(&mut self, hwnd_val: u64) -> bool {
+    fn set_foreground_window(&mut self, hwnd_val: u64) -> FocusRequest {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
-            IsWindowVisible, SetForegroundWindow,
+            GetForegroundWindow, IsHungAppWindow, IsIconic, IsWindowVisible, SetForegroundWindow,
         };
 
         let target_hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
@@ -193,29 +220,117 @@ impl WindowSystem for Win32WindowSystem {
                 || IsIconic(target_hwnd).as_bool()
                 || IsHungAppWindow(target_hwnd).as_bool()
             {
-                return false;
+                return FocusRequest::Ineligible;
             }
-            if GetForegroundWindow() == target_hwnd || SetForegroundWindow(target_hwnd).as_bool() {
-                return true;
+            if GetForegroundWindow() == target_hwnd {
+                return FocusRequest::AlreadyForeground;
+            }
+            if SetForegroundWindow(target_hwnd).as_bool() {
+                return FocusRequest::Accepted;
             }
 
-            let foreground = GetForegroundWindow();
-            if foreground.0.is_null() || IsHungAppWindow(foreground).as_bool() {
-                return false;
+            FocusRequest::Rejected {
+                retry: retry_foreground_request(target_hwnd),
             }
-            let current_thread = GetCurrentThreadId();
-            let foreground_thread = GetWindowThreadProcessId(foreground, None);
-            if foreground_thread == 0
-                || foreground_thread == current_thread
-                || !AttachThreadInput(current_thread, foreground_thread, true).as_bool()
+        }
+    }
+
+    fn window_stack(&self) -> Vec<WindowStackEntry> {
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+            IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOPMOST,
+        };
+
+        struct StackSnapshot<'a> {
+            monitors: &'a [MonitorInfoData],
+            windows: Vec<WindowStackEntry>,
+        }
+
+        unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let snapshot = &mut *(lparam.0 as *mut StackSnapshot<'_>);
+            let mut cloaked = 0u32;
+            if !IsWindowVisible(hwnd).as_bool()
+                || (DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED,
+                    (&mut cloaked as *mut u32).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                )
+                .is_ok()
+                    && cloaked != 0)
             {
-                return false;
+                return BOOL(1);
             }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_ok() {
+                let mut pid = 0;
+                let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                snapshot.windows.push(WindowStackEntry {
+                    hwnd: hwnd.0 as usize as u64,
+                    pid,
+                    thread_id: (thread_id != 0).then_some(thread_id),
+                    class: window_class_name(hwnd),
+                    monitor: window_monitor(hwnd, snapshot.monitors).map(|m| m.monitor_id.clone()),
+                    rect: RectData {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
+                    iconic: IsIconic(hwnd).as_bool(),
+                    topmost: GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0,
+                    owner: GetWindow(hwnd, GW_OWNER)
+                        .ok()
+                        .map(|owner| owner.0 as usize as u64),
+                });
+            }
+            BOOL(1)
+        }
 
-            // Avoid joining the target's input queue as well.
-            let requested = SetForegroundWindow(target_hwnd).as_bool();
-            let _ = AttachThreadInput(current_thread, foreground_thread, false);
-            requested
+        let monitors = self.cached_monitors.borrow();
+        let mut snapshot = StackSnapshot {
+            monitors: &monitors,
+            windows: Vec::new(),
+        };
+        unsafe {
+            let _ = EnumWindows(Some(collect), LPARAM(&mut snapshot as *mut _ as isize));
+        }
+        snapshot.windows
+    }
+
+    fn foreground_state(&self) -> ForegroundState {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+        };
+
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0;
+            let thread_id = if hwnd.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(hwnd, Some(&mut pid))
+            };
+            let mut info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            let has_gui_info = thread_id != 0 && GetGUIThreadInfo(thread_id, &mut info).is_ok();
+            ForegroundState {
+                hwnd: (!hwnd.0.is_null()).then_some(hwnd.0 as usize as u64),
+                pid: (pid != 0).then_some(pid),
+                thread_id: (thread_id != 0).then_some(thread_id),
+                class: (!hwnd.0.is_null()).then(|| window_class_name(hwnd)),
+                gui_flags: has_gui_info.then_some(info.flags.0),
+                menu_owner: (has_gui_info && !info.hwndMenuOwner.0.is_null())
+                    .then_some(info.hwndMenuOwner.0 as usize as u64),
+                capture: (has_gui_info && !info.hwndCapture.0.is_null())
+                    .then_some(info.hwndCapture.0 as usize as u64),
+                focused_control: (has_gui_info && !info.hwndFocus.0.is_null())
+                    .then_some(info.hwndFocus.0 as usize as u64),
+            }
         }
     }
 
@@ -289,6 +404,77 @@ impl WindowSystem for Win32WindowSystem {
     }
 }
 
+#[cfg(windows)]
+unsafe fn retry_foreground_request(target: windows::Win32::Foundation::HWND) -> FocusRetry {
+    use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
+    };
+
+    let foreground = GetForegroundWindow();
+    if foreground.0.is_null() {
+        return FocusRetry::NoForeground;
+    }
+    if IsHungAppWindow(foreground).as_bool() {
+        return FocusRetry::ForegroundHung;
+    }
+    let current_thread = GetCurrentThreadId();
+    let foreground_thread = GetWindowThreadProcessId(foreground, None);
+    if foreground_thread == 0 {
+        return FocusRetry::ForegroundThreadUnavailable;
+    }
+    if foreground_thread == current_thread {
+        return FocusRetry::SameThread;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if !AttachThreadInput(current_thread, foreground_thread, true).as_bool() {
+        return FocusRetry::AttachFailed(GetLastError().0);
+    }
+    let accepted = SetForegroundWindow(target).as_bool();
+    SetLastError(ERROR_SUCCESS);
+    let detached = AttachThreadInput(current_thread, foreground_thread, false).as_bool();
+    FocusRetry::Retried {
+        accepted,
+        detach_error: (!detached).then(|| GetLastError().0),
+    }
+}
+
+#[cfg(windows)]
+unsafe fn window_class_name(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    let mut buffer = [0u16; 256];
+    let length = GetClassNameW(hwnd, &mut buffer).max(0) as usize;
+    String::from_utf16_lossy(&buffer[..length])
+}
+
+#[cfg(windows)]
+unsafe fn window_monitor(
+    hwnd: windows::Win32::Foundation::HWND,
+    monitors: &[MonitorInfoData],
+) -> Option<&MonitorInfoData> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return None;
+    }
+    let rect = RectData {
+        left: info.rcMonitor.left,
+        top: info.rcMonitor.top,
+        right: info.rcMonitor.right,
+        bottom: info.rcMonitor.bottom,
+    };
+    monitors.iter().find(|m| m.monitor_rect == rect)
+}
+
 #[inline]
 fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
     haystack.len() >= suffix.len()
@@ -310,10 +496,10 @@ unsafe fn inspect_hwnd(
     use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow,
-        IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_SHOWMAXIMIZED,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+        IsWindow, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_SHOWMAXIMIZED,
         WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     };
 
     if !IsWindow(hwnd).as_bool() {
@@ -336,6 +522,37 @@ unsafe fn inspect_hwnd(
         return None;
     }
 
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 || pid == own_pid {
+        return None;
+    }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+    let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+    let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
+
+    // Exclude non-app tool/noactivate overlay windows during general enumeration unless they have a title
+    if require_visible_top_level
+        && (is_tool_window || is_no_activate)
+        && GetWindowTextLengthW(hwnd) == 0
+    {
+        return None;
+    }
+
+    let mut class_buf = [0u16; 256];
+    let class_len = GetClassNameW(hwnd, &mut class_buf).max(0) as usize;
+    let window_class = String::from_utf16_lossy(&class_buf[..class_len]);
+
+    // Exclude Windows shell desktop / taskbar chrome classes before expensive DWM/COM calls
+    if matches!(
+        window_class.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    ) {
+        return None;
+    }
+
     // Check DWMWA_CLOAKED (exclude background UWP frames / suspended windows)
     let mut cloaked: u32 = 0;
     if DwmGetWindowAttribute(
@@ -350,25 +567,13 @@ unsafe fn inspect_hwnd(
         return None;
     }
 
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == 0 || pid == own_pid {
-        return None;
-    }
-
-    // Exclude windows on other virtual desktops
+    // Exclude windows on other virtual desktops (COM RPC - keep after fast local checks)
     if let Some(checker) = vdm {
         if !checker.is_window_on_current_desktop(hwnd) {
             return None;
         }
     }
 
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
-    let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
-    let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
-
-    // Exclude non-app tool/noactivate overlay windows during general enumeration unless they have a title
     let has_taskbar_button = (!is_tool_window && owner.0.is_null()) || is_app_window;
 
     let mut title_buf = [0u16; 512];
@@ -380,22 +585,6 @@ unsafe fn inspect_hwnd(
     };
 
     if require_visible_top_level && title.is_empty() && (is_tool_window || is_no_activate) {
-        return None;
-    }
-
-    let mut class_buf = [0u16; 256];
-    let class_len = GetClassNameW(hwnd, &mut class_buf);
-    let window_class = if class_len > 0 {
-        String::from_utf16_lossy(&class_buf[..class_len as usize])
-    } else {
-        String::new()
-    };
-
-    // Exclude Windows shell desktop / taskbar chrome classes
-    if matches!(
-        window_class.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    ) {
         return None;
     }
 
@@ -431,15 +620,17 @@ unsafe fn inspect_hwnd(
         wp.showCmd == SW_SHOWMAXIMIZED.0 as u32
     };
 
-    // Per Section 4.2 #6: When minimized, use normal_rect (or MonitorFromWindow pre-minimized rect)
-    // instead of the off-screen (-32000) window_rect.
-    let attribution_rect = if is_iconic || window_rect.left <= -30000 {
-        &normal_rect
-    } else {
-        &window_rect
-    };
-
-    let monitor_id = find_best_monitor_for_rect(attribution_rect, monitors)
+    // MonitorFromWindow uses the pre-minimize rectangle, including a maximized window's
+    // actual screen position. rcNormalPosition is the restored rectangle in workspace coordinates.
+    let monitor_id = window_monitor(hwnd, monitors)
+        .or_else(|| {
+            let rect = if is_iconic {
+                &normal_rect
+            } else {
+                &window_rect
+            };
+            find_best_monitor_for_rect(rect, monitors)
+        })
         .map(|m| m.monitor_id.clone())
         .unwrap_or_else(|| "UNKNOWN-MONITOR".to_string());
 
@@ -468,6 +659,7 @@ unsafe fn inspect_hwnd(
         monitor_id,
         is_visible,
         is_iconic,
+        is_topmost: (ex_style & WS_EX_TOPMOST.0) != 0,
         is_enabled,
         is_hung,
         is_maximized,

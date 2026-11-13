@@ -16,8 +16,8 @@ use crate::scenes::layouts::{
 };
 use crate::scenes::manager::SceneStateManager;
 use crate::scenes::switch::{
-    execute_scene_switch, resolve_effective_target_monitor_id, verify_switch_results,
-    PendingVerification, SwitchOutcome, SwitchWarning,
+    execute_scene_switch_from, resolve_effective_target_monitor_id, verify_switch_results,
+    PendingVerification, SwitchOutcome, SwitchSource, SwitchWarning,
 };
 
 pub struct AppController {
@@ -170,7 +170,7 @@ impl AppController {
     }
 
     /// Request switching to `scene_id` (serialized on main UI thread).
-    pub fn switch_to_scene(&mut self, scene_id: &str) -> SwitchOutcome {
+    pub fn switch_to_scene(&mut self, scene_id: &str, source: SwitchSource) -> SwitchOutcome {
         self.process_queued_win_events();
 
         let launcher_mon = if self.launcher_monitor_id.is_empty() {
@@ -179,7 +179,7 @@ impl AppController {
             Some(self.launcher_monitor_id.as_str())
         };
 
-        let outcome = execute_scene_switch(
+        let outcome = execute_scene_switch_from(
             scene_id,
             &self.config,
             &mut self.state_mgr,
@@ -187,9 +187,13 @@ impl AppController {
             &mut self.recovery,
             &mut *self.sys,
             launcher_mon,
+            source,
         );
 
         if outcome.switched {
+            if let Some(previous) = &self.pending_verification {
+                previous.skip_verification("superseded_by_next_switch");
+            }
             self.pending_verification = outcome.verification.clone();
             self.last_warnings = outcome.warnings.clone();
             self.update_monitor_profile_active_scene(scene_id);
@@ -214,7 +218,9 @@ impl AppController {
     /// Restore all windows minimized by Kiri and reset scene state to `Unknown` (Section 8.1, AT-15).
     pub fn restore_all_minimized_windows(&mut self) -> usize {
         self.process_queued_win_events();
-        self.pending_verification = None;
+        if let Some(pending) = self.pending_verification.take() {
+            pending.skip_verification("restore_all");
+        }
         let count = self.recovery.restore_all_minimized_by_us(&mut *self.sys);
         self.state_mgr.reset_to_unknown();
         self.last_warnings.clear();

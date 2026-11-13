@@ -12,12 +12,17 @@
 //! - Restores windows in reverse Z-order (bottom-to-top) after verifying `is_iconic` (Section 5.3).
 //! - Verifies window states on a one-shot timer (Step 10) and detects tray-hiding apps (Section 8.2).
 
+mod trace;
+
+use self::trace::{binding_event, window_state, PresentationPhase, SwitchTrace};
+pub use self::trace::SwitchSource;
 use crate::config::AppConfig;
 use crate::diagnostics::{log_info, log_warn, mask_title};
-use crate::platform::{ShowCmd, WindowInstance, WindowSystem};
+use crate::platform::{ShowCmd, WindowInstance, WindowRaise, WindowSystem};
 use crate::recovery::RecoveryManager;
 use crate::scenes::bindings::{BindingResolution, BindingResolver, BoundRuntimeIdentity};
 use crate::scenes::manager::SceneStateManager;
+use serde_json::json;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,26 +77,42 @@ pub enum SwitchWarning {
     ScenePresentationFailed { scene_id: String },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PendingVerification {
     pub scene_id: String,
     pub target_monitor_id: String,
     pub minimized: Vec<(String, u64)>,
     pub restored: Vec<(String, u64)>,
     presentation: Option<PendingPresentation>,
+    trace: SwitchTrace,
+    trace_targets: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
 struct PendingPresentation {
     windows: Vec<BoundRuntimeIdentity>,
-    focus_target: Option<u64>,
+    focus: bool,
     input_tick: u32,
-    retry_raise: bool,
 }
 
 impl PendingVerification {
     pub fn cancel_presentation_retry(&mut self) {
+        self.trace
+            .record("presentation_cancelled", || json!({"reason": "settings_changed"}));
+        self.trace.flush();
         self.presentation = None;
+    }
+
+    pub fn skip_verification(&self, reason: &str) {
+        self.trace
+            .record("verification_skipped", || json!({"reason": reason}));
+        self.trace.flush();
+    }
+
+    pub fn record_timer_failure(&self, error: u32) {
+        self.trace
+            .record("verification_timer_failed", || json!({"win32_error": error}));
+        self.trace.flush();
     }
 }
 
@@ -146,27 +167,16 @@ fn binding_specificity_rank(binding: &crate::config::WindowBinding, resolver: &B
     }
 }
 
-/// Raise scene windows from bottom to top and choose the top eligible window for activation.
-fn raise_scene_windows(
-    sys: &mut dyn WindowSystem,
-    windows: &[&WindowInstance],
-    focus: bool,
-) -> (Option<u64>, bool) {
-    let mut raise_failed = false;
-    let mut focus_target = None;
-    for win in windows {
-        if win.is_hung {
-            continue;
-        }
-        raise_failed |= !sys.bring_to_top(win.hwnd);
-        if focus && win.is_enabled {
-            focus_target = Some(win.hwnd);
-        }
-    }
-    (focus_target, raise_failed)
+fn scene_focus_target(windows: &[&WindowInstance]) -> Option<u64> {
+    windows
+        .iter()
+        .rev()
+        .find(|win| win.is_enabled && !win.is_hung)
+        .map(|win| win.hwnd)
 }
 
 /// Execute the 10-step `switch_scene` algorithm (Section 5.1).
+#[cfg(test)]
 pub fn execute_scene_switch(
     next_scene_id: &str,
     config: &AppConfig,
@@ -176,11 +186,48 @@ pub fn execute_scene_switch(
     sys: &mut dyn WindowSystem,
     launcher_monitor_id: Option<&str>,
 ) -> SwitchOutcome {
-    let mut warnings = Vec::new();
+    execute_scene_switch_from(
+        next_scene_id,
+        config,
+        state_mgr,
+        resolver,
+        recovery,
+        sys,
+        launcher_monitor_id,
+        SwitchSource::Unspecified,
+    )
+}
+
+pub fn execute_scene_switch_from(
+    next_scene_id: &str,
+    config: &AppConfig,
+    state_mgr: &mut SceneStateManager,
+    resolver: &mut BindingResolver,
+    recovery: &mut RecoveryManager,
+    sys: &mut dyn WindowSystem,
+    launcher_monitor_id: Option<&str>,
+    source: SwitchSource,
+) -> SwitchOutcome {
     let input_tick = sys.last_input_tick();
+    let trace = SwitchTrace::new();
+    trace.record("started", || {
+        json!({
+            "from_scene": state_mgr.active_scene_id(),
+            "to_scene": next_scene_id,
+            "source": source,
+            "monitor_policy": config.target.monitor_policy,
+            "configured_monitor": config.target.monitor_id,
+            "launcher_monitor": launcher_monitor_id,
+            "focus_on_switch": config.launcher.focus_on_switch,
+            "restore_all_on_switch": config.launcher.restore_all_on_switch,
+            "foreground": sys.foreground_state(),
+        })
+    });
+    let mut warnings = Vec::new();
 
     // Verify scene exists
     if !config.scenes.iter().any(|s| s.id == next_scene_id) {
+        trace.record("finished", || json!({"reason": "scene_not_found"}));
         warnings.push(SwitchWarning::SceneNotFound {
             scene_id: next_scene_id.to_string(),
         });
@@ -206,6 +253,12 @@ pub fn execute_scene_switch(
         "ALL_MONITORS".to_string()
     } else {
         let Some(mon_id) = resolve_effective_target_monitor_id(config, launcher_monitor_id) else {
+            trace.record("finished", || {
+                json!({
+                    "reason": "target_monitor_not_configured",
+                    "already_active": already_active,
+                })
+            });
             if already_active {
                 return SwitchOutcome {
                     was_noop_same_scene: true,
@@ -228,6 +281,13 @@ pub fn execute_scene_switch(
         };
 
         if !monitors.iter().any(|m| m.monitor_id == mon_id) {
+            trace.record("finished", || {
+                json!({
+                    "reason": "target_monitor_disconnected",
+                    "target_monitor": mon_id,
+                    "already_active": already_active,
+                })
+            });
             if already_active {
                 return SwitchOutcome {
                     was_noop_same_scene: true,
@@ -255,6 +315,14 @@ pub fn execute_scene_switch(
 
     // Step 2: Enumerate and re-validate registered windows
     let all_windows = sys.enumerate_windows();
+    trace.record("target", || {
+        json!({
+            "monitor": target_mon_id,
+            "connected_monitors": connected_monitor_ids,
+            "enumerated_windows": all_windows.len(),
+            "last_input_tick": input_tick,
+        })
+    });
 
     // First, determine which HWNDs are protected in `next_scene_id` (either belonging to `next` or `always_visible`).
     // This guarantees common windows shared across scenes are never minimized (FR-07, AT-07).
@@ -263,8 +331,21 @@ pub fn execute_scene_switch(
     let mut claimed_hwnds: HashSet<u64> = HashSet::new();
 
     // Resolve bindings in order of specificity so keyword/monitor-pinned bindings claim their windows first
-    let mut ordered_bindings: Vec<&crate::config::WindowBinding> =
-        config.bindings.iter().filter(|b| b.enabled).collect();
+    let mut ordered_bindings = Vec::new();
+    for binding in &config.bindings {
+        if binding.enabled {
+            ordered_bindings.push(binding);
+        } else if trace.is_enabled() && binding.scene_ids.iter().any(|id| id == next_scene_id) {
+            trace.record("binding", || {
+                json!({
+                    "binding": binding.id,
+                    "exe": crate::diagnostics::executable_name(&binding.match_rule.exe_path),
+                    "in_scene": true,
+                    "result": "disabled",
+                })
+            });
+        }
+    }
     ordered_bindings.sort_by_key(|b| binding_specificity_rank(b, resolver));
 
     for binding in ordered_bindings {
@@ -285,6 +366,9 @@ pub fn execute_scene_switch(
             )
         };
 
+        trace.record("binding", || {
+            binding_event(binding, in_next, &resolution, &all_windows, &claimed_hwnds)
+        });
         match resolution {
             BindingResolution::Resolved(win) => {
                 claimed_hwnds.insert(win.hwnd);
@@ -395,6 +479,12 @@ pub fn execute_scene_switch(
             win.monitor_id == target_mon_id
         };
         if !on_valid_monitor {
+            trace.record("presentation_candidate_skipped", || {
+                json!({
+                    "binding": binding_id, "hwnd": win.hwnd,
+                    "reason": "outside_target_monitor", "monitor": win.monitor_id,
+                })
+            });
             continue;
         }
         let z = recovery
@@ -477,6 +567,7 @@ pub fn execute_scene_switch(
     // Step 1 idempotency check (AT-03): If `state == Active(next)` and no newly reopened windows need
     // minimizing/restoring, return a clean no-op without issuing any OS commands.
     if already_active && to_minimize.is_empty() && to_restore.is_empty() {
+        trace.record("finished", || json!({"reason": "already_active"}));
         return SwitchOutcome {
             was_noop_same_scene: true,
             switched: false,
@@ -497,6 +588,30 @@ pub fn execute_scene_switch(
 
     // Check if the current foreground window is among `to_minimize` (Section 5.4, FR-18, AT-25)
     let foreground_hwnd = sys.get_foreground_window();
+    trace.record("plan", || {
+        json!({
+            "minimize": to_minimize.iter().map(|(binding, win)| json!({
+                "binding": binding,
+                "hwnd": win.hwnd,
+                "deferred": Some(win.hwnd) == foreground_hwnd,
+            })).collect::<Vec<_>>(),
+            "restore": to_restore.iter().map(|(binding, win, _)| json!({
+                "binding": binding, "hwnd": win.hwnd,
+            })).collect::<Vec<_>>(),
+            "raise_visible": to_bring_to_front.iter().map(|(win, _)| win.hwnd).collect::<Vec<_>>(),
+            "warnings": warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>(),
+        })
+    });
+    let trace_targets: Vec<_> = if trace.is_enabled() {
+        to_restore
+            .iter()
+            .map(|(_, win, _)| win.hwnd)
+            .chain(to_bring_to_front.iter().map(|(win, _)| win.hwnd))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    trace.stacking("before_operations", &trace_targets, sys);
     let mut deferred_foreground_minimize: Option<(String, WindowInstance)> = None;
 
     let mut minimized_hwnds = Vec::new();
@@ -508,7 +623,7 @@ pub fn execute_scene_switch(
             deferred_foreground_minimize = Some((binding_id, win));
             continue;
         }
-        match sys.show_window_async(win.hwnd, ShowCmd::MinimizeNoActivate) {
+        match trace.show(sys, &binding_id, win.hwnd, ShowCmd::MinimizeNoActivate) {
             Ok(()) => {
                 recovery.mark_minimize_issued(win.hwnd);
                 minimized_hwnds.push(win.hwnd);
@@ -536,18 +651,27 @@ pub fn execute_scene_switch(
     };
     for (binding_id, win, z) in to_restore {
         // Section 5.3: Always re-verify `is_iconic` immediately before sending restore command
-        let still_iconic = sys.query_window(win.hwnd).is_some_and(|live| {
+        let live = sys.query_window(win.hwnd);
+        let still_iconic = live.as_ref().is_some_and(|live| {
             live.is_iconic
                 && live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
         });
         if !still_iconic {
+            trace.record("restore_skipped", || {
+                json!({
+                    "binding": binding_id,
+                    "hwnd": win.hwnd,
+                    "reason": "no_longer_same_minimized_window",
+                    "observed": live.as_ref().map(window_state),
+                })
+            });
             recovery.invalidate_hwnd(win.hwnd);
             continue;
         }
 
-        recovery.mark_restoring_by_us(win.hwnd);
-        match sys.show_window_async(win.hwnd, restore_cmd) {
+        match trace.show(sys, &binding_id, win.hwnd, restore_cmd) {
             Ok(()) => {
+                recovery.mark_restoring_by_us(win.hwnd);
                 restored_hwnds.push(win.hwnd);
                 verification_restored.push((binding_id, win.hwnd));
                 scene_windows.push((win, z));
@@ -566,7 +690,7 @@ pub fn execute_scene_switch(
     // so keyboard focus never stays trapped on an invisible minimized window.
     let mut foreground_minimize_issued = false;
     if let Some((binding_id, fg_win)) = deferred_foreground_minimize {
-        match sys.show_window_async(fg_win.hwnd, ShowCmd::MinimizeActivateNext) {
+        match trace.show(sys, &binding_id, fg_win.hwnd, ShowCmd::MinimizeActivateNext) {
             Ok(()) => {
                 recovery.mark_minimize_issued(fg_win.hwnd);
                 minimized_hwnds.push(fg_win.hwnd);
@@ -589,19 +713,18 @@ pub fn execute_scene_switch(
     scene_windows.append(&mut to_bring_to_front);
     scene_windows.sort_by_key(|(_, z)| std::cmp::Reverse(*z));
     let scene_windows: Vec<_> = scene_windows.iter().map(|(win, _)| win).collect();
-    let (focus_target, raise_failed) = raise_scene_windows(
-        sys,
-        &scene_windows,
-        config.launcher.focus_on_switch || foreground_minimize_issued,
-    );
-    if let Some(hwnd) = focus_target {
-        let _ = sys.set_foreground_window(hwnd);
+    for win in scene_windows.iter().filter(|win| !win.is_hung) {
+        trace.raise(sys, "initial", win.hwnd, WindowRaise::Normal);
     }
-    // A failed raise, a delayed restore, or the old foreground window's minimize can
-    // change the Z-order after the first pass.
-    let retry_raise = raise_failed || foreground_minimize_issued || !restored_hwnds.is_empty();
+    let focus = config.launcher.focus_on_switch || foreground_minimize_issued;
+    if focus {
+        if let Some(hwnd) = scene_focus_target(&scene_windows) {
+            trace.focus(sys, "initial", hwnd);
+        }
+    }
+    trace.stacking("after_initial_requests", &trace_targets, sys);
     let presentation = input_tick
-        .filter(|_| !scene_windows.is_empty() && (retry_raise || focus_target.is_some()))
+        .filter(|_| !scene_windows.is_empty())
         .map(|input_tick| PendingPresentation {
             windows: scene_windows
                 .into_iter()
@@ -611,39 +734,62 @@ pub fn execute_scene_switch(
                     process_start_time: win.process_start_time,
                 })
                 .collect(),
-            focus_target,
+            focus,
             input_tick,
-            retry_raise,
         });
+    if let Some(presentation) = &presentation {
+        repair_scene_presentation(
+            presentation,
+            &target_mon_id,
+            sys,
+            &trace,
+            PresentationPhase::Immediate,
+        );
+    } else if !trace_targets.is_empty() {
+        trace.record("presentation_skipped", || {
+            json!({
+                "phase": "immediate",
+                "reason": if input_tick.is_none() { "input_tick_unavailable" } else { "no_eligible_targets" },
+            })
+        });
+    }
 
     let _ = recovery.persist_journal();
 
     // Step 9: Confirm `state = Active(next)`
     state_mgr.set_active(next_scene_id.to_string());
-    log_info(
-        "switch",
-        &format!(
-            "Switched to scene '{}' on monitor '{}' (minimized={}, restored={}, warnings={})",
-            next_scene_id,
-            target_mon_id,
-            minimized_hwnds.len(),
-            restored_hwnds.len(),
-            warnings.len()
-        ),
-    );
+    if !warnings.is_empty() || trace.is_enabled() {
+        log_info(
+            "switch",
+            &format!(
+                "Switched to scene '{}' on monitor '{}' (minimized={}, restored={}, warnings={})",
+                next_scene_id,
+                target_mon_id,
+                minimized_hwnds.len(),
+                restored_hwnds.len(),
+                warnings.len()
+            ),
+        );
+    }
 
     let verification = if !verification_minimized.is_empty()
         || !verification_restored.is_empty()
         || presentation.is_some()
+        || !trace_targets.is_empty()
     {
+        trace.record("verification_pending", || json!({}));
+        trace.flush();
         Some(PendingVerification {
             scene_id: next_scene_id.to_string(),
             target_monitor_id: target_mon_id,
             minimized: verification_minimized,
             restored: verification_restored,
             presentation,
+            trace,
+            trace_targets,
         })
     } else {
+        trace.record("finished", || json!({"reason": "no_window_operations"}));
         None
     };
 
@@ -667,9 +813,18 @@ pub fn verify_switch_results(
 ) -> Vec<SwitchWarning> {
     let mut warnings = Vec::new();
     let mut journal_dirty = false;
+    let trace = &pending.trace;
+    trace.stacking("verification_before", &pending.trace_targets, sys);
 
     for (binding_id, hwnd) in &pending.minimized {
-        if let Some(live) = sys.query_window(*hwnd) {
+        let live = sys.query_window(*hwnd);
+        trace.record("show_verified", || {
+            json!({
+                "binding": binding_id, "hwnd": hwnd, "expected": "minimized",
+                "observed": live.as_ref().map(window_state),
+            })
+        });
+        if let Some(live) = live {
             if !live.is_visible && !live.is_iconic {
                 // Section 8.2: App hid itself to system tray upon minimize
                 log_warn(
@@ -702,7 +857,14 @@ pub fn verify_switch_results(
     }
 
     for (binding_id, hwnd) in &pending.restored {
-        if let Some(live) = sys.query_window(*hwnd) {
+        let live = sys.query_window(*hwnd);
+        trace.record("show_verified", || {
+            json!({
+                "binding": binding_id, "hwnd": hwnd, "expected": "restored",
+                "observed": live.as_ref().map(window_state),
+            })
+        });
+        if let Some(live) = live {
             if live.is_iconic {
                 log_warn(
                     "switch",
@@ -719,7 +881,15 @@ pub fn verify_switch_results(
         }
     }
 
-    warnings.extend(verify_scene_presentation(pending, sys));
+    if pending.presentation.is_none() {
+        trace.record("presentation_skipped", || {
+            json!({
+                "phase": "verification", "reason": "no_pending_presentation",
+            })
+        });
+    } else {
+        warnings.extend(verify_scene_presentation(pending, sys));
+    }
 
     // Section 5.4 (FR-18): Verify the current foreground window is not still a minimized window
     if let Some(fg_hwnd) = sys.get_foreground_window() {
@@ -736,7 +906,7 @@ pub fn verify_switch_results(
                 .or_else(|| sys.enumerate_windows().into_iter().find(can_receive_focus))
                 .map(|w| w.hwnd);
             if let Some(safe_hwnd) = fallback_hwnd {
-                let _ = sys.set_foreground_window(safe_hwnd);
+                trace.focus(sys, "minimized_foreground_fallback", safe_hwnd);
             }
         }
     }
@@ -745,6 +915,14 @@ pub fn verify_switch_results(
         let _ = recovery.persist_journal();
     }
 
+    trace.stacking("verification_after", &pending.trace_targets, sys);
+    trace.record("finished", || {
+        json!({
+            "reason": "verified",
+            "warnings": warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>(),
+        })
+    });
+    trace.flush();
     warnings
 }
 
@@ -757,13 +935,58 @@ fn verify_scene_presentation(
     sys: &mut dyn WindowSystem,
 ) -> Option<SwitchWarning> {
     let presentation = pending.presentation.as_ref()?;
-    let foreground = sys.get_foreground_window();
-    let focus_out_of_date =
-        presentation.focus_target.is_some() && presentation.focus_target != foreground;
-    if !(presentation.retry_raise || focus_out_of_date)
-        || sys.last_input_tick() != Some(presentation.input_tick)
-    {
+    let (raise_failed, failed_focus_target) = repair_scene_presentation(
+        presentation,
+        &pending.target_monitor_id,
+        sys,
+        &pending.trace,
+        PresentationPhase::Verification,
+    );
+    if raise_failed {
+        log_warn(
+            "switch",
+            &format!(
+                "Could not correct window stacking for scene '{}'",
+                pending.scene_id
+            ),
+        );
+    }
+    if let Some(hwnd) = failed_focus_target {
+        log_warn(
+            "switch",
+            &format!(
+                "Could not focus window 0x{:X} in scene '{}'",
+                hwnd, pending.scene_id
+            ),
+        );
+    }
+    if !raise_failed && failed_focus_target.is_none() {
         return None;
+    }
+    Some(SwitchWarning::ScenePresentationFailed {
+        scene_id: pending.scene_id.clone(),
+    })
+}
+
+/// Correct visual stacking, and optionally retry a foreground request after the switch settles.
+fn repair_scene_presentation(
+    presentation: &PendingPresentation,
+    target_monitor_id: &str,
+    sys: &mut dyn WindowSystem,
+    trace: &SwitchTrace,
+    phase: PresentationPhase,
+) -> (bool, Option<u64>) {
+    let retry_focus = phase.retries_focus() && presentation.focus;
+    let current_input_tick = sys.last_input_tick();
+    if current_input_tick != Some(presentation.input_tick) {
+        trace.record("presentation_skipped", || {
+            json!({
+                "phase": phase, "reason": "input_changed_or_unavailable",
+                "switch_input_tick": presentation.input_tick,
+                "current_input_tick": current_input_tick,
+            })
+        });
+        return (false, None);
     }
 
     // Revalidate candidates on the current desktop and keep their original Z-order.
@@ -776,29 +999,80 @@ fn verify_scene_presentation(
                 live.matches_runtime_identity(target.hwnd, target.pid, target.process_start_time)
                     && live.is_visible
                     && !live.is_iconic
-                    && (pending.target_monitor_id == "ALL_MONITORS"
-                        || live.monitor_id == pending.target_monitor_id)
+                    && !live.is_hung
+                    && (target_monitor_id == "ALL_MONITORS" || live.monitor_id == target_monitor_id)
             })
         })
         .collect();
-    if sys.last_input_tick() != Some(presentation.input_tick) {
-        return None;
+
+    let scene_hwnds: HashSet<_> = windows.iter().map(|win| win.hwnd).collect();
+    let is_covered = |target: &WindowInstance| {
+        live_windows
+            .iter()
+            .take_while(|above| above.hwnd != target.hwnd)
+            .any(|above| {
+                above.is_topmost == target.is_topmost
+                    && !above.is_iconic
+                    && !scene_hwnds.contains(&above.hwnd)
+                    && above.window_rect.intersection_area(&target.window_rect) > 0
+            })
+    };
+    let normal_windows_covered = windows.iter().any(|win| !win.is_topmost && is_covered(win));
+    let topmost_windows_covered = windows.iter().any(|win| win.is_topmost && is_covered(win));
+    trace.record("presentation_checked", || {
+        json!({
+            "phase": phase,
+            "eligible_hwnds": windows.iter().map(|win| win.hwnd).collect::<Vec<_>>(),
+            "normal_windows_covered": normal_windows_covered,
+            "topmost_windows_covered": topmost_windows_covered,
+            "retry_focus": retry_focus,
+        })
+    });
+
+    let mut raise_failed = false;
+    // Raise the affected group from bottom to top to preserve the scene's stacking order.
+    for win in &windows {
+        let covered = if win.is_topmost {
+            topmost_windows_covered
+        } else {
+            normal_windows_covered
+        };
+        if covered {
+            if sys.last_input_tick() != Some(presentation.input_tick) {
+                trace.record("presentation_skipped", || {
+                    json!({
+                        "phase": phase, "reason": "input_changed_during_reorder",
+                    })
+                });
+                return (raise_failed, None);
+            }
+            raise_failed |= !trace.raise(
+                sys,
+                phase.as_str(),
+                win.hwnd,
+                WindowRaise::ReorderWithinGroup,
+            );
+        }
     }
-    let (focus_target, raise_failed) =
-        raise_scene_windows(sys, &windows, presentation.focus_target.is_some());
-    let focus_failed = sys.last_input_tick() == Some(presentation.input_tick)
-        && focus_target.is_some_and(|hwnd| !sys.set_foreground_window(hwnd));
-    if !raise_failed && !focus_failed {
-        return None;
-    }
-    log_warn(
-        "switch",
-        &format!(
-            "Could not bring scene '{}' to the front (raise_failed={}, focus_failed={}, focus_target={:?})",
-            pending.scene_id, raise_failed, focus_failed, focus_target,
-        ),
-    );
-    Some(SwitchWarning::ScenePresentationFailed {
-        scene_id: pending.scene_id.clone(),
-    })
+    let failed_focus_target = if retry_focus {
+        let current_input_tick = sys.last_input_tick();
+        if current_input_tick == Some(presentation.input_tick) {
+            scene_focus_target(&windows).filter(|&hwnd| {
+                sys.get_foreground_window() != Some(hwnd)
+                    && !trace.focus(sys, phase.as_str(), hwnd).accepted()
+            })
+        } else {
+            trace.record("focus_skipped", || {
+                json!({
+                    "phase": phase, "reason": "input_changed_or_unavailable",
+                    "switch_input_tick": presentation.input_tick,
+                    "current_input_tick": current_input_tick,
+                })
+            });
+            None
+        }
+    } else {
+        None
+    };
+    (raise_failed, failed_focus_target)
 }

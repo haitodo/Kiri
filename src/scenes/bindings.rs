@@ -520,6 +520,7 @@ pub fn suggest_safe_title_rule(win: &WindowInstance) -> TitleRule {
         || lower_exe.ends_with("code.exe")
         || lower_exe.ends_with("msedge.exe")
         || lower_exe.ends_with("chrome.exe")
+        || lower_exe.ends_with("antigravity.exe")
     {
         return TitleRule::any();
     }

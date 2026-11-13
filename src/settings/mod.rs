@@ -648,6 +648,7 @@ mod tests {
             monitor_id: monitor_id.to_string(),
             is_visible: true,
             is_iconic: false,
+            is_topmost: false,
             is_enabled: true,
             is_hung: false,
             is_maximized: false,

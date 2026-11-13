@@ -274,19 +274,29 @@ pub fn find_best_monitor_for_rect<'a>(
 
 #[cfg(windows)]
 pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
+    use std::sync::{Mutex, OnceLock};
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
+    #[derive(Clone, PartialEq, Eq)]
     struct RawMon {
+        hmon: isize,
         gdi_name: String,
         monitor_rect: RectData,
         work_area: RectData,
         dpi: u32,
         is_primary: bool,
     }
+
+    struct MonitorCache {
+        raw: Vec<RawMon>,
+        monitors: Vec<MonitorInfoData>,
+    }
+
+    static MONITOR_CACHE: OnceLock<Mutex<Option<MonitorCache>>> = OnceLock::new();
 
     unsafe extern "system" fn enum_proc(
         hmon: HMONITOR,
@@ -314,6 +324,7 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
             let is_primary = (mi.monitorInfo.dwFlags & 1) != 0; // MONITORINFOF_PRIMARY
 
             list.push(RawMon {
+                hmon: hmon.0 as isize,
                 gdi_name,
                 monitor_rect: RectData {
                     left: rc_mon.left,
@@ -334,7 +345,7 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
         BOOL(1)
     }
 
-    let mut raw_list: Vec<RawMon> = Vec::new();
+    let mut raw_list: Vec<RawMon> = Vec::with_capacity(4);
     unsafe {
         let _ = EnumDisplayMonitors(
             HDC::default(),
@@ -342,6 +353,15 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
             Some(enum_proc),
             LPARAM(&mut raw_list as *mut Vec<RawMon> as isize),
         );
+    }
+
+    let cache_mutex = MONITOR_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache_mutex.lock() {
+        if let Some(ref cached) = *guard {
+            if cached.raw == raw_list {
+                return cached.monitors.clone();
+            }
+        }
     }
 
     let target_map = query_display_config_map();
@@ -365,8 +385,8 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
         *base_id_counts.entry(base_id).or_insert(0) += 1;
     }
 
-    raw_list
-        .into_iter()
+    let monitors: Vec<MonitorInfoData> = raw_list
+        .iter()
         .map(|raw| {
             let (hw_path, friendly) = target_map
                 .get(&raw.gdi_name)
@@ -400,7 +420,7 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
             };
 
             let friendly_name = if friendly.is_empty() {
-                raw.gdi_name
+                raw.gdi_name.clone()
             } else {
                 friendly
             };
@@ -414,7 +434,16 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
                 is_primary: raw.is_primary,
             }
         })
-        .collect()
+        .collect();
+
+    if let Ok(mut guard) = cache_mutex.lock() {
+        *guard = Some(MonitorCache {
+            raw: raw_list,
+            monitors: monitors.clone(),
+        });
+    }
+
+    monitors
 }
 
 #[cfg(not(windows))]
