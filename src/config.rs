@@ -3,11 +3,12 @@
 
 use crate::diagnostics::{log_error, log_info, log_warn};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,13 +144,38 @@ impl Default for TargetConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scene {
     pub id: String,
     pub name: String,
     pub icon: String,
     pub order: i32,
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<SceneVariant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_variant_id: Option<String>,
+}
+
+impl Scene {
+    pub fn target<'a>(&'a self, common: &'a TargetConfig) -> &'a TargetConfig {
+        self.target.as_ref().unwrap_or(common)
+    }
+
+    pub fn preferred_variant(&self) -> Option<&SceneVariant> {
+        self.last_variant_id
+            .as_ref()
+            .and_then(|id| self.variants.iter().find(|variant| &variant.id == id))
+            .or_else(|| self.variants.first())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneVariant {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,10 +313,60 @@ pub struct WindowBinding {
     #[serde(default)]
     pub instance_hint: Option<InstanceHint>,
     pub scene_ids: Vec<String>,
+    /// Additional memberships for specific variants, keyed by scene ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scene_variants: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub always_visible: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl WindowBinding {
+    pub fn belongs_to_selection(&self, scene: &str, variant: Option<&str>) -> bool {
+        self.scene_ids.iter().any(|id| id == scene)
+            || variant.is_some_and(|variant| {
+                self.scene_variants
+                    .get(scene)
+                    .is_some_and(|ids| ids.iter().any(|id| id == variant))
+            })
+    }
+
+    pub fn belongs_to_scene(&self, scene: &str) -> bool {
+        self.belongs_to_selection(scene, None) || self.scene_variants.contains_key(scene)
+    }
+
+    pub fn has_scene(&self) -> bool {
+        !self.scene_ids.is_empty() || !self.scene_variants.is_empty()
+    }
+
+    pub fn add_to_scene(&mut self, scene: &str, variant: Option<&str>) {
+        if self.scene_ids.iter().any(|id| id == scene) {
+            return;
+        }
+        if let Some(variant) = variant {
+            let ids = self.scene_variants.entry(scene.into()).or_default();
+            if !ids.iter().any(|id| id == variant) {
+                ids.push(variant.into());
+            }
+        } else {
+            self.scene_ids.push(scene.into());
+            self.scene_variants.remove(scene);
+        }
+    }
+
+    pub fn remove_from_scene(&mut self, scene: &str, variant: Option<&str>) {
+        if let Some(variant) = variant {
+            if let Some(ids) = self.scene_variants.get_mut(scene) {
+                ids.retain(|id| id != variant);
+                if ids.is_empty() {
+                    self.scene_variants.remove(scene);
+                }
+            }
+        } else {
+            self.scene_ids.retain(|id| id != scene);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +487,7 @@ impl AppConfig {
                     icon: "chart".to_string(),
                     order: 1,
                     pinned: true,
+                    ..Scene::default()
                 },
                 Scene {
                     id: "code".to_string(),
@@ -418,6 +495,7 @@ impl AppConfig {
                     icon: "code".to_string(),
                     order: 2,
                     pinned: true,
+                    ..Scene::default()
                 },
                 Scene {
                     id: "web".to_string(),
@@ -425,6 +503,7 @@ impl AppConfig {
                     icon: "globe".to_string(),
                     order: 3,
                     pinned: true,
+                    ..Scene::default()
                 },
             ],
             shortcuts: Vec::new(),
@@ -439,6 +518,7 @@ impl AppConfig {
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string()],
+                scene_variants: BTreeMap::new(),
                 always_visible: false,
                 enabled: false,
             }],
@@ -454,6 +534,10 @@ impl AppConfig {
         let mut list: Vec<&Scene> = self.scenes.iter().collect();
         list.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
         list
+    }
+
+    pub fn scene(&self, id: &str) -> Option<&Scene> {
+        self.scenes.iter().find(|scene| scene.id == id)
     }
 
     /// Splits scenes into `(visible_bar_scenes, overflow_scenes)` according to `pinned` and `visible_slots`.
@@ -481,6 +565,37 @@ impl AppConfig {
         self.launcher.button_size_dip = self.launcher.button_size_dip.clamp(20, 96);
         self.launcher.grip_size_dip = self.launcher.grip_size_dip.clamp(8, 48);
         self.launcher.visible_slots = self.launcher.visible_slots.clamp(1, 12);
+    }
+
+    fn validate_variants(&self) -> Result<(), String> {
+        for scene in &self.scenes {
+            let mut ids = std::collections::HashSet::new();
+            for variant in &scene.variants {
+                if variant.id.trim().is_empty()
+                    || variant.name.trim().is_empty()
+                    || variant.name.chars().any(char::is_control)
+                    || !ids.insert(&variant.id)
+                {
+                    return Err(format!(
+                        "シーン「{}」の構成名または構成 ID を確認してください。",
+                        scene.name
+                    ));
+                }
+            }
+        }
+        for binding in &self.bindings {
+            for (scene_id, ids) in &binding.scene_variants {
+                if ids.is_empty()
+                    || !self.scene(scene_id).is_some_and(|scene| {
+                        ids.iter()
+                            .all(|id| scene.variants.iter().any(|variant| &variant.id == id))
+                    })
+                {
+                    return Err(format!("登録「{}」の構成が見つかりません。", binding.id));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -592,7 +707,7 @@ impl ConfigManager {
                 let bak = self.backup_path();
                 if bak.exists() {
                     match self.read_and_validate_file(&bak) {
-                        Ok((cfg, file_warnings)) => {
+                        Ok((mut cfg, file_warnings)) => {
                             log_warn("config", "Successfully recovered configuration from config.json.bak");
                             self.warnings.extend(file_warnings);
                             if cfg.schema_version > CURRENT_SCHEMA_VERSION {
@@ -602,6 +717,7 @@ impl ConfigManager {
                                 error: primary_err,
                             };
                             if !self.read_only {
+                                cfg.schema_version = CURRENT_SCHEMA_VERSION;
                                 let _ = self.save(&cfg);
                             }
                             return cfg;
@@ -690,7 +806,7 @@ impl ConfigManager {
                 cfg.schema_version
             ));
         }
-        cfg.validate_and_clamp();
+        cfg.schema_version = CURRENT_SCHEMA_VERSION;
         Ok((cfg, warnings))
     }
 
@@ -755,6 +871,7 @@ impl ConfigManager {
             .map_err(|e| format!("Schema validation error in {}: {}", source_label, e))?;
         if cfg.schema_version <= CURRENT_SCHEMA_VERSION {
             cfg.validate_and_clamp();
+            cfg.validate_variants()?;
         }
 
         Ok((cfg, warnings))
@@ -869,6 +986,30 @@ mod tests {
         ));
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn version_one_configs_keep_their_common_target_and_window_memberships() {
+        let dir = temp_test_dir("legacy-scenes");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut legacy = AppConfig::default_initial();
+        legacy.schema_version = 1;
+        legacy.target.monitor_policy = MonitorPolicy::Fixed;
+        legacy.target.monitor_id = Some("left".into());
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let mut manager = ConfigManager::new(path.clone());
+        let loaded = manager.load();
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+        let trade = loaded.scene("trade").unwrap();
+        assert_eq!(trade.target(&loaded.target), &legacy.target);
+        assert!(trade.preferred_variant().is_none());
+        assert!(loaded.bindings[0].belongs_to_selection("trade", None));
+        assert_eq!(fs::read(dir.join("config.v1.json")).unwrap(), bytes);
+        assert_eq!(manager.import_config_from_path(&path).unwrap().0, loaded);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

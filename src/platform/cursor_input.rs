@@ -6,8 +6,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LWIN,
-    VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
-    VK_XBUTTON1, VK_XBUTTON2,
+    VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE,
+    VK_UP, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
@@ -225,12 +225,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let down = !key.flags.contains(LLKHF_UP);
         let vk = key.vkCode as u16;
 
-        // While the non-activating cursor popup is open, intercept Esc/Arrows/Enter without stealing focus
+        // While the non-activating cursor popup is open, route its navigation keys to it.
         if state.popup.is_some()
             && matches!(
                 vk,
                 v if v == VK_ESCAPE.0
                     || v == VK_RETURN.0
+                    || v == VK_SPACE.0
                     || v == VK_UP.0
                     || v == VK_DOWN.0
                     || v == VK_LEFT.0

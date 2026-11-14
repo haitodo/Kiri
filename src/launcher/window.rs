@@ -20,7 +20,7 @@ use crate::launcher::cursor_popup::{
 use crate::launcher::input::{
     wheel_scene_index, HitTarget, LauncherLayout, SceneWheel, CORNER_RADIUS_DIP,
 };
-use crate::launcher::menu::{show_context_menu, MenuCommand};
+use crate::launcher::menu::{show_context_menu, show_scene_variants_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
 use crate::platform::cursor_input::{
@@ -30,10 +30,10 @@ use crate::platform::cursor_input::{
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
 use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
-use crate::scenes::manager::SceneState;
 use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
 use crate::settings::{window::{SettingsWindow, WM_SETTINGS_REQUEST}, SettingsPage};
 use windows::core::PWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
     TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
@@ -50,6 +50,7 @@ const TIMER_VERIFY_SWITCH: usize = 101;
 const TIMER_DISPLAY_DEBOUNCE: usize = 102;
 const HOTKEY_BASE_ID: i32 = 4000;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_APP_VARIANT_MENU: u32 = 0x8000 + 13;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LauncherDragState {
@@ -58,6 +59,13 @@ pub struct LauncherDragState {
     pub start_cursor_x: i32,
     pub start_cursor_y: i32,
     pub moved: bool,
+}
+
+struct VariantMenuRequest {
+    scene_id: String,
+    point: POINT,
+    source: SwitchSource,
+    owner: HWND,
 }
 
 #[cfg(windows)]
@@ -76,6 +84,7 @@ pub struct LauncherWindowHost {
     pub overflow_popup: Option<Box<OverflowPopup>>,
     cursor_input: CursorInput,
     cursor_popup: Option<Box<CursorPopup>>,
+    pending_variant_menu: Option<VariantMenuRequest>,
     bar_wheel: SceneWheel,
     pub tray: Option<TrayIcon>,
     pub win_event_hook: Option<WinEventHookGuard>,
@@ -202,6 +211,7 @@ impl LauncherWindowHost {
                 overflow_popup,
                 cursor_input: CursorInput::new(hwnd),
                 cursor_popup: None,
+                pending_variant_menu: None,
                 bar_wheel: SceneWheel::default(),
                 tray,
                 win_event_hook,
@@ -482,15 +492,19 @@ impl LauncherWindowHost {
 
         let text_opt = match target {
             HitTarget::SceneButton { scene_id, .. } => {
-                let (visible, overflow) = self.app.config.split_visible_and_overflow();
-                let scene_name = visible
-                    .iter()
-                    .chain(overflow.iter())
-                    .find(|s| &s.id == scene_id)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| scene_id.clone());
-                Some(scene_name)
+                self.app
+                    .config
+                    .scene(scene_id)
+                    .map(|scene| match scene.preferred_variant() {
+                        Some(variant) => format!("{} / {}", scene.name, variant.name),
+                        None => scene.name.clone(),
+                    })
             }
+            HitTarget::SceneVariants { scene_id, .. } => self
+                .app
+                .config
+                .scene(scene_id)
+                .map(|scene| format!("{}の構成を選ぶ", scene.name)),
             HitTarget::OverflowButton => {
                 if self.app.is_active_scene_in_overflow() {
                     let active_name = self
@@ -564,7 +578,44 @@ impl LauncherWindowHost {
 
     fn trigger_scene_switch(&mut self, scene_id: &str, source: SwitchSource) {
         self.hide_cursor_popup();
-        self.switch_scene(scene_id, source);
+        self.switch_scene(scene_id, None, source);
+    }
+
+    fn choose_scene_variant(&mut self, scene_id: &str, point: POINT, source: SwitchSource) {
+        self.hide_tooltip();
+        if let Some(overflow) = &mut self.overflow_popup {
+            overflow.hide();
+        }
+        let mut owner = self.hwnd;
+        if matches!(source, SwitchSource::PopupClick) {
+            if let Some(popup) = self.cursor_popup.as_ref().filter(|popup| popup.visible) {
+                // The fixed bar may be hidden. Keep the visible popup as the menu owner and
+                // release its input hook so the native menu gets keyboard and mouse messages.
+                owner = popup.hwnd();
+                let _ = self.cursor_input.set_popup(None);
+            }
+        } else {
+            self.hide_cursor_popup();
+        }
+        self.pending_variant_menu = Some(VariantMenuRequest {
+            scene_id: scene_id.to_owned(),
+            point,
+            source,
+            owner,
+        });
+        if unsafe {
+            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                self.hwnd,
+                WM_APP_VARIANT_MENU,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .is_err()
+        {
+            self.pending_variant_menu = None;
+            self.hide_cursor_popup();
+        }
     }
 
     fn cycle_scene(&mut self, steps: i32, source: SwitchSource) {
@@ -589,22 +640,27 @@ impl LauncherWindowHost {
         if let Some(overflow) = &mut self.overflow_popup {
             overflow.hide();
         }
-        self.switch_scene(&scene_id, source);
+        self.switch_scene(&scene_id, None, source);
         if let Some(popup) = &mut self.cursor_popup {
             popup.update_active_scene(self.app.state_mgr.active_scene_id());
         }
     }
 
-    fn switch_scene(&mut self, scene_id: &str, source: SwitchSource) {
+    fn switch_scene(&mut self, scene_id: &str, variant: Option<&str>, source: SwitchSource) {
         use windows::core::w;
         use windows::Win32::Graphics::Gdi::InvalidateRect;
         use windows::Win32::UI::WindowsAndMessaging::{
             MessageBoxW, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
         };
 
-        let outcome = self.app.switch_to_scene(scene_id, source);
+        let outcome = self.app.switch_to_scene(scene_id, variant, source);
 
-        if outcome
+        if self
+            .app
+            .config
+            .scene(scene_id)
+            .is_some_and(|scene| scene.target.is_none())
+            && outcome
             .warnings
             .contains(&SwitchWarning::TargetMonitorNotConfigured)
         {
@@ -621,7 +677,7 @@ impl LauncherWindowHost {
                     self.app.config.target.monitor_id = Some(self.app.launcher_monitor_id.clone());
                     let _ = self.app.config_mgr.save(&self.app.config);
                     // Retry the switch now that target monitor is configured
-                    let retry = self.app.switch_to_scene(scene_id, source);
+                    let retry = self.app.switch_to_scene(scene_id, variant, source);
                     if retry.verification.is_some() {
                         self.schedule_switch_verification();
                     }
@@ -747,7 +803,7 @@ impl LauncherWindowHost {
                 }
             }
             MenuCommand::RestoreSavedLayout => {
-                if !matches!(self.app.state_mgr.state(), SceneState::Active(_)) {
+                if self.app.state_mgr.active_scene_id().is_none() {
                     self.notify_tray(
                         "Kiri - レイアウト復元",
                         "アクティブなシーンが未確定のため復元できません。先にシーンを選択してください。",
@@ -821,13 +877,21 @@ impl LauncherWindowHost {
     }
 
     fn execute_cursor_popup_action(&mut self, action: PopupAction) {
-        self.hide_cursor_popup();
         match action {
             PopupAction::SwitchScene(scene_id) => {
                 self.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
             }
-            PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
-            PopupAction::OpenSettings => self.show_settings(SettingsPage::Shortcuts),
+            PopupAction::ChooseVariant(scene_id, point) => {
+                self.choose_scene_variant(&scene_id, point, SwitchSource::PopupClick)
+            }
+            PopupAction::OpenShortcut(shortcut) => {
+                self.hide_cursor_popup();
+                super::shortcuts::open(shortcut);
+            }
+            PopupAction::OpenSettings => {
+                self.hide_cursor_popup();
+                self.show_settings(SettingsPage::Shortcuts);
+            }
         }
     }
 
@@ -852,13 +916,13 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use crate::config::RectData;
-    use windows::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
+    use windows::Win32::Foundation::{HWND, LRESULT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
+        BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
+        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW,
         SetCursor, SetTimer, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_SIZEALL, MA_NOACTIVATE,
         WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
         WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -876,6 +940,22 @@ unsafe extern "system" fn launcher_wndproc(
         // WindowFromPoint in the wheel hook can request a hit test synchronously.
         if msg == WM_NCHITTEST {
             return LRESULT(HTCLIENT as isize);
+        }
+        if msg == WM_APP_VARIANT_MENU {
+            if let Some(request) = (*ptr).pending_variant_menu.take() {
+                let scene = (*ptr).app.config.scene(&request.scene_id).cloned();
+                // The native menu pumps messages. Release all launcher borrows while it is open.
+                let variant = scene
+                    .as_ref()
+                    .filter(|_| IsWindowVisible(request.owner).as_bool())
+                    .and_then(|scene| show_scene_variants_menu(request.owner, request.point, scene));
+                let host = &mut *ptr;
+                host.hide_cursor_popup();
+                if let Some(variant) = variant {
+                    host.switch_scene(&request.scene_id, Some(variant), request.source);
+                }
+            }
+            return LRESULT(0);
         }
         let host = &mut *ptr;
 
@@ -933,7 +1013,7 @@ unsafe extern "system" fn launcher_wndproc(
                 host.hide_tooltip();
                 let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                let has_active_scene = matches!(host.app.state_mgr.state(), SceneState::Active(_));
+                let has_active_scene = host.app.state_mgr.active_scene_id().is_some();
                 if let Some(cmd) = show_context_menu(
                     hwnd,
                     screen_x,
@@ -956,7 +1036,7 @@ unsafe extern "system" fn launcher_wndproc(
                 host.hide_tooltip();
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                let has_active_scene = matches!(host.app.state_mgr.state(), SceneState::Active(_));
+                let has_active_scene = host.app.state_mgr.active_scene_id().is_some();
                 if let Some(cmd) = show_context_menu(
                     hwnd,
                     pt.x,
@@ -1001,7 +1081,9 @@ unsafe extern "system" fn launcher_wndproc(
                             let _ = SetCapture(hwnd);
                         }
                     }
-                    HitTarget::SceneButton { .. } | HitTarget::OverflowButton => {
+                    HitTarget::SceneButton { .. }
+                    | HitTarget::SceneVariants { .. }
+                    | HitTarget::OverflowButton => {
                         host.pressed = hit;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -1138,8 +1220,7 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_LBUTTONUP => {
                 host.hide_tooltip();
-                let had_pressed = host.pressed != HitTarget::None;
-                host.pressed = HitTarget::None;
+                let pressed = std::mem::replace(&mut host.pressed, HitTarget::None);
                 if let Some(drag) = host.drag_state.take() {
                     let _ = ReleaseCapture();
                     if drag.moved {
@@ -1156,18 +1237,33 @@ unsafe extern "system" fn launcher_wndproc(
                     }
                     return LRESULT(0);
                 }
-                if had_pressed {
+                if pressed != HitTarget::None {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
 
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                match host.layout.hit_test(client_x, client_y) {
+                let hit = host.layout.hit_test(client_x, client_y);
+                if hit != pressed {
+                    return LRESULT(0);
+                }
+                match hit {
                     HitTarget::SceneButton { scene_id, .. } => {
                         if let Some(ref mut ov) = host.overflow_popup {
                             ov.hide();
                         }
                         host.trigger_scene_switch(&scene_id, SwitchSource::BarClick);
+                    }
+                    HitTarget::SceneVariants { scene_id, index } => {
+                        if let Some(rect) = host.layout.scene_buttons[index].variants_rect {
+                            let mut point = POINT {
+                                x: rect.left,
+                                y: rect.bottom,
+                            };
+                            let _ = ClientToScreen(hwnd, &mut point);
+                            host.choose_scene_variant(&scene_id, point, SwitchSource::BarClick);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
                     HitTarget::OverflowButton => {
                         let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
@@ -1216,7 +1312,13 @@ unsafe extern "system" fn launcher_wndproc(
                 let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
                 if let Some(scene) = overflow_scenes.get(idx) {
                     let scene_id = scene.id.clone();
-                    host.trigger_scene_switch(&scene_id, SwitchSource::Overflow);
+                    if lparam.0 == 1 {
+                        let mut point = POINT::default();
+                        let _ = GetCursorPos(&mut point);
+                        host.choose_scene_variant(&scene_id, point, SwitchSource::Overflow);
+                    } else {
+                        host.trigger_scene_switch(&scene_id, SwitchSource::Overflow);
+                    }
                 }
                 LRESULT(0)
             }
@@ -1234,8 +1336,7 @@ unsafe extern "system" fn launcher_wndproc(
                     host.hide_cursor_popup();
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
-                    let has_active_scene =
-                        matches!(host.app.state_mgr.state(), SceneState::Active(_));
+                    let has_active_scene = host.app.state_mgr.active_scene_id().is_some();
                     if let Some(cmd) = show_context_menu(
                         hwnd,
                         pt.x,
@@ -1298,6 +1399,9 @@ unsafe extern "system" fn launcher_wndproc(
                 let settings = HWND(wparam.0 as *mut _);
                 if SettingsWindow::dispatch(settings, hwnd, &mut host.app) {
                     host.hide_cursor_popup();
+                    if let Some(overflow) = &mut host.overflow_popup {
+                        overflow.hide();
+                    }
                     let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                     host.apply_window_bounds(x, y, w, h);
                     let failed = host.register_configured_hotkeys();

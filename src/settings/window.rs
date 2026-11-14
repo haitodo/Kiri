@@ -79,9 +79,28 @@ thread_local! {
 
 #[derive(Deserialize)]
 struct Request {
+    #[serde(rename = "request_id")]
     id: u32,
     #[serde(flatten)]
     command: Command,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_request_keeps_the_binding_and_request_ids_separate() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": 7, "action": "share_in_scene", "scene": "code", "id": "terminal",
+        }))
+        .unwrap();
+        assert_eq!(request.id, 7);
+        assert!(
+            matches!(request.command, Command::ShareInScene { scene, id }
+            if scene == "code" && id == "terminal")
+        );
+    }
 }
 
 enum FileAction {
@@ -935,7 +954,7 @@ impl SettingsWindow {
                 editor.reset(app);
                 Ok(Value::Null)
             }
-            Inspect { scene } => Ok(editor.inspect(&scene, app)),
+            Inspect { scene, variant } => Ok(editor.inspect(&scene, variant.as_deref(), app)),
             Save {
                 tray_only_confirmed,
             } => {

@@ -1,8 +1,8 @@
 use super::{is_autostart_enabled, RegistrationWarning, SettingsViewModel};
 use crate::app::AppController;
 use crate::config::{
-    AppConfig, CursorPopupPosition, LauncherConfig, MonitorPolicy, Orientation, Scene, Shortcut,
-    TitleRule, TitleRuleType, WindowBinding,
+    AppConfig, CursorPopupPosition, LauncherConfig, MonitorPolicy, Orientation, Scene,
+    SceneVariant, Shortcut, TargetConfig, TitleRule, TitleRuleType, WindowBinding,
 };
 use crate::diagnostics::executable_name;
 use crate::launcher::paint::{is_builtin_icon, BUILTIN_ICONS};
@@ -10,7 +10,7 @@ use crate::platform::WindowInstance;
 use crate::scenes::switch::{format_switch_warnings, preview_scene_switch};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 #[derive(Clone, Copy)]
@@ -58,17 +58,43 @@ pub(super) enum Command {
     DeleteLayout {
         id: String,
     },
+    SceneTarget {
+        scene: String,
+        policy: Option<MonitorPolicy>,
+        monitor: Option<String>,
+    },
+    CreateVariant {
+        scene: String,
+        original_name: Option<String>,
+        name: String,
+    },
+    RenameVariant {
+        scene: String,
+        variant: String,
+        name: String,
+    },
+    DeleteVariant {
+        scene: String,
+        variant: String,
+    },
     AddWindows {
         scene: String,
+        variant: Option<String>,
         candidates: Vec<String>,
     },
     RemoveFromScene {
+        scene: String,
+        variant: Option<String>,
+        id: String,
+    },
+    ShareInScene {
         scene: String,
         id: String,
     },
     EditBinding {
         id: String,
         scenes: Vec<String>,
+        variants: BTreeMap<String, Vec<String>>,
         always: bool,
         enabled: bool,
         rule: TitleRule,
@@ -110,6 +136,7 @@ pub(super) enum Command {
     },
     Inspect {
         scene: String,
+        variant: Option<String>,
     },
     Save {
         tray_only_confirmed: bool,
@@ -227,6 +254,9 @@ impl Editor {
 
     pub(super) fn import(&mut self, config: AppConfig, app: &AppController) {
         self.vm.config_draft = config;
+        self.deleted_layouts.clear();
+        self.detached.clear();
+        self.reset_position = false;
         self.imported = true;
         self.refresh(app);
     }
@@ -242,6 +272,16 @@ impl Editor {
                 config.launcher.orientation = live.launcher.orientation;
             }
             config.monitors = live.monitors.clone();
+            for scene in &mut config.scenes {
+                if let Some(id) = live
+                    .scene(&scene.id)
+                    .and_then(|current| current.last_variant_id.as_ref())
+                {
+                    if scene.variants.iter().any(|variant| &variant.id == id) {
+                        scene.last_variant_id = Some(id.clone());
+                    }
+                }
+            }
             for profile in &mut config.monitors {
                 if profile
                     .last_active_scene_id
@@ -261,10 +301,11 @@ impl Editor {
                 .cloned()
                 .map(|mut layout| {
                     layout.entries.retain(|entry| {
-                        config.bindings.iter().any(|b| b.id == entry.binding_id)
-                            && !self
-                                .detached
-                                .contains(&(layout.scene_id.clone(), entry.binding_id.clone()))
+                        config.bindings.iter().any(|b| {
+                            b.id == entry.binding_id && b.belongs_to_scene(&layout.scene_id)
+                        }) && !self
+                            .detached
+                            .contains(&(layout.scene_id.clone(), entry.binding_id.clone()))
                     });
                     layout
                 })
@@ -291,7 +332,7 @@ impl Editor {
                         let id = format!("scene-{n}");
                         !config.scenes.iter().any(|s| s.id == id)
                             && !self.baseline.scenes.iter().any(|s| s.id == id)
-                            && !config.bindings.iter().any(|b| b.scene_ids.contains(&id))
+                            && !config.bindings.iter().any(|b| b.belongs_to_scene(&id))
                             && !config.hotkeys.iter().any(|h| h.scene_id == id)
                             && !config.layouts.iter().any(|l| l.scene_id == id)
                     })
@@ -308,6 +349,7 @@ impl Editor {
                     icon: "star".into(),
                     order: order + 1,
                     pinned: true,
+                    ..Scene::default()
                 });
                 extra = json!({ "scene": id });
             }
@@ -359,9 +401,10 @@ impl Editor {
                 config.hotkeys.retain(|h| h.scene_id != id);
                 config.layouts.retain(|l| l.scene_id != id);
                 config.bindings.retain_mut(|binding| {
-                    let was_member = binding.scene_ids.contains(&id);
-                    binding.scene_ids.retain(|s| s != &id);
-                    !was_member || binding.always_visible || !binding.scene_ids.is_empty()
+                    let was_member = binding.belongs_to_scene(&id);
+                    binding.remove_from_scene(&id, None);
+                    binding.scene_variants.remove(&id);
+                    !was_member || binding.always_visible || binding.has_scene()
                 });
                 self.vm.refresh_annotations();
             }
@@ -370,30 +413,129 @@ impl Editor {
                 self.vm.delete_scene_layouts(&id);
                 self.deleted_layouts.insert(id);
             }
-            AddWindows { scene, candidates } => {
-                require_scene(&self.vm.config_draft, &scene)?;
+            SceneTarget {
+                scene,
+                policy,
+                monitor,
+            } => {
+                self.validate_fixed_target(policy, monitor.as_deref())?;
+                let scene = require_scene_mut(&mut self.vm.config_draft, &scene)?;
+                scene.target = policy.map(|monitor_policy| TargetConfig {
+                    monitor_policy,
+                    monitor_id: monitor,
+                });
+            }
+            CreateVariant {
+                scene,
+                original_name,
+                name,
+            } => {
+                let config = &mut self.vm.config_draft;
+                let saved = self.baseline.scene(&scene);
+                let item = require_scene_mut(config, &scene)?;
+                let name = variant_name(item, None, name)?;
+                if item.variants.is_empty() {
+                    let original_name =
+                        variant_name(item, None, original_name.unwrap_or_default())?;
+                    if original_name.eq_ignore_ascii_case(&name) {
+                        return Err("構成には別々の名前を付けてください。".into());
+                    }
+                    let id = next_variant_id(item, saved);
+                    item.variants.push(SceneVariant {
+                        id: id.clone(),
+                        name: original_name,
+                    });
+                    for binding in &mut config.bindings {
+                        if binding.belongs_to_selection(&scene, None) {
+                            binding.remove_from_scene(&scene, None);
+                            binding.add_to_scene(&scene, Some(&id));
+                        }
+                    }
+                }
+                let item = require_scene_mut(config, &scene)?;
+                let id = next_variant_id(item, saved);
+                item.variants.push(SceneVariant {
+                    id: id.clone(),
+                    name,
+                });
+                self.vm.refresh_annotations();
+                extra = json!({ "variant": id });
+            }
+            RenameVariant {
+                scene,
+                variant,
+                name,
+            } => {
+                let item = require_scene_mut(&mut self.vm.config_draft, &scene)?;
+                let name = variant_name(item, Some(&variant), name)?;
+                item.variants
+                    .iter_mut()
+                    .find(|v| v.id == variant)
+                    .ok_or("構成が見つかりません。")?
+                    .name = name;
+            }
+            DeleteVariant { scene, variant } => self.delete_variant(&scene, &variant)?,
+            AddWindows {
+                scene,
+                variant,
+                candidates,
+            } => {
+                let item = require_selection(&self.vm.config_draft, &scene, variant.as_deref())?;
+                let target = item.target(&self.vm.config_draft.target).clone();
                 let windows = self.live_candidates(&candidates, app)?;
+                if target.monitor_policy != MonitorPolicy::AllMonitors {
+                    let monitor = self.vm.target_monitor(&target);
+                    if windows
+                        .iter()
+                        .any(|win| Some(win.monitor_id.as_str()) != monitor.as_deref())
+                    {
+                        return Err("切り替える画面にあるウィンドウを選んでください。".into());
+                    }
+                }
                 if windows.iter().any(|win| self.ambiguous_candidate(win.hwnd)) {
                     return Err("一致する登録済みウィンドウがあります。「登録済みウィンドウを管理」から対象を確認してください。".into());
                 }
                 for win in windows {
-                    self.vm.add_window_to_scene(&win, &scene);
+                    self.vm
+                        .add_window_to_scene(&win, &scene, variant.as_deref());
                 }
             }
-            RemoveFromScene { scene, id } => {
+            RemoveFromScene { scene, variant, id } => {
+                require_selection(&self.vm.config_draft, &scene, variant.as_deref())?;
+                self.vm
+                    .unbind_window_from_scene(&id, &scene, variant.as_deref());
+                if !self
+                    .vm
+                    .config_draft
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.id == id && binding.belongs_to_scene(&scene))
+                {
+                    self.detached.insert((scene, id));
+                }
+            }
+            ShareInScene { scene, id } => {
                 require_scene(&self.vm.config_draft, &scene)?;
-                self.vm.unbind_window_from_scene(&id, &scene);
-                self.detached.insert((scene, id));
+                let binding = self
+                    .vm
+                    .config_draft
+                    .bindings
+                    .iter_mut()
+                    .find(|binding| binding.id == id && binding.belongs_to_scene(&scene))
+                    .ok_or("このシーンにウィンドウが登録されていません。")?;
+                binding.add_to_scene(&scene, None);
+                self.vm.refresh_annotations();
             }
             EditBinding {
                 id,
                 scenes,
+                variants,
                 always,
                 enabled,
                 rule,
                 monitor,
             } => {
-                self.edit_binding(&id, scenes, always, enabled, rule, monitor)?;
+                self.edit_binding(&id, scenes, variants, always, enabled, rule, monitor)?;
             }
             ChooseWindow { id, candidate } => {
                 let windows = self.live_candidates(&[candidate], app)?;
@@ -423,13 +565,7 @@ impl Editor {
                 self.reset_position = true;
             }
             Target { policy, monitor } => {
-                if policy == MonitorPolicy::Fixed
-                    && !monitor
-                        .as_ref()
-                        .is_some_and(|id| self.vm.monitors.iter().any(|mon| &mon.monitor_id == id))
-                {
-                    return Err("接続されている画面を選んでください。".into());
-                }
+                self.validate_fixed_target(Some(policy), monitor.as_deref())?;
                 let target = &mut self.vm.config_draft.target;
                 target.monitor_policy = policy;
                 if policy == MonitorPolicy::Fixed {
@@ -509,6 +645,72 @@ impl Editor {
         Ok(extra)
     }
 
+    fn validate_fixed_target(
+        &self,
+        policy: Option<MonitorPolicy>,
+        monitor: Option<&str>,
+    ) -> Result<(), String> {
+        if policy == Some(MonitorPolicy::Fixed)
+            && !self
+                .vm
+                .monitors
+                .iter()
+                .any(|mon| Some(mon.monitor_id.as_str()) == monitor)
+        {
+            return Err("接続されている画面を選んでください。".into());
+        }
+        Ok(())
+    }
+
+    fn delete_variant(&mut self, scene: &str, variant: &str) -> Result<(), String> {
+        let config = &mut self.vm.config_draft;
+        let item = require_scene_mut(config, scene)?;
+        let index = item
+            .variants
+            .iter()
+            .position(|v| v.id == variant)
+            .ok_or("構成が見つかりません。")?;
+        item.variants.remove(index);
+        if item.last_variant_id.as_deref() == Some(variant) {
+            item.last_variant_id = None;
+        }
+        let remaining = if item.variants.len() == 1 {
+            Some(item.variants.remove(0).id)
+        } else {
+            None
+        };
+        if item.variants.is_empty() {
+            item.last_variant_id = None;
+        }
+        config.bindings.retain_mut(|binding| {
+            let was_member = binding.belongs_to_scene(scene);
+            binding.remove_from_scene(scene, Some(variant));
+            if let Some(id) = &remaining {
+                if binding.belongs_to_selection(scene, Some(id)) {
+                    binding.add_to_scene(scene, None);
+                }
+            }
+            if was_member && !binding.belongs_to_scene(scene) {
+                self.detached.insert((scene.to_owned(), binding.id.clone()));
+                return binding.always_visible || binding.has_scene();
+            }
+            true
+        });
+        for layout in config
+            .layouts
+            .iter_mut()
+            .filter(|layout| layout.scene_id == scene)
+        {
+            layout.entries.retain(|entry| {
+                config.bindings.iter().any(|binding| {
+                    binding.id == entry.binding_id && binding.belongs_to_scene(scene)
+                })
+            });
+        }
+        self.vm.refresh_annotations();
+        Ok(())
+    }
+
     /// Returns a warning if only the separate Windows logon preference could not be saved.
     pub(super) fn save(
         &mut self,
@@ -569,25 +771,11 @@ impl Editor {
             let candidate = self.vm.candidate_windows.iter().find(|row| {
                 previous.contains(key) && candidate_key(&row.instance) == *key
             }).ok_or("選んだウィンドウが移動したか、閉じられました。一覧を更新して選び直してください。")?;
-            if let Some(reason) = self.candidate_block_reason(&candidate.instance) {
+            if let Some(reason) = candidate_block_reason(&candidate.instance) {
                 return Err(reason.into());
             }
             Ok(candidate.instance.clone())
         }).collect()
-    }
-
-    fn candidate_block_reason(&self, win: &WindowInstance) -> Option<&'static str> {
-        if win.exe_path.is_empty() && win.aumid.is_none() {
-            Some("アプリを識別できません")
-        } else if win.is_elevated {
-            Some("管理者権限で実行中")
-        } else if self.vm.config_draft.target.monitor_policy != MonitorPolicy::AllMonitors
-            && self.vm.target_monitor().as_deref() != Some(win.monitor_id.as_str())
-        {
-            Some("操作する画面の外")
-        } else {
-            None
-        }
     }
 
     fn ambiguous_candidate(&self, hwnd: u64) -> bool {
@@ -603,6 +791,7 @@ impl Editor {
         &mut self,
         id: &str,
         scenes: Vec<String>,
+        mut variants: BTreeMap<String, Vec<String>>,
         always: bool,
         enabled: bool,
         mut rule: TitleRule,
@@ -611,6 +800,12 @@ impl Editor {
         let config = &mut self.vm.config_draft;
         for id in &scenes {
             require_scene(config, id)?;
+        }
+        variants.retain(|scene, ids| !ids.is_empty() && !scenes.contains(scene));
+        for (scene, ids) in &variants {
+            for variant in ids {
+                require_selection(config, scene, Some(variant))?;
+            }
         }
         let binding = config
             .bindings
@@ -638,14 +833,18 @@ impl Editor {
         {
             return Err("接続されている画面を選んでください。".into());
         }
-        if scenes.is_empty() && enabled && !always {
+        if scenes.is_empty() && variants.is_empty() && enabled && !always {
             return Err("シーンを選ぶか、この登録を無効にしてください。".into());
         }
         if rule != binding.match_rule.title_rule || monitor != binding.match_rule.monitor_id {
             binding.instance_hint = None;
         }
-        for scene in &binding.scene_ids {
-            if !scenes.contains(scene) {
+        for scene in binding
+            .scene_ids
+            .iter()
+            .chain(binding.scene_variants.keys())
+        {
+            if !scenes.contains(scene) && !variants.contains_key(scene) {
                 self.detached.insert((scene.clone(), id.into()));
             }
         }
@@ -654,10 +853,11 @@ impl Editor {
         binding.always_visible = always;
         binding.enabled = enabled;
         binding.scene_ids = scenes;
+        binding.scene_variants = variants;
         for layout in config
             .layouts
             .iter_mut()
-            .filter(|l| !binding.scene_ids.contains(&l.scene_id))
+            .filter(|l| !binding.belongs_to_scene(&l.scene_id))
         {
             layout.entries.retain(|entry| entry.binding_id != id);
         }
@@ -665,7 +865,7 @@ impl Editor {
         Ok(())
     }
 
-    pub(super) fn inspect(&self, scene: &str, app: &AppController) -> Value {
+    pub(super) fn inspect(&self, scene: &str, variant: Option<&str>, app: &AppController) -> Value {
         let config = &self.vm.config_draft;
         let mut resolver = app.resolver.clone();
         for binding in &config.bindings {
@@ -680,6 +880,7 @@ impl Editor {
         }
         let preview = preview_scene_switch(
             scene,
+            variant,
             config,
             resolver,
             &app.recovery,
@@ -736,7 +937,9 @@ impl Editor {
                     "app": app_label(&row.instance),
                     "title": row.instance.title,
                     "monitor": self.monitor_label(&row.instance.monitor_id),
-                    "blocked": self.candidate_block_reason(&row.instance),
+                    "monitor_id": row.instance.monitor_id,
+                    "binding_id": row.existing_binding_id,
+                    "blocked": candidate_block_reason(&row.instance),
                     "ambiguous": self.ambiguous_candidate(row.instance.hwnd),
                     "warnings": row.warnings.iter().filter_map(warning_label).collect::<Vec<_>>(),
                     "scenes": row.bound_scene_ids,
@@ -754,7 +957,9 @@ impl Editor {
                 "id": binding.id, "app": live.map_or_else(|| binding_label(binding), |w| app_label(&w.instance)),
                 "title": if row.is_running { row.window_title.as_str() } else { "" },
                 "monitor_label": monitor.map(|id| self.monitor_label(id)),
-                "scenes": binding.scene_ids, "always": binding.always_visible, "enabled": binding.enabled,
+                "monitor_id": monitor, "scenes": row.bound_scene_ids,
+                "common_scenes": binding.scene_ids, "variants": binding.scene_variants,
+                "always": binding.always_visible, "enabled": binding.enabled,
                 "running": row.is_running, "warnings": row.warnings.iter().filter_map(warning_label).collect::<Vec<_>>(),
                 "ambiguous": row.ambiguous_candidates.iter().map(candidate_key).collect::<Vec<_>>(),
                 "rule": binding.match_rule.title_rule, "monitor": binding.match_rule.monitor_id,
@@ -764,12 +969,14 @@ impl Editor {
             let (layouts, _) = self.vm.scene_layout_summary(&scene.id);
             json!({ "id": scene.id, "name": scene.name, "icon": scene.icon,
                 "pinned": scene.pinned, "layouts": layouts,
+                "variants": scene.variants, "preferred_variant": scene.preferred_variant().map(|v| &v.id),
+                "target": scene.target, "effective_monitor": self.vm.target_monitor(scene.target(&config.target)),
                 "hotkey": self.vm.get_scene_hotkey(&scene.id).map(|(mods, key)| json!({"mods": mods, "key": key})),
             })
         }).collect();
         json!({
             "scenes": scenes, "bindings": bindings, "candidates": candidates,
-            "monitors": monitors, "target": config.target, "effective_monitor": self.vm.target_monitor(),
+            "monitors": monitors, "target": config.target, "effective_monitor": self.vm.target_monitor(&config.target),
             "launcher": config.launcher, "shortcuts": config.shortcuts,
             "autostart": self.autostart, "verbose": config.verbose_title_logging,
             "read_only": self.read_only, "dirty": self.dirty(),
@@ -787,13 +994,64 @@ fn normalize_scene_order(config: &mut AppConfig) {
     }
 }
 
-fn require_scene(config: &AppConfig, id: &str) -> Result<(), String> {
+fn candidate_block_reason(win: &WindowInstance) -> Option<&'static str> {
+    if win.exe_path.is_empty() && win.aumid.is_none() {
+        Some("アプリを識別できません")
+    } else if win.is_elevated {
+        Some("管理者権限で実行中")
+    } else {
+        None
+    }
+}
+
+fn require_scene<'a>(config: &'a AppConfig, id: &str) -> Result<&'a Scene, String> {
+    config
+        .scene(id)
+        .ok_or_else(|| "シーンが見つかりません。".into())
+}
+
+fn require_scene_mut<'a>(config: &'a mut AppConfig, id: &str) -> Result<&'a mut Scene, String> {
     config
         .scenes
-        .iter()
-        .any(|s| s.id == id)
-        .then_some(())
+        .iter_mut()
+        .find(|scene| scene.id == id)
         .ok_or_else(|| "シーンが見つかりません。".into())
+}
+
+fn require_selection<'a>(
+    config: &'a AppConfig,
+    scene: &str,
+    variant: Option<&str>,
+) -> Result<&'a Scene, String> {
+    let scene = require_scene(config, scene)?;
+    if variant.is_some_and(|id| !scene.variants.iter().any(|variant| variant.id == id)) {
+        return Err("構成が見つかりません。".into());
+    }
+    Ok(scene)
+}
+
+fn variant_name(scene: &Scene, current: Option<&str>, name: String) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err("構成名を入力してください。".into());
+    }
+    if scene.variants.iter().any(|variant| {
+        Some(variant.id.as_str()) != current && variant.name.eq_ignore_ascii_case(name)
+    }) {
+        return Err("同じ名前の構成があります。".into());
+    }
+    Ok(name.to_owned())
+}
+
+fn next_variant_id(scene: &Scene, saved: Option<&Scene>) -> String {
+    let used = scene
+        .variants
+        .iter()
+        .chain(saved.into_iter().flat_map(|scene| &scene.variants));
+    (1..)
+        .map(|n| format!("variant-{n}"))
+        .find(|id| !used.clone().any(|variant| &variant.id == id))
+        .unwrap()
 }
 
 fn scene_name(config: &AppConfig, id: Option<&str>, name: String) -> Result<String, String> {
@@ -872,7 +1130,6 @@ fn warning_label(warning: &RegistrationWarning) -> Option<String> {
     Some(match warning {
         RegistrationWarning::NoTaskbarButton => "タスクバーに表示されないウィンドウです".into(),
         RegistrationWarning::ElevatedProcess => "管理者権限で実行中".into(),
-        RegistrationWarning::OutsideTargetMonitor { .. } => "操作する画面の外".into(),
         RegistrationWarning::TitleMayContainSensitiveOrDynamicText => {
             "ウィンドウ名が変わることがあります".into()
         }
@@ -972,6 +1229,103 @@ mod tests {
         let pending = editor.config_to_save(&app.config);
         assert!(pending.launcher.position.is_none());
         assert!(pending.layouts.is_empty());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn splitting_and_removing_variants_preserves_memberships_and_live_choice() {
+        let (mut app, folder) = sample_app("variants");
+        app.config.bindings[0].scene_ids.push("code".into());
+        let mut editor = Editor::new(&app);
+        let scene = "code".to_owned();
+        let new_variant = editor
+            .edit(
+                Command::CreateVariant {
+                    scene: scene.clone(),
+                    original_name: Some("Antigravity".into()),
+                    name: "Codex".into(),
+                },
+                &app,
+            )
+            .unwrap();
+        let codex = new_variant["variant"].as_str().unwrap().to_owned();
+        let draft = &editor.vm.config_draft;
+        let original = draft
+            .scene(&scene)
+            .unwrap()
+            .preferred_variant()
+            .unwrap()
+            .id
+            .clone();
+        let binding = &draft.bindings[0];
+        assert!(binding.belongs_to_selection("trade", None));
+        assert!(binding.belongs_to_selection(&scene, Some(&original)));
+        assert!(!binding.belongs_to_selection(&scene, Some(&codex)));
+
+        let binding_id = binding.id.clone();
+        editor
+            .edit(
+                Command::ShareInScene {
+                    scene: scene.clone(),
+                    id: binding_id,
+                },
+                &app,
+            )
+            .unwrap();
+        let mut tool = editor.vm.config_draft.bindings[0].clone();
+        tool.id = "codex".into();
+        tool.scene_ids.clear();
+        tool.add_to_scene(&scene, Some(&codex));
+        editor.vm.config_draft.bindings.push(tool);
+        editor.save(&mut app, false).unwrap();
+
+        let switched = app.switch_to_scene(
+            &scene,
+            Some(&codex),
+            crate::scenes::switch::SwitchSource::PopupClick,
+        );
+        assert!(switched.switched);
+        editor
+            .edit(
+                Command::RenameVariant {
+                    scene: scene.clone(),
+                    variant: codex.clone(),
+                    name: "Codex CLI".into(),
+                },
+                &app,
+            )
+            .unwrap();
+        editor.save(&mut app, false).unwrap();
+        assert_eq!(
+            app.config
+                .scene(&scene)
+                .unwrap()
+                .preferred_variant()
+                .unwrap()
+                .name,
+            "Codex CLI"
+        );
+        assert!(app.state_mgr.is_already_active(&scene, Some(&codex)));
+        assert!(!editor.dirty());
+
+        editor
+            .edit(
+                Command::DeleteVariant {
+                    scene: scene.clone(),
+                    variant: original,
+                },
+                &app,
+            )
+            .unwrap();
+        editor.save(&mut app, false).unwrap();
+        assert!(app.config.scene(&scene).unwrap().variants.is_empty());
+        assert!(app
+            .config
+            .bindings
+            .iter()
+            .all(|binding| binding.belongs_to_selection(&scene, None)));
+        assert!(app.config.bindings[0].belongs_to_selection("trade", None));
+        assert!(app.state_mgr.active_scene_id().is_none());
         fs::remove_dir_all(folder).unwrap();
     }
 }

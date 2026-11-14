@@ -13,6 +13,7 @@ const bridge = window.chrome.webview;
 let sceneId, state, setup = false, onboarding = false, visited = 'scenes';
 let pending, pendingFocus, requestedPage, sequence = 0, commitDialog;
 let invalidLauncher = false;
+const editedVariants = new Map();
 
 const iconPaths = {
   layers: 'M12 2 2 7l10 5 10-5-10-5ZM2 12l10 5 10-5M2 17l10 5 10-5',
@@ -21,6 +22,7 @@ const iconPaths = {
   keyboard: 'M2 6h20v12H2zM6 10h.01M10 10h.01m4 0h.01m4 0h.01M6 14h.01M10 14h4m4 0h.01',
   archive: 'M3 4h18v4H3zM5 8v12h14V8m-10 4h6',
   plus: 'M12 5v14M5 12h14',
+  down: 'm6 9 6 6 6-6',
   check: 'm5 12 4 4L19 6',
   sliders: 'M4 5h8m4 0h4M4 12h3m4 0h9M4 19h11m4 0h1M12 3v4m-5 3v4m8 3v4',
   eye: 'M2 12c5-8 15-8 20 0-5 8-15 8-20 0Zm13 0a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z',
@@ -121,7 +123,7 @@ function request(action, values = {}) {
     pending = { id, resolve, reject, focus: root.contains(document.activeElement) ? document.activeElement : null };
     root.setAttribute('aria-busy', 'true');
     root.inert = true;
-    bridge.postMessage({ id, action, ...values });
+    bridge.postMessage({ request_id: id, action, ...values });
   });
 }
 
@@ -216,29 +218,52 @@ function renderFooter() {
 }
 
 function selected() { return state.scenes.find((scene) => scene.id === sceneId); }
-function scopeLabel() {
-  const { policy, monitor } = targetValue();
+function selectedVariant(scene) {
+  return scene.variants.find((variant) => variant.id === editedVariants.get(scene.id))
+    || scene.variants.find((variant) => variant.id === scene.preferred_variant);
+}
+
+function scopeLabel(target = state.target) {
+  const { monitor_policy: policy, monitor_id: monitor } = target;
   if (policy === 'all_monitors') return 'すべての画面';
   if (policy === 'launcher_monitor') return '固定バーのある画面';
   if (!monitor) return '未設定';
-  return state.monitors.find((m) => m.id === monitor)
-    ? '画面 ' + state.monitors.find((m) => m.id === monitor).number : '未接続の画面';
+  const display = state.monitors.find((m) => m.id === monitor);
+  return display ? '画面 ' + display.number + ' だけ' : '未接続の画面';
 }
-function monitorSelected(id) {
-  return state.target.monitor_policy === 'all_monitors' || state.effective_monitor === id;
+
+function targetOptions(target) {
+  const options = [['all_monitors', 'すべての画面'], ['launcher_monitor', '固定バーのある画面']];
+  if (target?.monitor_policy === 'fixed' && !state.monitors.some((m) => m.id === target.monitor_id)) {
+    options.push([targetOption(target), target.monitor_id ? '未接続の画面（現在の設定）' : '未設定']);
+  }
+  return options.concat(state.monitors.map((m) => ['fixed:' + m.id,
+    '画面 ' + m.number + ' だけ' + (m.name ? ' — ' + m.name : '')]));
 }
-function targetValue() { return { policy: state.target.monitor_policy, monitor: state.target.monitor_id }; }
+
+function targetOption(target) {
+  if (!target) return 'inherit';
+  return target.monitor_policy === 'fixed' ? 'fixed:' + (target.monitor_id || '') : target.monitor_policy;
+}
+
+function changeTarget(value, scene) {
+  const monitor = value.startsWith('fixed:') ? value.slice(6) : null;
+  if (monitor !== null && !state.monitors.some((m) => m.id === monitor)) return;
+  const policy = monitor !== null ? 'fixed' : value === 'inherit' ? null : value;
+  void act(scene ? 'scene_target' : 'target', { scene: scene?.id, policy, monitor });
+}
+
+const missingMonitor = '対象の画面が見つかりません。接続を確認するか、別の画面を選んでください。';
 
 function renderScenes() {
   byId('first-run').hidden = !onboarding || state.read_only;
-  byId('target-summary').textContent = '操作する画面：' + scopeLabel();
-  byId('mini-monitors').replaceChildren(...state.monitors.map((m) => el('span', monitorSelected(m.id) ? 'active' : '', String(m.number))));
   byId('scene-list').replaceChildren(...state.scenes.map((scene) => {
     const selected = scene.id === sceneId;
     const count = state.bindings.filter((binding) => binding.scenes.includes(scene.id)).length;
+    const detail = scene.variants.length ? scene.variants.length + ' 構成' : count + ' ウィンドウ';
     const item = button('', () => { sceneId = scene.id; redraw(); }, { focus: 'scene:' + scene.id });
     item.setAttribute('aria-pressed', String(selected));
-    item.replaceChildren(badge(scene.icon, !selected), el('span', 'identity', el('strong', '', scene.name), el('small', '', count + ' ウィンドウ')),
+    item.replaceChildren(badge(scene.icon, !selected), el('span', 'identity', el('strong', '', scene.name), el('small', '', detail)),
       selected ? el('span', 'check', icon('check')) : el('span'));
     return item;
   }));
@@ -246,20 +271,72 @@ function renderScenes() {
   byId('scene-editor').hidden = !scene;
   if (scene) {
     const bindings = state.bindings.filter((binding) => binding.scenes.includes(scene.id));
-    byId('scene-windows').textContent = scene.name + 'のウィンドウ';
-    byId('scene-bindings').replaceChildren(...(bindings.length
-      ? bindings.map((binding) => bindingRow(binding, scene)) : [el('li', 'empty', 'ウィンドウはまだありません。開いているウィンドウから追加できます。')]));
+    const target = scene.target || state.target;
+    byId('scene-name').textContent = scene.name;
+    setOptions(byId('scene-target'), [['inherit', '共通設定を使う（' + scopeLabel() + '）'], ...targetOptions(scene.target)], targetOption(scene.target));
+    const hint = byId('scene-target-hint');
+    hint.textContent = missingMonitor;
+    hint.hidden = target.monitor_policy === 'all_monitors' || state.monitors.some((m) => m.id === scene.effective_monitor);
+    renderMonitors(byId('scene-monitor-map'), scene);
+    renderVariants(scene, bindings);
   }
   byId('all-bindings').replaceChildren(...(state.bindings.length
     ? state.bindings.map((binding) => bindingRow(binding)) : [el('li', 'empty', '登録済みのウィンドウはありません。')]));
 }
 
-function bindingRow(binding, scene) {
+function variantTabId(variant) { return 'variant-tab-' + variant.id; }
+
+function renderVariants(scene, bindings) {
+  const variant = selectedVariant(scene);
+  const tabs = byId('variant-tabs');
+  const panel = byId('variant-panel');
+  tabs.hidden = !variant;
+  byId('common-windows').hidden = !variant;
+  byId('edit-variant').hidden = !variant;
+  if (variant) {
+    tabs.replaceChildren(...scene.variants.map((item) => {
+      const tab = button(item.name, () => selectVariant(scene, item), { focus: 'variant:' + item.id });
+      tab.id = variantTabId(item);
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-controls', panel.id);
+      tab.setAttribute('aria-selected', String(item.id === variant.id));
+      tab.tabIndex = item.id === variant.id ? 0 : -1;
+      return tab;
+    }));
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', variantTabId(variant));
+    renderBindingList(byId('common-bindings'), bindings.filter((binding) => binding.common_scenes.includes(scene.id)), scene, null);
+  } else {
+    tabs.replaceChildren();
+    panel.removeAttribute('role');
+    panel.removeAttribute('aria-labelledby');
+  }
+  byId('scene-windows').textContent = variant ? variant.name + 'で使うウィンドウ' : 'ウィンドウ';
+  const rows = variant ? bindings.filter((binding) => binding.variants[scene.id]?.includes(variant.id)) : bindings;
+  renderBindingList(byId('scene-bindings'), rows, scene, variant);
+}
+
+function selectVariant(scene, variant) {
+  editedVariants.set(scene.id, variant.id);
+  redraw();
+  byId(variantTabId(variant))?.focus({ preventScroll: true });
+}
+
+function renderBindingList(list, bindings, scene, variant) {
+  list.replaceChildren(...(bindings.length ? bindings.map((binding) => bindingRow(binding, scene, variant))
+    : [el('li', 'empty', 'ウィンドウはまだありません。')]));
+}
+
+function bindingRow(binding, scene, variant) {
   const description = [binding.running ? binding.title : 'ウィンドウが見つかりません', binding.monitor_label].filter(Boolean).join(' · ');
+  const target = scene?.target || state.target;
+  const outside = scene && binding.monitor_id && target.monitor_policy !== 'all_monitors'
+    && binding.monitor_id !== scene.effective_monitor;
   const status = [...new Set([
     ...(!binding.enabled ? ['無効'] : []),
     ...(binding.always ? ['常に表示'] : []),
     ...(binding.scenes.length > 1 ? ['他のシーンと共有'] : []),
+    ...(outside ? ['切り替える画面の外'] : []),
     ...binding.warnings,
   ])];
   const controls = el('div', 'actions',
@@ -267,9 +344,13 @@ function bindingRow(binding, scene) {
     button(binding.ambiguous.length ? '候補を確認' : '詳細', () => openBinding(binding), {
       css: 'quiet', aria: binding.app + ' の詳細', focus: 'binding:' + (scene?.id || '-') + ':' + binding.id,
     }),
-    scene ? button('外す', () => act('remove_from_scene', { scene: scene.id, id: binding.id }, () => {
-      if (!byId('add-windows').disabled) queueMicrotask(() => byId('add-windows').focus({ preventScroll: true }));
-    }), { css: 'quiet', edit: true, aria: binding.app + ' をこのシーンから外す' }) : null);
+    variant ? button('共通にする', () => act('share_in_scene', { scene: scene.id, id: binding.id }), {
+      css: 'quiet', edit: true, aria: binding.app + ' をどの構成でも使う',
+    }) : null,
+    scene ? button('外す', () => act('remove_from_scene', { scene: scene.id, variant: variant?.id, id: binding.id }, () => {
+      const add = byId(!variant && scene.variants.length ? 'add-common-windows' : 'add-windows');
+      queueMicrotask(() => add.focus({ preventScroll: true }));
+    }), { css: 'quiet', edit: true, aria: binding.app + ' を' + (variant?.name || scene.name) + 'から外す' }) : null);
   return el('li', 'row labelled-row', rowIdentity(binding.app, description), controls);
 }
 
@@ -289,7 +370,8 @@ function renderLauncher() {
   const bar = el('div', 'bar' + (cfg.orientation === 'vertical' ? ' vertical' : ''),
     el('span', 'grip', icon('grip')),
     ...scenes.map((scene) => {
-      const node = el('span', 'slot', icon(scene.icon));
+      const node = el('span', 'bar-scene', el('span', 'slot', icon(scene.icon)),
+        scene.variants?.length > 1 ? el('span', 'slot variant-arrow', icon('down')) : null);
       node.title = scene.name;
       return node;
     }),
@@ -302,44 +384,41 @@ function renderLauncher() {
 
 function renderBehavior() {
   const all = state.target.monitor_policy === 'all_monitors';
-  const options = [['all_monitors', 'すべての画面'], ['launcher_monitor', '固定バーのある画面']];
-  const fixed = state.target.monitor_policy === 'fixed';
-  const value = fixed ? 'fixed:' + (state.target.monitor_id || '') : state.target.monitor_policy;
-  if (fixed && !state.monitors.some((m) => m.id === state.target.monitor_id)) {
-    options.push([value, state.target.monitor_id ? '未接続の画面（現在の設定）' : '未設定']);
-  }
-  options.push(...state.monitors.map((m) => ['fixed:' + m.id, '画面 ' + m.number + ' だけ' + (m.name ? ' — ' + m.name : '')]));
-  setOptions(byId('target'), options, value);
+  setOptions(byId('target'), targetOptions(state.target), targetOption(state.target));
   byId('monitor-hint').textContent = !all && !state.monitors.some((m) => m.id === state.effective_monitor)
-    ? '対象の画面が見つかりません。接続を確認するか、別の画面を選んでください。'
-    : '切替時は「' + scopeLabel() + '」にある登録済みのウィンドウを操作します。';
+    ? missingMonitor : 'シーンで「共通設定を使う」を選ぶと、この設定が適用されます。';
   byId('setup-next-row').hidden = !setup;
   byId('restore').checked = state.launcher.restore_all_on_switch;
   byId('focus').checked = state.launcher.focus_on_switch;
   byId('autostart').checked = state.autostart;
   byId('verbose').checked = state.verbose;
 
-  renderMonitors();
+  renderMonitors(byId('monitor-map'));
 }
 
-function renderMonitors() {
-  const map = byId('monitor-map');
+function renderMonitors(map, scene) {
+  const target = scene?.target || state.target;
+  const effective = scene ? scene.effective_monitor : state.effective_monitor;
   const monitors = state.monitors;
-  if (!monitors.length) { map.replaceChildren(el('small', '', '接続されている画面はありません。')); return; }
+  if (!monitors.length) {
+    map.replaceChildren(el('small', '', '接続されている画面はありません。'));
+    map.style.height = '';
+    return;
+  }
   const bounds = monitors.map(({rect}) => rect);
   const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
   const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
   const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
   const maxWidth = map.clientWidth || 230;
-  const scale = Math.min(maxWidth / width, 116 / height);
+  const scale = Math.min(maxWidth / width, (scene ? 76 : 116) / height);
   map.replaceChildren(...monitors.map((m) => {
     const rect = m.rect;
     const label = '画面 ' + m.number;
     const primary = m.primary ? '（メイン）' : '';
-    const item = button(label, () => void act('target', { policy: 'fixed', monitor: m.id }), {
-      edit: true, aria: label + primary + (m.name ? ' ' + m.name : ''), focus: 'monitor:' + m.id,
+    const item = button(label, () => changeTarget('fixed:' + m.id, scene), {
+      edit: true, aria: label + primary + (m.name ? ' ' + m.name : ''), focus: map.id + ':' + m.id,
     });
-    item.setAttribute('aria-pressed', String(monitorSelected(m.id)));
+    item.setAttribute('aria-pressed', String(target.monitor_policy === 'all_monitors' || effective === m.id));
     item.title = label + primary + (m.name ? ' — ' + m.name : '');
     item.style.left = (rect.left - minX) * scale + 'px';
     item.style.top = (rect.top - minY) * scale + 'px';
@@ -470,32 +549,70 @@ function openSceneDetails() {
     }), { focus: state.read_only ? undefined : name });
 }
 
-async function openWindowPicker() {
+function openVariantEditor(edit) {
+  const scene = selected();
+  if (!scene || state.read_only || pending) return;
+  const variant = edit ? selectedVariant(scene) : null;
+  const original = !scene.variants.length ? input('標準') : null;
+  const name = input(variant?.name || '');
+  name.required = true;
+  if (original) original.required = true;
+  const remove = variant ? el('div', 'actions', button('構成を削除', () => {
+    const caption = 'この構成だけで使うウィンドウがシーンから外れます。'
+      + (scene.variants.length === 2 ? '残る構成のウィンドウはシーンに引き継ぎます。' : '');
+    confirm('「' + variant.name + '」を削除しますか？', caption, '構成を削除', () =>
+      applyDialog('delete_variant', { scene: scene.id, variant: variant.id }, () => {
+        editedVariants.delete(scene.id);
+        queueMicrotask(() => byId('create-variant').focus({ preventScroll: true }));
+      }));
+  }, { css: 'danger', edit: true })) : null;
+  openDialog(variant ? '構成の設定' : '構成を追加',
+    original ? '登録済みのウィンドウは元の構成に引き継ぎます。' : '', [
+      ...(original ? [field('元の構成名', original)] : []),
+      field(original ? '新しい構成名' : '構成名', name),
+      ...(remove ? [remove] : []),
+    ], variant ? '編集に反映' : '追加', () => variant
+      ? applyDialog('rename_variant', { scene: scene.id, variant: variant.id, name: name.value })
+      : applyDialog('create_variant', { scene: scene.id, original_name: original?.value, name: name.value }, ({ variant }) => {
+        editedVariants.set(scene.id, variant);
+        queueMicrotask(() => byId('add-windows').focus({ preventScroll: true }));
+      }), { focus: name });
+}
+
+async function openWindowPicker(common = false) {
   if (!selected() || state.read_only || pending) return;
   try {
     await request('refresh');
     redraw();
     const scene = selected();
     if (!scene) return;
+    const variant = common ? null : selectedVariant(scene);
+    const target = scene.target || state.target;
+    const bindings = new Map(state.bindings.map((binding) => [binding.id, binding]));
     const list = el('div');
     const matches = state.candidates;
     const chosen = [];
     for (const candidate of matches) {
-      const already = candidate.scenes.includes(scene.id);
-      const status = [candidate.title, candidate.monitor, already ? '追加済み' : candidate.blocked,
+      const binding = bindings.get(candidate.binding_id);
+      const shared = binding?.common_scenes.includes(scene.id);
+      const already = shared || (variant && binding?.variants[scene.id]?.includes(variant.id));
+      const blocked = candidate.blocked || (target.monitor_policy !== 'all_monitors'
+        && candidate.monitor_id !== scene.effective_monitor ? '切り替える画面の外' : null);
+      const status = [candidate.title, candidate.monitor, already ? (shared && variant ? 'どの構成でも使用' : '追加済み') : blocked,
         candidate.ambiguous ? '登録済みウィンドウの候補です。先に登録の候補を確認してください' : null,
-        !already && candidate.scenes.length ? '他のシーンと共有' : null, ...candidate.warnings];
+        !already && candidate.scenes.some((id) => id !== scene.id) ? '他のシーンと共有' : null, ...candidate.warnings];
       const [label, box] = check(candidate.app, false, [...new Set(status.filter(Boolean))].join(' · '));
-      box.disabled = already || Boolean(candidate.blocked) || candidate.ambiguous;
+      box.disabled = Boolean(already || blocked || candidate.ambiguous);
       box.value = candidate.key;
       if (!box.disabled) chosen.push(box);
       list.append(label);
     }
     if (!matches.length) list.append(el('p', '', 'ウィンドウが見つかりません。登録したいアプリを開いてから、もう一度お試しください。'));
     list.addEventListener('change', () => { dialogSubmit.disabled = !chosen.some((box) => box.checked); });
-    openDialog('開いているウィンドウから追加', '追加先：' + scene.name + '　／　操作範囲：' + scopeLabel(),
+    const destination = variant?.name || (common ? 'どの構成でも使うウィンドウ' : '');
+    openDialog('開いているウィンドウから追加', [scene.name, destination, scopeLabel(target)].filter(Boolean).join(' ／ '),
       list, '選んだウィンドウを追加', () => applyDialog('add_windows', {
-        scene: scene.id, candidates: chosen.filter((box) => box.checked).map((box) => box.value),
+        scene: scene.id, variant: variant?.id, candidates: chosen.filter((box) => box.checked).map((box) => box.value),
       }, () => { onboarding = false; }), { focus: chosen[0] });
     dialogSubmit.disabled = true;
   } catch (error) { showMessage(error.message); }
@@ -505,11 +622,18 @@ function openBinding(binding) {
   if (pending) return;
   const readOnly = state.read_only;
   const checks = state.scenes.map((scene) => {
-    const [label, box] = check(scene.name, binding.scenes.includes(scene.id));
+    const [label, box] = check(scene.name, binding.common_scenes.includes(scene.id), scene.variants.length ? 'どの構成でも使う' : null);
     box.disabled = readOnly;
-    return { label, box, id: scene.id };
+    const options = scene.variants.map((variant) => {
+      const [row, option] = check(variant.name, Boolean(binding.variants[scene.id]?.includes(variant.id)));
+      option.disabled = readOnly || box.checked;
+      box.addEventListener('change', () => { option.disabled = readOnly || box.checked; });
+      return { row, option, id: variant.id };
+    });
+    const group = el('div', '', label, options.length ? el('div', 'binding-variant-options', ...options.map(({ row }) => row)) : null);
+    return { group, box, options, id: scene.id };
   });
-  const scenes = el('fieldset', 'rule-box', el('legend', '', '登録先のシーン'), ...checks.map(({ label }) => label));
+  const scenes = el('fieldset', 'rule-box', el('legend', '', '登録先のシーンと構成'), ...checks.map(({ group }) => group));
   const [always, isAlways] = check('シーンを切り替えても常に表示する', binding.always);
   const [enabled, isEnabled] = check('このウィンドウの登録を有効にする', binding.enabled);
   const type = select([['any','ウィンドウ名を問わない'],['contains','指定した文字を含む'],
@@ -539,6 +663,8 @@ function openBinding(binding) {
   openDialog(binding.app + ' の登録', binding.title || 'ウィンドウが見つかりません',
     [ambiguity, scenes, always, enabled, rules, remove], '編集に反映', readOnly ? undefined : () =>
       applyDialog('edit_binding', { id: binding.id, scenes: checks.filter(({box}) => box.checked).map(({id}) => id),
+        variants: Object.fromEntries(checks.filter(({ box }) => !box.checked).map(({ id, options }) =>
+          [id, options.filter(({ option }) => option.checked).map(({ id }) => id)])),
         always: isAlways.checked, enabled: isEnabled.checked, rule: { type: type.value, value: type.value === 'any' ? null : value.value },
         monitor: monitor.value || null }));
 }
@@ -566,13 +692,15 @@ async function inspect() {
   const scene = selected();
   if (!scene || pending) return;
   try {
-    const result = await request('inspect', { scene: scene.id });
+    const variant = selectedVariant(scene);
+    const result = await request('inspect', { scene: scene.id, variant: variant?.id });
     const group = (label, items) => el('div', 'stack', el('h3', '', label),
       items.length ? el('ul', 'rows', ...items.map(({ window, reason }) => el('li', '',
         rowIdentity(window.app, [window.title, window.monitor, reason].filter(Boolean).join(' · ')))))
         : el('p', '', '該当なし'));
     const warnings = result.warnings.map((warning) => el('p', 'notice', warning));
-    openDialog('「' + scene.name + '」に切り替えると', '現在のウィンドウと編集中の設定からの見込みです。ここでは操作しません。', [
+    const title = variant ? scene.name + ' / ' + variant.name : scene.name;
+    openDialog('「' + title + '」に切り替えると', scopeLabel(scene.target || state.target) + 'での切替の見込みです。', [
       ...warnings,
       group('表示する', result.restore.map((window) => ({ window }))),
       group('最小化する', result.minimize.map((window) => ({ window }))),
@@ -709,22 +837,29 @@ function importSettings() {
 
 document.querySelectorAll('[data-icon]').forEach((node) => node.prepend(icon(node.dataset.icon)));
 nav.forEach((node) => node.addEventListener('click', () => go(node.dataset.page)));
-root.querySelectorAll('[data-link]').forEach((node) => node.addEventListener('click', () => go(node.dataset.link)));
 byId('start-setup').addEventListener('click', () => { setup = true; go('behavior'); });
 byId('setup-next').addEventListener('click', () => { setup = false; go('scenes'); byId('create-scene').focus(); });
 byId('create-scene').addEventListener('click', openCreate);
-byId('add-windows').addEventListener('click', openWindowPicker);
+byId('add-windows').addEventListener('click', () => openWindowPicker());
+byId('add-common-windows').addEventListener('click', () => openWindowPicker(true));
+byId('create-variant').addEventListener('click', () => openVariantEditor(false));
+byId('edit-variant').addEventListener('click', () => openVariantEditor(true));
+byId('variant-tabs').addEventListener('keydown', (event) => {
+  const scene = selected();
+  if (!scene || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const variants = scene.variants;
+  const index = variants.indexOf(selectedVariant(scene));
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? variants.length - 1
+    : (index + variants.length + (event.key === 'ArrowLeft' ? -1 : 1)) % variants.length;
+  selectVariant(scene, variants[next]);
+});
 byId('scene-details').addEventListener('click', openSceneDetails);
 byId('inspect').addEventListener('click', inspect);
 byId('refresh-bindings').addEventListener('click', () => act('refresh'));
 byId('refresh-monitors').addEventListener('click', () => act('refresh'));
-byId('target').addEventListener('change', (event) => {
-  const value = event.target.value;
-  if (value.startsWith('fixed:')) {
-    const monitor = value.slice(6);
-    if (monitor && state.monitors.some((m) => m.id === monitor)) void act('target', { policy: 'fixed', monitor });
-  } else void act('target', { policy: value, monitor: null });
-});
+byId('target').addEventListener('change', (event) => changeTarget(event.target.value));
+byId('scene-target').addEventListener('change', (event) => changeTarget(event.target.value, selected()));
 launcherFields.forEach((id) => byId(id).addEventListener('change', sendLauncher));
 ['restore','focus','autostart','verbose'].forEach((id) => byId(id).addEventListener('change', sendBehavior));
 byId('reset-position').addEventListener('click', () => act('reset_position', {}, () => showMessage('保存すると固定バーの位置が初期化されます。', true)));
@@ -754,11 +889,15 @@ document.addEventListener('keydown', (event) => {
     saveEdits();
   }
 });
-new ResizeObserver(() => { if (state && visited === 'behavior') renderMonitors(); }).observe(content);
+new ResizeObserver(() => {
+  if (!state) return;
+  if (visited === 'behavior') renderMonitors(byId('monitor-map'));
+  if (visited === 'scenes' && selected()) renderMonitors(byId('scene-monitor-map'), selected());
+}).observe(content);
 
 const darkScheme = matchMedia('(prefers-color-scheme: dark)');
 function syncAppearance() {
-  bridge.postMessage({ id: 0, action: 'appearance', dark: darkScheme.matches });
+  bridge.postMessage({ request_id: 0, action: 'appearance', dark: darkScheme.matches });
 }
 darkScheme.addEventListener('change', syncAppearance);
 
@@ -766,5 +905,5 @@ request('initialize').then((extra) => {
   onboarding = Boolean(extra.first_run);
   go(requestedPage || extra.page);
   // A hidden WebView can throttle animation callbacks. Signal after updating the DOM.
-  bridge.postMessage({ id: 0, action: 'rendered', dark: darkScheme.matches });
-}).catch(() => bridge.postMessage({ id: 0, action: 'startup_failed' }));
+  bridge.postMessage({ request_id: 0, action: 'rendered', dark: darkScheme.matches });
+}).catch(() => bridge.postMessage({ request_id: 0, action: 'startup_failed' }));

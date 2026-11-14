@@ -3,7 +3,9 @@
 //! Coordinates `ConfigManager`, `SceneStateManager`, `BindingResolver`, `RecoveryManager`,
 //! and `WindowSystem` without coupling the core logic to Win32 `HWND` callbacks.
 
-use crate::config::{AppConfig, ConfigManager, MonitorProfile, Orientation};
+use crate::config::{
+    AppConfig, ConfigManager, MonitorPolicy, MonitorProfile, Orientation, TargetConfig,
+};
 use crate::diagnostics::{log_info, log_warn};
 use crate::launcher::input::LauncherLayout;
 use crate::platform::hooks::drain_minimize_events;
@@ -88,8 +90,16 @@ impl AppController {
         if let Some(pending) = &mut self.pending_verification {
             pending.cancel_presentation_retry();
         }
-        if self.config.target != config.target || self.state_mgr.active_scene_id().is_some_and(|id| {
-            !config.scenes.iter().any(|s| s.id == id)
+        if self.state_mgr.active_scene_id().is_some_and(|id| {
+            let previous = self
+                .config
+                .scene(id)
+                .map(|scene| scene.target(&self.config.target));
+            config.scene(id).is_none_or(|scene| {
+                previous != Some(scene.target(&config.target))
+                    || self.state_mgr.active_variant_id()
+                        != scene.preferred_variant().map(|variant| variant.id.as_str())
+            })
         }) {
             self.state_mgr.reset_to_unknown();
         }
@@ -194,8 +204,13 @@ impl AppController {
         }
     }
 
-    /// Request switching to `scene_id` (serialized on main UI thread).
-    pub fn switch_to_scene(&mut self, scene_id: &str, source: SwitchSource) -> SwitchOutcome {
+    /// Switch to the requested variant, or the scene's last-used variant for an ordinary click.
+    pub fn switch_to_scene(
+        &mut self,
+        scene_id: &str,
+        variant_id: Option<&str>,
+        source: SwitchSource,
+    ) -> SwitchOutcome {
         self.process_queued_win_events();
 
         let launcher_mon = if self.launcher_monitor_id.is_empty() {
@@ -206,6 +221,7 @@ impl AppController {
 
         let outcome = execute_scene_switch_from(
             scene_id,
+            variant_id,
             &self.config,
             &mut self.state_mgr,
             &mut self.resolver,
@@ -222,6 +238,24 @@ impl AppController {
             self.pending_verification = outcome.verification.clone();
             self.last_warnings = outcome.warnings.clone();
             self.update_monitor_profile_active_scene(scene_id);
+            if let Some(variant_id) = self.state_mgr.active_variant_id() {
+                if let Some(scene) = self
+                    .config
+                    .scenes
+                    .iter_mut()
+                    .find(|scene| scene.id == scene_id)
+                {
+                    if scene.last_variant_id.as_deref() != Some(variant_id) {
+                        scene.last_variant_id = Some(variant_id.to_owned());
+                        if let Err(error) = self.config_mgr.save(&self.config) {
+                            log_warn(
+                                "config",
+                                &format!("Could not remember scene variant: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
         } else if !outcome.was_noop_same_scene {
             self.last_warnings = outcome.warnings.clone();
         }
@@ -267,35 +301,18 @@ impl AppController {
             return false;
         };
 
-        let target_monitors: Vec<String> =
-            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
-                self.sys
-                    .monitors()
-                    .into_iter()
-                    .map(|m| m.monitor_id)
-                    .collect()
-            } else {
-                let launcher_mon = if self.launcher_monitor_id.is_empty() {
-                    None
-                } else {
-                    Some(self.launcher_monitor_id.as_str())
-                };
-                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
-                    Some(mon) => vec![mon],
-                    None => return false,
-                }
-            };
-
+        let variant_id = self.state_mgr.active_variant_id();
         let mut any_saved = false;
-        for target_mon in target_monitors {
+        for target_mon in self.scene_monitor_ids(&scene_id) {
             if let Some(snapshot) = capture_scene_layout(
                 &scene_id,
+                variant_id,
                 &target_mon,
                 &self.config,
                 &mut self.resolver,
                 &*self.sys,
             ) {
-                save_layout_into_config(&mut self.config, snapshot);
+                save_layout_into_config(&mut self.config, snapshot, variant_id);
                 any_saved = true;
             }
         }
@@ -318,29 +335,11 @@ impl AppController {
             return 0;
         };
 
-        let target_monitors: Vec<String> =
-            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
-                self.sys
-                    .monitors()
-                    .into_iter()
-                    .map(|m| m.monitor_id)
-                    .collect()
-            } else {
-                let launcher_mon = if self.launcher_monitor_id.is_empty() {
-                    None
-                } else {
-                    Some(self.launcher_monitor_id.as_str())
-                };
-                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
-                    Some(mon) => vec![mon],
-                    None => return 0,
-                }
-            };
-
         let mut total = 0;
-        for target_mon in target_monitors {
+        for target_mon in self.scene_monitor_ids(&scene_id) {
             total += apply_saved_scene_layout(
                 &scene_id,
+                self.state_mgr.active_variant_id(),
                 &target_mon,
                 &self.config,
                 &mut self.resolver,
@@ -357,22 +356,14 @@ impl AppController {
         let Some(scene_id) = self.state_mgr.active_scene_id().map(|s| s.to_string()) else {
             return (0, 0, Vec::new());
         };
+        let target_monitors = self.scene_monitor_ids(&scene_id);
+        if target_monitors.is_empty() {
+            return (0, 0, Vec::new());
+        }
         let windows = self.sys.enumerate_windows();
-        let monitors = self.sys.monitors();
-        let target_monitors: Vec<String> =
-            if self.config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors {
-                monitors.iter().map(|m| m.monitor_id.clone()).collect()
-            } else {
-                let launcher_mon = if self.launcher_monitor_id.is_empty() {
-                    None
-                } else {
-                    Some(self.launcher_monitor_id.as_str())
-                };
-                match resolve_effective_target_monitor_id(&self.config, launcher_mon) {
-                    Some(mon) => vec![mon],
-                    None => Vec::new(),
-                }
-            };
+        let target_is_fixed =
+            self.scene_target(&scene_id).monitor_policy != MonitorPolicy::AllMonitors;
+        let variant_id = self.state_mgr.active_variant_id();
 
         let mut launched = 0usize;
         let mut skipped = 0usize;
@@ -380,7 +371,16 @@ impl AppController {
         let mut seen_exes = std::collections::HashSet::new();
 
         for binding in &self.config.bindings {
-            if !binding.enabled || !binding.scene_ids.iter().any(|s| s == &scene_id) {
+            if !binding.enabled || !binding.belongs_to_selection(&scene_id, variant_id) {
+                continue;
+            }
+            if target_is_fixed
+                && binding
+                    .match_rule
+                    .monitor_id
+                    .as_ref()
+                    .is_some_and(|id| !target_monitors.contains(id))
+            {
                 continue;
             }
             let already_open = target_monitors.iter().any(|mon| {
@@ -463,14 +463,35 @@ impl AppController {
         );
     }
 
+    fn scene_target(&self, scene_id: &str) -> &TargetConfig {
+        self.config
+            .scene(scene_id)
+            .map_or(&self.config.target, |scene| {
+                scene.target(&self.config.target)
+            })
+    }
+
+    fn launcher_monitor(&self) -> Option<&str> {
+        (!self.launcher_monitor_id.is_empty()).then_some(self.launcher_monitor_id.as_str())
+    }
+
+    fn scene_monitor_ids(&self, scene_id: &str) -> Vec<String> {
+        let target = self.scene_target(scene_id);
+        let monitors = self.sys.monitors();
+        if target.monitor_policy == MonitorPolicy::AllMonitors {
+            return monitors.into_iter().map(|mon| mon.monitor_id).collect();
+        }
+        resolve_effective_target_monitor_id(target, self.launcher_monitor())
+            .filter(|id| monitors.iter().any(|mon| &mon.monitor_id == id))
+            .into_iter()
+            .collect()
+    }
+
     fn update_monitor_profile_active_scene(&mut self, scene_id: &str) {
-        let launcher_mon = if self.launcher_monitor_id.is_empty() {
-            None
-        } else {
-            Some(self.launcher_monitor_id.as_str())
-        };
-        let Some(target_mon) = resolve_effective_target_monitor_id(&self.config, launcher_mon)
-        else {
+        let Some(target_mon) = resolve_effective_target_monitor_id(
+            self.scene_target(scene_id),
+            self.launcher_monitor(),
+        ) else {
             return;
         };
 

@@ -184,7 +184,8 @@ impl CursorPopup {
                 canvas.fill(rect, radius, palette.active_border);
                 canvas.fill(inset(rect, border), radius - border, palette.hover);
             } else {
-                let fill = if self.hover == Some(Hit::Scene(index)) {
+                let fill = if matches!(self.hover, Some(Hit::Scene(i) | Hit::SceneVariants(i)) if i == index)
+                {
                     palette.hover
                 } else {
                     palette.tile
@@ -192,7 +193,17 @@ impl CursorPopup {
                 canvas.fill(rect, radius, fill);
             }
 
-            let x = rect.left + (rect.width() - icon_size) / 2;
+            let mut main = rect;
+            if scene.variants.len() > 1 {
+                let arrow = self.scene_variant_rect(rect);
+                if self.hover == Some(Hit::SceneVariants(index)) {
+                    canvas.fill(inset(arrow, px(2)), px(4), palette.hover);
+                }
+                let color = 0xFF00_0000 | if active { palette.accent } else { palette.text };
+                super::super::paint::draw_variant_arrow(canvas.graphics, arrow, color, self.dpi);
+                main.right = arrow.left;
+            }
+            let x = main.left + (main.width() - icon_size) / 2;
             let y = rect.top + px(9);
             if let Some(image) = self.icon_cache.get_or_load_image(&scene.icon, self.dpi) {
                 let _ = GdipDrawImageRect(
@@ -272,13 +283,18 @@ impl CursorPopup {
             };
             let active = self.active_scene_id.as_deref() == Some(scene.id.as_str());
             let color = if active { palette.accent } else { palette.text };
+            let right = if scene.variants.len() > 1 {
+                self.scene_variant_rect(rect).left
+            } else {
+                rect.right
+            };
             select_font(hdc, self.fonts.body);
             draw_text(
                 hdc,
                 &scene.name,
                 RectData {
                     left: rect.left + px(3),
-                    right: rect.right - px(3),
+                    right: right - px(3),
                     top: rect.top + px(29),
                     bottom: rect.top + px(49),
                 },
@@ -291,7 +307,7 @@ impl CursorPopup {
                     hdc,
                     "✓",
                     RectData {
-                        right: rect.right - px(6),
+                        right: right - px(5),
                         top: rect.top + px(3),
                         bottom: rect.top + px(20),
                         ..rect

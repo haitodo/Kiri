@@ -3,7 +3,7 @@
 mod paint;
 
 use self::paint::{PopupFonts, PopupPalette};
-use super::input::{point_in_rect, SceneWheel};
+use super::input::{point_in_rect, SceneWheel, SCENE_VARIANT_BUTTON_DIP};
 use super::paint::{GdiThemeCache, GdiplusContext};
 use crate::config::{AppConfig, CursorPopupPosition, RectData, Scene, Shortcut};
 use crate::platform::cursor_input::{PopupInput, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP};
@@ -179,12 +179,14 @@ impl PopupLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Scene(usize),
+    SceneVariants(usize),
     Shortcut(usize),
     Settings,
 }
 
 pub enum PopupAction {
     SwitchScene(String),
+    ChooseVariant(String, POINT),
     OpenShortcut(Shortcut),
     OpenSettings,
 }
@@ -226,7 +228,7 @@ fn next_focus_hit(
     };
 
     match cur {
-        Hit::Scene(i) => {
+        Hit::Scene(i) | Hit::SceneVariants(i) => {
             if vk == VK_LEFT.0 {
                 if i > 0 {
                     Some(Hit::Scene(i - 1))
@@ -311,6 +313,10 @@ pub struct CursorPopup {
 }
 
 impl CursorPopup {
+    pub(super) fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn create(owner: HWND, gdiplus: GdiplusContext) -> windows::core::Result<Box<Self>> {
         static REGISTER: Once = Once::new();
         let class = w!("KiriCursorPopupClass");
@@ -469,6 +475,17 @@ impl CursorPopup {
     fn action_for_hit(&self, hit: Hit) -> PopupAction {
         match hit {
             Hit::Scene(index) => PopupAction::SwitchScene(self.scenes[index].id.clone()),
+            Hit::SceneVariants(index) => {
+                let rect = self.scene_variant_rect(self.layout.scene(index, self.width));
+                let mut point = POINT {
+                    x: rect.left,
+                    y: rect.bottom - self.scroll,
+                };
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut point);
+                }
+                PopupAction::ChooseVariant(self.scenes[index].id.clone(), point)
+            }
             Hit::Shortcut(index) => PopupAction::OpenShortcut(self.shortcuts[index].clone()),
             Hit::Settings => PopupAction::OpenSettings,
         }
@@ -476,7 +493,7 @@ impl CursorPopup {
 
     fn ensure_hit_visible(&mut self, hit: Hit) {
         let rect = match hit {
-            Hit::Scene(index) => self.layout.scene(index, self.width),
+            Hit::Scene(index) | Hit::SceneVariants(index) => self.layout.scene(index, self.width),
             Hit::Shortcut(index) => self.layout.shortcut(index, self.width),
             Hit::Settings => self.layout.shortcut(0, self.width),
         };
@@ -489,7 +506,7 @@ impl CursorPopup {
 
     pub fn handle_key(&mut self, vk: u16) -> CursorKeyOutcome {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+            VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
         };
         if !self.visible {
             return CursorKeyOutcome::Ignored;
@@ -503,6 +520,17 @@ impl CursorPopup {
                 return CursorKeyOutcome::Execute;
             }
             return CursorKeyOutcome::Dismiss;
+        }
+        if vk == VK_SPACE.0 {
+            if let Some(Hit::Scene(index) | Hit::SceneVariants(index)) =
+                self.keyboard_focus.or(self.hover)
+            {
+                if self.scenes[index].variants.len() > 1 {
+                    self.pending_action = Some(self.action_for_hit(Hit::SceneVariants(index)));
+                    return CursorKeyOutcome::Execute;
+                }
+            }
+            return CursorKeyOutcome::Ignored;
         }
         if matches!(
             vk,
@@ -596,10 +624,17 @@ impl CursorPopup {
     fn hit_test(&self, lparam: LPARAM) -> Option<Hit> {
         let x = lparam.0 as i16 as i32;
         let y = ((lparam.0 >> 16) as i16 as i32) + self.scroll;
-        if let Some(index) =
-            (0..self.scenes.len()).find(|&i| point_in_rect(x, y, &self.layout.scene(i, self.width)))
-        {
-            return Some(Hit::Scene(index));
+        for (index, scene) in self.scenes.iter().enumerate() {
+            let rect = self.layout.scene(index, self.width);
+            if point_in_rect(x, y, &rect) {
+                let arrow =
+                    scene.variants.len() > 1 && point_in_rect(x, y, &self.scene_variant_rect(rect));
+                return Some(if arrow {
+                    Hit::SceneVariants(index)
+                } else {
+                    Hit::Scene(index)
+                });
+            }
         }
         let index = (0..self.shortcuts.len().max(1))
             .find(|&i| point_in_rect(x, y, &self.layout.shortcut(i, self.width)))?;
@@ -608,6 +643,13 @@ impl CursorPopup {
         } else {
             Hit::Shortcut(index)
         })
+    }
+
+    fn scene_variant_rect(&self, rect: RectData) -> RectData {
+        RectData {
+            left: rect.right - dip_to_px(SCENE_VARIANT_BUTTON_DIP, self.dpi),
+            ..rect
+        }
     }
 
     fn scroll_to(&mut self, requested: i32) {
@@ -874,6 +916,13 @@ mod tests {
             )
             .unwrap();
             let mut config = AppConfig::default_initial();
+            config.scenes[1].variants = ["Antigravity", "Codex"]
+                .into_iter()
+                .map(|name| crate::config::SceneVariant {
+                    id: name.into(),
+                    name: name.into(),
+                })
+                .collect();
             config.shortcuts = (0..14)
                 .map(|i| Shortcut {
                     name: format!("Site {i}"),
@@ -914,12 +963,26 @@ mod tests {
             let hit = LPARAM(((y as isize) << 16) | x as isize);
             assert!(popup.hit_test(hit) == Some(Hit::Scene(1)));
 
-            let _ = SendMessageW(
-                popup.hwnd,
-                WM_VSCROLL,
-                WPARAM(SB_TOP.0 as usize),
-                LPARAM(0),
+            let tile = popup.layout.scene(1, popup.width);
+            let arrow = popup.scene_variant_rect(tile);
+            let x = arrow.left + 2;
+            let y = tile.top + 4 - popup.scroll;
+            let hit = LPARAM(((y as isize) << 16) | x as isize);
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, WPARAM(0), hit);
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), hit);
+            assert!(
+                matches!(popup.pending_action.take(), Some(PopupAction::ChooseVariant(scene, _)) if scene == "code")
             );
+            let mut message = MSG::default();
+            assert!(PeekMessageW(
+                &mut message,
+                owner,
+                WM_APP_CURSOR_POPUP_ACTION,
+                WM_APP_CURSOR_POPUP_ACTION,
+                PM_REMOVE
+            )
+            .as_bool());
+            let _ = SendMessageW(popup.hwnd, WM_VSCROLL, WPARAM(SB_TOP.0 as usize), LPARAM(0));
             assert_eq!(popup.scroll, 0);
             let row = popup
                 .viewport_rect(popup.layout.shortcut(0, popup.width))
@@ -932,7 +995,6 @@ mod tests {
                 if shortcut == config.shortcuts[0])
             );
 
-            let mut message = MSG::default();
             assert!(PeekMessageW(
                 &mut message,
                 owner,

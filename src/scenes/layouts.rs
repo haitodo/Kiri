@@ -14,6 +14,7 @@ use crate::scenes::bindings::{BindingResolution, BindingResolver};
 /// Capture the current layout of all resolved windows belonging to `scene_id` on `target_monitor_id`.
 pub fn capture_scene_layout(
     scene_id: &str,
+    variant_id: Option<&str>,
     target_monitor_id: &str,
     config: &AppConfig,
     resolver: &mut BindingResolver,
@@ -28,7 +29,7 @@ pub fn capture_scene_layout(
     let mut entries = Vec::new();
 
     for binding in &config.bindings {
-        if !binding.enabled || !binding.scene_ids.iter().any(|id| id == scene_id) {
+        if !binding.enabled || !binding.belongs_to_selection(scene_id, variant_id) {
             continue;
         }
         if let BindingResolution::Resolved(win) =
@@ -60,12 +61,32 @@ pub fn capture_scene_layout(
 }
 
 /// Upsert a `LayoutSnapshot` into `config.layouts`.
-pub fn save_layout_into_config(config: &mut AppConfig, snapshot: LayoutSnapshot) {
+pub fn save_layout_into_config(
+    config: &mut AppConfig,
+    mut snapshot: LayoutSnapshot,
+    variant_id: Option<&str>,
+) {
     if let Some(existing) = config
         .layouts
         .iter_mut()
         .find(|l| l.scene_id == snapshot.scene_id && l.monitor_id == snapshot.monitor_id)
     {
+        if variant_id.is_some() {
+            // Keep positions recorded for windows used exclusively by the other variants.
+            snapshot.entries.extend(
+                existing
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        config.bindings.iter().any(|binding| {
+                            binding.id == entry.binding_id
+                                && binding.belongs_to_scene(&snapshot.scene_id)
+                                && !binding.belongs_to_selection(&snapshot.scene_id, variant_id)
+                        })
+                    })
+                    .cloned(),
+            );
+        }
         *existing = snapshot;
     } else {
         config.layouts.push(snapshot);
@@ -76,6 +97,7 @@ pub fn save_layout_into_config(config: &mut AppConfig, snapshot: LayoutSnapshot)
 /// Returns the number of windows whose placement was updated.
 pub fn apply_saved_scene_layout(
     scene_id: &str,
+    variant_id: Option<&str>,
     target_monitor_id: &str,
     config: &AppConfig,
     resolver: &mut BindingResolver,
@@ -100,11 +122,9 @@ pub fn apply_saved_scene_layout(
 
     let mut applied = 0;
     for entry in &snapshot.entries {
-        let Some(binding) = config
-            .bindings
-            .iter()
-            .find(|b| b.id == entry.binding_id && b.enabled)
-        else {
+        let Some(binding) = config.bindings.iter().find(|b| {
+            b.id == entry.binding_id && b.enabled && b.belongs_to_selection(scene_id, variant_id)
+        }) else {
             continue;
         };
 

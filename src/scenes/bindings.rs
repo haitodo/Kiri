@@ -55,8 +55,6 @@ pub enum RegistrationWarning {
     NoTaskbarButton,
     /// Process is running elevated (Administrator); UIPI prevents normal-privilege Kiri from controlling it.
     ElevatedProcess,
-    /// Window is currently on a monitor other than `target_monitor`.
-    OutsideTargetMonitor { window_monitor: String },
     /// Window title appears to contain digits (e.g. MT5 account number) or dynamic document/tab info.
     TitleMayContainSensitiveOrDynamicText,
     /// Multiple windows on the target monitor match this rule without disambiguation.
@@ -486,23 +484,13 @@ pub fn extract_smart_title_keyword(title: &str) -> Option<String> {
 }
 
 /// Evaluate safety warnings when a user selects `win` for registration in the Settings UI (Section 2.4).
-pub fn evaluate_registration_warnings(
-    win: &WindowInstance,
-    target_monitor_id: Option<&str>,
-) -> Vec<RegistrationWarning> {
+pub fn evaluate_registration_warnings(win: &WindowInstance) -> Vec<RegistrationWarning> {
     let mut warnings = Vec::new();
     if !win.has_taskbar_button {
         warnings.push(RegistrationWarning::NoTaskbarButton);
     }
     if win.is_elevated {
         warnings.push(RegistrationWarning::ElevatedProcess);
-    }
-    if let Some(target_mon) = target_monitor_id {
-        if win.monitor_id != target_mon {
-            warnings.push(RegistrationWarning::OutsideTargetMonitor {
-                window_monitor: win.monitor_id.clone(),
-            });
-        }
     }
     // Check if title contains account-like numbers (4+ consecutive digits) or dynamic separator (` - `)
     let has_digits = win

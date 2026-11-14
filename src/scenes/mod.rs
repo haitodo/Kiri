@@ -9,8 +9,15 @@ pub mod switch;
 mod tests {
     use super::bindings::BindingResolver;
     use super::manager::{SceneState, SceneStateManager};
-    use super::switch::{execute_scene_switch, preview_scene_switch, verify_switch_results, SwitchWarning};
-    use crate::config::{AppConfig, MonitorPolicy, RectData, Scene, TitleRule, WindowBinding, WindowMatch};
+    use super::switch::{
+        execute_scene_switch, preview_scene_switch, verify_switch_results, SwitchSource,
+        SwitchWarning,
+    };
+    use crate::app::AppController;
+    use crate::config::{
+        AppConfig, ConfigManager, MonitorPolicy, RectData, Scene, SceneVariant, TargetConfig,
+        TitleRule, WindowBinding, WindowMatch,
+    };
     use crate::platform::fake::FakeWindowSystem;
     use crate::platform::hooks::{MinimizeEvent, MinimizeEventKind};
     use crate::platform::{ShowCmd, WindowInstance, WindowRaise, WindowSystem};
@@ -85,6 +92,7 @@ mod tests {
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string()],
+                scene_variants: Default::default(),
                 always_visible: false,
                 enabled: true,
             },
@@ -99,6 +107,7 @@ mod tests {
                 },
                 instance_hint: None,
                 scene_ids: vec!["code".to_string()],
+                scene_variants: Default::default(),
                 always_visible: false,
                 enabled: true,
             },
@@ -113,11 +122,142 @@ mod tests {
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string(), "code".to_string()],
+                scene_variants: Default::default(),
                 always_visible: false,
                 enabled: true,
             },
         ];
         cfg
+    }
+
+    #[test]
+    fn switching_variants_uses_the_destination_scene_monitor_and_remembers_the_choice() {
+        let folder = test_journal_path("variants").with_extension("");
+        let mut config = AppConfig::default_initial();
+        let dev = config
+            .scenes
+            .iter_mut()
+            .find(|scene| scene.id == "code")
+            .unwrap();
+        dev.target = Some(TargetConfig {
+            monitor_policy: MonitorPolicy::Fixed,
+            monitor_id: Some("MON-1-PRIMARY".into()),
+        });
+        dev.variants = vec![
+            SceneVariant {
+                id: "antigravity".into(),
+                name: "Antigravity".into(),
+            },
+            SceneVariant {
+                id: "codex".into(),
+                name: "Codex".into(),
+            },
+        ];
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        let mut vm = crate::settings::SettingsViewModel::build(&config, &sys, None);
+        let left = "MON-1-PRIMARY";
+        let right = "MON-2-TARGET";
+        for (hwnd, exe, monitor, scene, variant) in [
+            (
+                1,
+                r"C:\Apps\Antigravity.exe",
+                left,
+                "code",
+                Some("antigravity"),
+            ),
+            (2, r"C:\Apps\Codex.exe", left, "code", Some("codex")),
+            (3, r"C:\Apps\Terminal.exe", left, "code", None),
+            (4, r"C:\Apps\Docs.exe", right, "web", None),
+        ] {
+            let window = make_win(hwnd, hwnd as u32, exe, "Test", exe, monitor);
+            sys.add_window(window.clone());
+            vm.refresh_candidates(&sys);
+            vm.add_window_to_scene(&window, scene, variant);
+        }
+        vm.config_draft.bindings.last_mut().unwrap().instance_hint = None;
+        let config_mgr = ConfigManager::new(folder.join("config.json"));
+        config_mgr.save(&vm.config_draft).unwrap();
+        let mut app = AppController::new(
+            config_mgr,
+            RecoveryManager::new(folder.join("journal.json")),
+            Box::new(sys),
+        );
+
+        let web = app.switch_to_scene("web", None, SwitchSource::Unspecified);
+        assert!(web.switched);
+        assert_eq!(web.minimized_hwnds.len(), 3);
+        let preview = preview_scene_switch(
+            "code",
+            Some("codex"),
+            &app.config,
+            BindingResolver::new(),
+            &app.recovery,
+            &*app.sys,
+            Some(right),
+        );
+        let mut restored: Vec<_> = preview.restore.iter().map(|win| win.hwnd).collect();
+        restored.sort_unstable();
+        assert_eq!(restored, [2, 3]);
+        assert!(preview
+            .unchanged
+            .iter()
+            .any(|(win, reason)| win.hwnd == 4 && *reason == "操作する画面の外"));
+        assert!(preview.minimize.is_empty());
+
+        let codex = app.switch_to_scene("code", Some("codex"), SwitchSource::Unspecified);
+        assert_eq!(codex.restored_hwnds.len(), 2);
+        assert!(!app.sys.query_window(4).unwrap().is_iconic);
+        assert!(app.state_mgr.is_already_active("code", Some("codex")));
+        assert!(app.save_active_scene_layout());
+        let antigravity =
+            app.switch_to_scene("code", Some("antigravity"), SwitchSource::Unspecified);
+        assert_eq!(antigravity.minimized_hwnds, [2]);
+        assert_eq!(antigravity.restored_hwnds, [1]);
+        assert!(!app.sys.query_window(3).unwrap().is_iconic);
+        assert!(!app.sys.query_window(4).unwrap().is_iconic);
+        assert!(app.save_active_scene_layout());
+        assert_eq!(app.config.layouts.len(), 1);
+        assert_eq!(app.config.layouts[0].monitor_id, left);
+        assert_eq!(app.config.layouts[0].entries.len(), 3);
+        assert_eq!(app.restore_active_scene_layout(), 2);
+
+        assert!(
+            app.switch_to_scene("web", None, SwitchSource::Unspecified)
+                .switched
+        );
+        let back = app.switch_to_scene("code", None, SwitchSource::Unspecified);
+        assert!(back.restored_hwnds.contains(&1));
+        assert!(!back.restored_hwnds.contains(&2));
+        assert!(
+            app.switch_to_scene("code", None, SwitchSource::Unspecified)
+                .was_noop_same_scene
+        );
+        let loaded = app.config_mgr.load();
+        assert_eq!(
+            loaded
+                .scene("code")
+                .unwrap()
+                .preferred_variant()
+                .unwrap()
+                .id,
+            "antigravity"
+        );
+
+        let disconnected = app
+            .config
+            .scenes
+            .iter_mut()
+            .find(|scene| scene.id == "code")
+            .unwrap();
+        disconnected.target.as_mut().unwrap().monitor_id = Some("missing".into());
+        let unavailable = app.switch_to_scene("code", Some("codex"), SwitchSource::Unspecified);
+        assert!(!unavailable.switched);
+        assert!(matches!(
+            &unavailable.warnings[..],
+            [SwitchWarning::TargetMonitorDisconnected { .. }]
+        ));
+        assert!(app.state_mgr.is_already_active("code", Some("antigravity")));
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
@@ -187,7 +327,7 @@ mod tests {
         assert!(out.switched);
         assert_eq!(out.minimized_hwnds, vec![20]);
         assert!(out.restored_hwnds.is_empty());
-        assert_eq!(*state_mgr.state(), SceneState::Active("code".to_string()));
+        assert!(state_mgr.is_already_active("code", None));
 
         // Verify Monitor 1 Edge and Monitor 2 unregistered Notepad are not iconic
         assert!(!sys.query_window(10).unwrap().is_iconic);
@@ -337,6 +477,7 @@ mod tests {
             },
             instance_hint: None,
             scene_ids: vec!["trade".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         });
@@ -395,7 +536,8 @@ mod tests {
         assert!(sys.query_window(70).unwrap().is_iconic);
 
         let actions_before = recovery.actions().clone();
-        let preview = preview_scene_switch("trade", &cfg, resolver.clone(), &recovery, &sys, None);
+        let preview =
+            preview_scene_switch("trade", None, &cfg, resolver.clone(), &recovery, &sys, None);
         let mut planned_restore: Vec<_> = preview.restore.iter().map(|win| win.hwnd).collect();
         planned_restore.sort_unstable();
         assert_eq!(planned_restore, [20, 70]);
@@ -406,8 +548,16 @@ mod tests {
         assert_eq!(*recovery.actions(), actions_before);
 
         cfg.launcher.restore_all_on_switch = false;
-        let preview = preview_scene_switch("trade", &cfg, resolver.clone(), &recovery, &sys, None);
-        assert_eq!(preview.restore.iter().map(|win| win.hwnd).collect::<Vec<_>>(), [70]);
+        let preview =
+            preview_scene_switch("trade", None, &cfg, resolver.clone(), &recovery, &sys, None);
+        assert_eq!(
+            preview
+                .restore
+                .iter()
+                .map(|win| win.hwnd)
+                .collect::<Vec<_>>(),
+            [70]
+        );
         assert!(preview.unchanged.iter().any(|(win, _)| win.hwnd == 20));
         cfg.launcher.restore_all_on_switch = true;
 
@@ -578,6 +728,7 @@ mod tests {
             },
             instance_hint: None,
             scene_ids: vec!["web".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         });
@@ -732,11 +883,46 @@ mod tests {
         let mut cfg = setup_standard_config();
         cfg.launcher.visible_slots = 3;
         cfg.scenes = vec![
-            Scene { id: "s1".to_string(), name: "S1".to_string(), icon: "chart".to_string(), order: 1, pinned: true },
-            Scene { id: "s2".to_string(), name: "S2".to_string(), icon: "code".to_string(), order: 2, pinned: true },
-            Scene { id: "s3".to_string(), name: "S3".to_string(), icon: "globe".to_string(), order: 3, pinned: true },
-            Scene { id: "s4".to_string(), name: "S4".to_string(), icon: "chart".to_string(), order: 4, pinned: true },
-            Scene { id: "s5".to_string(), name: "S5".to_string(), icon: "chart".to_string(), order: 5, pinned: false },
+            Scene {
+                id: "s1".to_string(),
+                name: "S1".to_string(),
+                icon: "chart".to_string(),
+                order: 1,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "s2".to_string(),
+                name: "S2".to_string(),
+                icon: "code".to_string(),
+                order: 2,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "s3".to_string(),
+                name: "S3".to_string(),
+                icon: "globe".to_string(),
+                order: 3,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "s4".to_string(),
+                name: "S4".to_string(),
+                icon: "chart".to_string(),
+                order: 4,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "s5".to_string(),
+                name: "S5".to_string(),
+                icon: "chart".to_string(),
+                order: 5,
+                pinned: false,
+                ..Scene::default()
+            },
         ];
         let (visible, overflow) = cfg.split_visible_and_overflow();
         assert_eq!(visible.len(), 3);
@@ -853,9 +1039,30 @@ mod tests {
         assert_eq!(cfg.target.monitor_policy, MonitorPolicy::AllMonitors);
 
         cfg.scenes = vec![
-            Scene { id: "workspaceA".to_string(), name: "Workspace A".to_string(), icon: "chart".to_string(), order: 1, pinned: true },
-            Scene { id: "workspaceB".to_string(), name: "Workspace B".to_string(), icon: "code".to_string(), order: 2, pinned: true },
-            Scene { id: "workspaceC".to_string(), name: "Workspace C".to_string(), icon: "globe".to_string(), order: 3, pinned: true },
+            Scene {
+                id: "workspaceA".to_string(),
+                name: "Workspace A".to_string(),
+                icon: "chart".to_string(),
+                order: 1,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "workspaceB".to_string(),
+                name: "Workspace B".to_string(),
+                icon: "code".to_string(),
+                order: 2,
+                pinned: true,
+                ..Scene::default()
+            },
+            Scene {
+                id: "workspaceC".to_string(),
+                name: "Workspace C".to_string(),
+                icon: "globe".to_string(),
+                order: 3,
+                pinned: true,
+                ..Scene::default()
+            },
         ];
 
         // Dual monitor setup: MON-1-PRIMARY (Left) and MON-2-TARGET (Right)
@@ -880,17 +1087,17 @@ mod tests {
         let w201 = sys.query_window(201).unwrap();
         let w202 = sys.query_window(202).unwrap();
 
-        vm.bind_window_to_scene(&w101, "workspaceA", false);
-        vm.bind_window_to_scene(&w102, "workspaceA", false);
-        vm.bind_window_to_scene(&w201, "workspaceA", false);
+        vm.add_window_to_scene(&w101, "workspaceA", None);
+        vm.add_window_to_scene(&w102, "workspaceA", None);
+        vm.add_window_to_scene(&w201, "workspaceA", None);
 
         // Workspace B: Left = DevEditor(103), Right = Browser(201 shared with A -> only left monitor changes between A and B!)
-        vm.bind_window_to_scene(&w103, "workspaceB", false);
-        vm.bind_window_to_scene(&w201, "workspaceB", false);
+        vm.add_window_to_scene(&w103, "workspaceB", None);
+        vm.add_window_to_scene(&w201, "workspaceB", None);
 
         // Workspace C: Left = Edge(104), Right = Edge(202) -> both monitors change!
-        vm.bind_window_to_scene(&w104, "workspaceC", false);
-        vm.bind_window_to_scene(&w202, "workspaceC", false);
+        vm.add_window_to_scene(&w104, "workspaceC", None);
+        vm.add_window_to_scene(&w202, "workspaceC", None);
 
         cfg = vm.config_draft;
 
@@ -1270,6 +1477,7 @@ mod tests {
             },
             instance_hint: None,
             scene_ids: vec!["trade".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         });
@@ -1284,6 +1492,7 @@ mod tests {
             },
             instance_hint: None,
             scene_ids: vec!["trade".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         });

@@ -14,9 +14,9 @@
 
 mod trace;
 
-use self::trace::{binding_event, window_state, PresentationPhase, SwitchTrace};
 pub use self::trace::SwitchSource;
-use crate::config::AppConfig;
+use self::trace::{binding_event, window_state, PresentationPhase, SwitchTrace};
+use crate::config::{AppConfig, MonitorPolicy, Scene, TargetConfig};
 use crate::diagnostics::{log_info, log_warn, mask_title};
 use crate::platform::{ShowCmd, WindowInstance, WindowRaise, WindowSystem};
 use crate::recovery::RecoveryManager;
@@ -33,6 +33,8 @@ pub enum SwitchWarning {
     TargetMonitorDisconnected { monitor_id: String },
     /// Requested scene ID does not exist in configuration.
     SceneNotFound { scene_id: String },
+    /// Requested variant no longer exists in the scene.
+    SceneVariantNotFound { scene_id: String },
     /// Multiple windows on the target monitor matched a binding without disambiguation (AT-10).
     AmbiguousBindingSameMonitor {
         binding_id: String,
@@ -128,21 +130,47 @@ pub struct SwitchOutcome {
     pub verification: Option<PendingVerification>,
 }
 
-/// Determine the effective target monitor ID based on `config.target` and current launcher monitor.
+/// Resolve a target monitor ID. For all-monitor scenes, this ID is only used for the launcher profile.
 pub fn resolve_effective_target_monitor_id(
-    config: &AppConfig,
+    target: &TargetConfig,
     launcher_monitor_id: Option<&str>,
 ) -> Option<String> {
-    match config.target.monitor_policy {
-        crate::config::MonitorPolicy::AllMonitors => launcher_monitor_id
+    match target.monitor_policy {
+        MonitorPolicy::AllMonitors => launcher_monitor_id
             .map(|s| s.to_string())
-            .or_else(|| config.target.monitor_id.clone())
+            .or_else(|| target.monitor_id.clone())
             .or_else(|| Some("ALL_MONITORS".to_string())),
-        crate::config::MonitorPolicy::Fixed => config.target.monitor_id.clone(),
-        crate::config::MonitorPolicy::LauncherMonitor => launcher_monitor_id
+        MonitorPolicy::Fixed => target.monitor_id.clone(),
+        MonitorPolicy::LauncherMonitor => launcher_monitor_id
             .map(|s| s.to_string())
-            .or_else(|| config.target.monitor_id.clone()),
+            .or_else(|| target.monitor_id.clone()),
     }
+}
+
+fn resolve_scene_selection<'a>(
+    config: &'a AppConfig,
+    scene_id: &str,
+    variant_id: Option<&str>,
+) -> Result<(&'a Scene, Option<&'a str>), SwitchWarning> {
+    let scene = config
+        .scene(scene_id)
+        .ok_or_else(|| SwitchWarning::SceneNotFound {
+            scene_id: scene_id.to_owned(),
+        })?;
+    let variant = if let Some(id) = variant_id {
+        Some(
+            scene
+                .variants
+                .iter()
+                .find(|variant| variant.id == id)
+                .ok_or_else(|| SwitchWarning::SceneVariantNotFound {
+                    scene_id: scene_id.to_owned(),
+                })?,
+        )
+    } else {
+        scene.preferred_variant()
+    };
+    Ok((scene, variant.map(|variant| variant.id.as_str())))
 }
 
 /// Rank a binding by specificity so that specific rules (cached HWND, title keyword, monitor ID)
@@ -188,6 +216,7 @@ pub fn execute_scene_switch(
 ) -> SwitchOutcome {
     execute_scene_switch_from(
         next_scene_id,
+        None,
         config,
         state_mgr,
         resolver,
@@ -217,6 +246,7 @@ pub struct SwitchPreview {
 
 pub fn preview_scene_switch(
     next_scene_id: &str,
+    variant_id: Option<&str>,
     config: &AppConfig,
     mut resolver: BindingResolver,
     recovery: &RecoveryManager,
@@ -228,7 +258,20 @@ pub fn preview_scene_switch(
         input_tick: None,
         preview: true,
     };
-    match plan_scene_switch(next_scene_id, config, &mut resolver, recovery, sys, launcher_monitor_id, context) {
+    let plan =
+        resolve_scene_selection(config, next_scene_id, variant_id).and_then(|(scene, variant)| {
+            plan_scene_switch(
+                scene,
+                variant,
+                config,
+                &mut resolver,
+                recovery,
+                sys,
+                launcher_monitor_id,
+                context,
+            )
+        });
+    match plan {
         Ok(plan) => SwitchPreview {
             restore: plan.to_restore.into_iter().map(|(_, win, _)| win).collect(),
             minimize: plan.to_minimize.into_iter().map(|(_, win)| win).collect(),
@@ -251,7 +294,8 @@ struct PlanContext<'a> {
 }
 
 fn plan_scene_switch(
-    next_scene_id: &str,
+    scene: &Scene,
+    variant_id: Option<&str>,
     config: &AppConfig,
     resolver: &mut BindingResolver,
     recovery: &RecoveryManager,
@@ -264,17 +308,18 @@ fn plan_scene_switch(
     let mut stale_actions = Vec::new();
     let mut unchanged = Vec::new();
 
-    if !config.scenes.iter().any(|s| s.id == next_scene_id) {
-        return Err(SwitchWarning::SceneNotFound { scene_id: next_scene_id.to_string() });
-    }
-
-    let is_all_monitors = config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors;
+    let target = scene.target(&config.target);
+    let in_selection = |binding: &crate::config::WindowBinding| {
+        binding.belongs_to_selection(&scene.id, variant_id)
+    };
+    let is_all_monitors = target.monitor_policy == MonitorPolicy::AllMonitors;
+    let mut outside_resolver = (preview && !is_all_monitors).then(BindingResolver::new);
     let monitors = sys.monitors();
     let connected_monitor_ids: Vec<String> = monitors.iter().map(|m| m.monitor_id.clone()).collect();
     let target_mon_id = if is_all_monitors {
         "ALL_MONITORS".to_string()
     } else {
-        let mon_id = resolve_effective_target_monitor_id(config, launcher_monitor_id)
+        let mon_id = resolve_effective_target_monitor_id(target, launcher_monitor_id)
             .ok_or(SwitchWarning::TargetMonitorNotConfigured)?;
         if !connected_monitor_ids.contains(&mon_id) {
             return Err(SwitchWarning::TargetMonitorDisconnected { monitor_id: mon_id });
@@ -304,7 +349,7 @@ fn plan_scene_switch(
     for binding in &config.bindings {
         if binding.enabled {
             ordered_bindings.push(binding);
-        } else if trace.is_enabled() && binding.scene_ids.iter().any(|id| id == next_scene_id) {
+        } else if trace.is_enabled() && in_selection(binding) {
             trace.record("binding", || {
                 json!({
                     "binding": binding.id,
@@ -318,7 +363,7 @@ fn plan_scene_switch(
     ordered_bindings.sort_by_key(|b| binding_specificity_rank(b, resolver));
 
     for binding in ordered_bindings {
-        let in_next = binding.scene_ids.iter().any(|id| id == next_scene_id);
+        let in_next = in_selection(binding);
         let resolution = if is_all_monitors {
             resolver.resolve_binding_multi_monitor(
                 binding,
@@ -364,7 +409,22 @@ fn plan_scene_switch(
                     target_hwnd: target_candidate.hwnd,
                 });
             }
-            BindingResolution::NotFound => {}
+            BindingResolution::NotFound => {
+                if let Some(outside_resolver) = &mut outside_resolver {
+                    if let BindingResolution::Resolved(win) = outside_resolver
+                        .resolve_binding_multi_monitor(
+                            binding,
+                            &all_windows,
+                            &connected_monitor_ids,
+                            &claimed_hwnds,
+                        )
+                    {
+                        if win.monitor_id != target_mon_id {
+                            unchanged.push((win, "操作する画面の外"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -482,7 +542,7 @@ fn plan_scene_switch(
         if !binding.enabled || binding.always_visible {
             continue;
         }
-        if !binding.scene_ids.iter().any(|id| id == next_scene_id) {
+        if !in_selection(binding) {
             continue;
         }
 
@@ -535,9 +595,12 @@ fn plan_scene_switch(
     }
 
     if preview {
-        let mut seen: HashSet<u64> = unchanged.iter().map(|(win, _)| win.hwnd)
-            .chain(to_minimize.iter().map(|(_, win)| win.hwnd))
-            .chain(to_restore.iter().map(|(_, win, _)| win.hwnd)).collect();
+        let mut seen: HashSet<u64> = to_minimize
+            .iter()
+            .map(|(_, win)| win.hwnd)
+            .chain(to_restore.iter().map(|(_, win, _)| win.hwnd))
+            .collect();
+        unchanged.retain(|(win, _)| seen.insert(win.hwnd));
         for (_, win, in_next, always_visible) in resolved_bindings {
             if seen.insert(win.hwnd) {
                 let reason = if always_visible { "常に表示" }
@@ -556,6 +619,7 @@ fn plan_scene_switch(
 
 pub fn execute_scene_switch_from(
     next_scene_id: &str,
+    requested_variant_id: Option<&str>,
     config: &AppConfig,
     state_mgr: &mut SceneStateManager,
     resolver: &mut BindingResolver,
@@ -566,37 +630,65 @@ pub fn execute_scene_switch_from(
 ) -> SwitchOutcome {
     let input_tick = sys.last_input_tick();
     let trace = SwitchTrace::new();
+    let selection = resolve_scene_selection(config, next_scene_id, requested_variant_id);
+    let variant_id = selection.as_ref().ok().and_then(|(_, variant)| *variant);
+    let target = config
+        .scene(next_scene_id)
+        .map_or(&config.target, |scene| scene.target(&config.target));
     trace.record("started", || {
         json!({
             "from_scene": state_mgr.active_scene_id(),
+            "from_variant": state_mgr.active_variant_id(),
             "to_scene": next_scene_id,
+            "to_variant": variant_id,
             "source": source,
-            "monitor_policy": config.target.monitor_policy,
-            "configured_monitor": config.target.monitor_id,
+            "monitor_policy": target.monitor_policy,
+            "configured_monitor": target.monitor_id,
             "launcher_monitor": launcher_monitor_id,
             "focus_on_switch": config.launcher.focus_on_switch,
             "restore_all_on_switch": config.launcher.restore_all_on_switch,
             "foreground": sys.foreground_state(),
         })
     });
-    let already_active = state_mgr.is_already_active(next_scene_id);
+    let already_active = state_mgr.is_already_active(next_scene_id, variant_id);
     let context = PlanContext { trace: &trace, input_tick, preview: false };
-    let SwitchPlan { target_mon_id, to_minimize, mut to_restore, mut to_bring_to_front, warnings, stale_actions, .. } =
-        match plan_scene_switch(next_scene_id, config, resolver, recovery, sys, launcher_monitor_id, context) {
-            Ok(plan) => plan,
-            Err(warning) => {
-                let was_noop_same_scene = already_active && !matches!(warning, SwitchWarning::SceneNotFound { .. });
-                trace.record("finished", || json!({"reason": format!("{warning:?}"), "already_active": already_active}));
-                return SwitchOutcome {
-                    was_noop_same_scene,
-                    switched: false,
-                    minimized_hwnds: Vec::new(),
-                    restored_hwnds: Vec::new(),
-                    warnings: if was_noop_same_scene { Vec::new() } else { vec![warning] },
-                    verification: None,
-                };
-            }
-        };
+    let plan = selection.and_then(|(scene, variant)| {
+        plan_scene_switch(
+            scene,
+            variant,
+            config,
+            resolver,
+            recovery,
+            sys,
+            launcher_monitor_id,
+            context,
+        )
+    });
+    let SwitchPlan {
+        target_mon_id,
+        to_minimize,
+        mut to_restore,
+        mut to_bring_to_front,
+        warnings,
+        stale_actions,
+        ..
+    } = match plan {
+        Ok(plan) => plan,
+        Err(warning) => {
+            trace.record(
+                "finished",
+                || json!({"reason": format!("{warning:?}"), "already_active": already_active}),
+            );
+            return SwitchOutcome {
+                was_noop_same_scene: false,
+                switched: false,
+                minimized_hwnds: Vec::new(),
+                restored_hwnds: Vec::new(),
+                warnings: vec![warning],
+                verification: None,
+            };
+        }
+    };
     for hwnd in stale_actions {
         recovery.invalidate_hwnd(hwnd);
     }
@@ -760,6 +852,14 @@ pub fn execute_scene_switch_from(
     // in bottom-to-top order so they appear above previously open/unregistered apps,
     // and activate the topmost window so it doesn't get obscured behind active apps.
     scene_windows.append(&mut to_bring_to_front);
+    if target_mon_id != "ALL_MONITORS" {
+        scene_windows.retain(|(win, _)| {
+            sys.query_window(win.hwnd).is_some_and(|live| {
+                stays_on_target(win, &live)
+                    && live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
+            })
+        });
+    }
     scene_windows.sort_by_key(|(_, z)| std::cmp::Reverse(*z));
     let scene_windows: Vec<_> = scene_windows.iter().map(|(win, _)| win).collect();
     for win in scene_windows.iter().filter(|win| !win.is_hung) {
@@ -806,7 +906,7 @@ pub fn execute_scene_switch_from(
     let _ = recovery.persist_journal();
 
     // Step 9: Confirm `state = Active(next)`
-    state_mgr.set_active(next_scene_id.to_string());
+    state_mgr.set_active(next_scene_id, variant_id);
     if !warnings.is_empty() || trace.is_enabled() {
         log_info(
             "switch",
@@ -1163,7 +1263,7 @@ pub fn format_switch_warnings(
         .iter()
         .map(|w| match w {
             SwitchWarning::TargetMonitorNotConfigured => {
-                "操作する画面が設定されていません。「ウィンドウの動作」で対象の画面を選んでください。".to_string()
+                "切り替える画面を設定してください。「シーン」または「ウィンドウの動作」から選べます。".to_string()
             }
             SwitchWarning::TargetMonitorDisconnected { monitor_id } => {
                 format!(
@@ -1173,6 +1273,11 @@ pub fn format_switch_warnings(
             }
             SwitchWarning::SceneNotFound { scene_id } => {
                 format!("指定されたシーン ID ({}) が見つかりませんでした。", scene_id)
+            }
+            SwitchWarning::SceneVariantNotFound { scene_id } => {
+                let name = scenes.iter().find(|scene| &scene.id == scene_id)
+                    .map_or(scene_id.as_str(), |scene| scene.name.as_str());
+                format!("「{name}」で選んだ構成が見つかりませんでした。")
             }
             SwitchWarning::AmbiguousBindingSameMonitor {
                 binding_id,
@@ -1270,6 +1375,7 @@ mod format_warning_tests {
             },
             instance_hint: None,
             scene_ids: vec!["code".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         }];
@@ -1279,6 +1385,7 @@ mod format_warning_tests {
             icon: "code".to_string(),
             pinned: true,
             order: 0,
+            ..Scene::default()
         }];
         let warnings = vec![
             SwitchWarning::AmbiguousBindingSameMonitor {

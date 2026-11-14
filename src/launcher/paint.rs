@@ -376,8 +376,7 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
 
         // Scene button backgrounds
         for (idx, slot) in state.layout.scene_buttons.iter().enumerate() {
-            let is_active =
-                matches!(state.scene_state, SceneState::Active(id) if id == &slot.scene.id);
+            let is_active = matches!(state.scene_state, SceneState::Active { scene_id, .. } if scene_id == &slot.scene.id);
             let is_last_hint = matches!(state.scene_state, SceneState::Unknown)
                 && state.last_known_scene_id == Some(slot.scene.id.as_str());
             let is_hovered = matches!(
@@ -399,6 +398,19 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
                 is_last_hint,
                 dpi,
             );
+            if let Some(rect) = slot.variants_rect {
+                draw_button_bg_gdiplus(
+                    graphics,
+                    &rect,
+                    btn_radius,
+                    is_active,
+                    matches!(state.hovered, HitTarget::SceneVariants { index, .. } if *index == idx),
+                    matches!(state.pressed, HitTarget::SceneVariants { index, .. } if *index == idx),
+                    false,
+                    dpi,
+                );
+                draw_variant_arrow(graphics, rect, colors::TEXT_PRIMARY_ARGB, dpi);
+            }
         }
 
         // Overflow button background
@@ -423,8 +435,7 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
 
         // Scene icons
         for slot in &state.layout.scene_buttons {
-            let is_active =
-                matches!(state.scene_state, SceneState::Active(id) if id == &slot.scene.id);
+            let is_active = matches!(state.scene_state, SceneState::Active { scene_id, .. } if scene_id == &slot.scene.id);
             draw_scene_icon(
                 graphics,
                 theme,
@@ -569,6 +580,24 @@ unsafe fn draw_button_bg_gdiplus(
             bar_h / 2.0,
             colors::SUBTLE_HINT_ARGB,
         );
+    }
+}
+
+#[cfg(windows)]
+pub(super) unsafe fn draw_variant_arrow(
+    graphics: *mut GpGraphics,
+    rect: RectData,
+    color: u32,
+    dpi: u32,
+) {
+    let x = (rect.left + rect.right) as f32 / 2.0;
+    let y = (rect.top + rect.bottom) as f32 / 2.0;
+    let size = dip_to_px(3, dpi) as f32;
+    let mut pen = std::ptr::null_mut();
+    if GdipCreatePen1(color, (size / 2.0).max(1.0), UnitPixel, &mut pen) == GpOk {
+        let _ = GdipDrawLine(graphics, pen, x - size, y - size / 2.0, x, y + size / 2.0);
+        let _ = GdipDrawLine(graphics, pen, x, y + size / 2.0, x + size, y - size / 2.0);
+        let _ = GdipDeletePen(pen);
     }
 }
 

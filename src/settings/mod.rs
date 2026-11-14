@@ -6,7 +6,8 @@ pub mod window;
 pub use editor::SettingsPage;
 
 use crate::config::{
-    AppConfig, InstanceHint, MonitorPolicy, TitleRule, TitleRuleType, WindowBinding, WindowMatch,
+    AppConfig, InstanceHint, MonitorPolicy, TargetConfig, TitleRule, TitleRuleType, WindowBinding,
+    WindowMatch,
 };
 use crate::platform::{MonitorInfoData, WindowInstance, WindowSystem};
 use crate::scenes::bindings::{
@@ -93,9 +94,8 @@ impl SettingsViewModel {
     }
 
     pub fn refresh_annotations(&mut self) {
-        let target = self.target_monitor();
         for row in &mut self.candidate_windows {
-            row.warnings = evaluate_registration_warnings(&row.instance, target.as_deref());
+            row.warnings = evaluate_registration_warnings(&row.instance);
         }
         self.sync_binding_annotations();
         self.sync_binding_rows();
@@ -105,11 +105,11 @@ impl SettingsViewModel {
         self.launcher_monitor_id = launcher_monitor_id.map(str::to_owned);
     }
 
-    pub fn target_monitor(&self) -> Option<String> {
-        (self.config_draft.target.monitor_policy != MonitorPolicy::AllMonitors)
+    pub fn target_monitor(&self, target: &TargetConfig) -> Option<String> {
+        (target.monitor_policy != MonitorPolicy::AllMonitors)
             .then(|| {
                 crate::scenes::switch::resolve_effective_target_monitor_id(
-                    &self.config_draft,
+                    target,
                     self.launcher_monitor_id.as_deref(),
                 )
             })
@@ -202,7 +202,13 @@ impl SettingsViewModel {
                         })
                         .unwrap_or(false)
             }) {
-                row.bound_scene_ids = b.scene_ids.clone();
+                row.bound_scene_ids = self
+                    .config_draft
+                    .scenes
+                    .iter()
+                    .filter(|scene| b.belongs_to_scene(&scene.id))
+                    .map(|scene| scene.id.clone())
+                    .collect();
                 row.existing_binding_id = Some(b.id.clone());
                 row.always_visible = b.always_visible;
                 claimed_binding_ids.insert(b.id.clone());
@@ -247,7 +253,13 @@ impl SettingsViewModel {
                     .iter_mut()
                     .find(|row| row.instance.hwnd == win.hwnd)
                 {
-                    row.bound_scene_ids = binding.scene_ids.clone();
+                    row.bound_scene_ids = self
+                        .config_draft
+                        .scenes
+                        .iter()
+                        .filter(|scene| binding.belongs_to_scene(&scene.id))
+                        .map(|scene| scene.id.clone())
+                        .collect();
                     row.existing_binding_id = Some(binding.id.clone());
                     row.always_visible = binding.always_visible;
                     claimed.insert(win.hwnd);
@@ -256,18 +268,12 @@ impl SettingsViewModel {
         }
     }
 
-    /// Register or update a `WindowInstance` into `scene_id` with default options.
-    pub fn bind_window_to_scene(
+    pub fn add_window_to_scene(
         &mut self,
         win: &WindowInstance,
         scene_id: &str,
-        always_visible: bool,
-    ) -> String {
-        let suggested_kw = self.suggest_default_title_keyword(win);
-        self.bind_window_to_scene_with_options(win, scene_id, always_visible, suggested_kw, true)
-    }
-
-    pub fn add_window_to_scene(&mut self, win: &WindowInstance, scene_id: &str) {
+        variant: Option<&str>,
+    ) {
         let existing = self
             .candidate_windows
             .iter()
@@ -279,21 +285,22 @@ impl SettingsViewModel {
             .iter_mut()
             .find(|binding| Some(binding.id.as_str()) == existing)
         {
-            if !binding.scene_ids.iter().any(|id| id == scene_id) {
-                binding.scene_ids.push(scene_id.into());
-                self.sync_binding_annotations();
-                self.sync_binding_rows();
-            }
+            binding.add_to_scene(scene_id, variant);
         } else {
-            self.bind_window_to_scene(win, scene_id, false);
+            let keyword = self.suggest_default_title_keyword(win);
+            self.bind_window_to_scene_with_options(win, scene_id, variant, false, keyword, true);
+            return;
         }
+        self.sync_binding_annotations();
+        self.sync_binding_rows();
     }
 
     /// Register or update a `WindowInstance` into `scene_id` with explicit title keyword and monitor pinning.
-    pub fn bind_window_to_scene_with_options(
+    fn bind_window_to_scene_with_options(
         &mut self,
         win: &WindowInstance,
         scene_id: &str,
+        variant: Option<&str>,
         always_visible: bool,
         custom_title_keyword: Option<String>,
         pin_to_monitor: bool,
@@ -331,9 +338,7 @@ impl SettingsViewModel {
                 .unwrap_or(false);
             b.enabled && (exact_hwnd || synced_binding_id.as_deref() == Some(b.id.as_str()))
         }) {
-            if !existing.scene_ids.iter().any(|s| s == scene_id) {
-                existing.scene_ids.push(scene_id.to_string());
-            }
+            existing.add_to_scene(scene_id, variant);
             existing.match_rule.title_rule = title_rule;
             existing.match_rule.monitor_id = monitor_id_rule;
             existing.instance_hint = Some(InstanceHint {
@@ -385,7 +390,7 @@ impl SettingsViewModel {
                 .find(|id| self.config_draft.bindings.iter().all(|b| &b.id != id))
                 .unwrap()
         };
-        let binding = WindowBinding {
+        let mut binding = WindowBinding {
             id: binding_id.clone(),
             match_rule: WindowMatch {
                 exe_path: win.exe_path.clone(),
@@ -401,10 +406,12 @@ impl SettingsViewModel {
                 last_monitor_id: Some(win.monitor_id.clone()),
                 disambiguator: Some("confirmed_target_monitor".to_string()),
             }),
-            scene_ids: vec![scene_id.to_string()],
+            scene_ids: Vec::new(),
+            scene_variants: Default::default(),
             always_visible,
             enabled: true,
         };
+        binding.add_to_scene(scene_id, variant);
         self.config_draft.bindings.push(binding);
         self.sync_binding_annotations();
         self.sync_binding_rows();
@@ -412,18 +419,27 @@ impl SettingsViewModel {
     }
 
     /// Stop managing an ordinary binding when its last scene is removed.
-    pub fn unbind_window_from_scene(&mut self, binding_id: &str, scene_id: &str) {
+    pub fn unbind_window_from_scene(
+        &mut self,
+        binding_id: &str,
+        scene_id: &str,
+        variant: Option<&str>,
+    ) {
         if let Some(b) = self
             .config_draft
             .bindings
             .iter_mut()
             .find(|b| b.id == binding_id)
         {
-            b.scene_ids.retain(|s| s != scene_id);
+            b.remove_from_scene(scene_id, variant);
+            if b.belongs_to_scene(scene_id) {
+                self.refresh_annotations();
+                return;
+            }
         }
         self.config_draft
             .bindings
-            .retain(|b| b.id != binding_id || !b.scene_ids.is_empty() || b.always_visible);
+            .retain(|b| b.id != binding_id || b.has_scene() || b.always_visible);
         for layout in self
             .config_draft
             .layouts
@@ -446,7 +462,6 @@ impl SettingsViewModel {
             .iter()
             .map(|c| c.instance.clone())
             .collect();
-        let target_mon_id = self.target_monitor();
         let monitor_ids: Vec<String> = self.monitors.iter().map(|m| m.monitor_id.clone()).collect();
         let mut resolver = crate::scenes::bindings::BindingResolver::new();
 
@@ -472,19 +487,12 @@ impl SettingsViewModel {
                     .cloned()
                     .collect();
 
-                let resolution = match (
-                    self.config_draft.target.monitor_policy,
-                    target_mon_id.as_deref(),
-                ) {
-                    (MonitorPolicy::AllMonitors, _) => resolver.resolve_binding_multi_monitor(
-                        b,
-                        &all_instances,
-                        &monitor_ids,
-                        &HashSet::new(),
-                    ),
-                    (_, Some(mon_id)) => resolver.resolve_binding(b, &all_instances, mon_id),
-                    _ => crate::scenes::bindings::BindingResolution::NotFound,
-                };
+                let resolution = resolver.resolve_binding_multi_monitor(
+                    b,
+                    &all_instances,
+                    &monitor_ids,
+                    &HashSet::new(),
+                );
                 match resolution {
                     crate::scenes::bindings::BindingResolution::AmbiguousSameMonitor(cands) => {
                         if !warnings
@@ -567,7 +575,13 @@ impl SettingsViewModel {
                 custom_title_keyword,
                 monitor_id,
                 monitor_label,
-                bound_scene_ids: b.scene_ids.clone(),
+                bound_scene_ids: self
+                    .config_draft
+                    .scenes
+                    .iter()
+                    .filter(|scene| b.belongs_to_scene(&scene.id))
+                    .map(|scene| scene.id.clone())
+                    .collect(),
                 always_visible: b.always_visible,
                 warnings,
                 ambiguous_candidates,
@@ -860,6 +874,7 @@ mod tests {
                 icon: "chart".to_string(),
                 order: 1,
                 pinned: true,
+                ..Scene::default()
             },
             Scene {
                 id: "code".to_string(),
@@ -867,6 +882,7 @@ mod tests {
                 icon: "code".to_string(),
                 order: 2,
                 pinned: true,
+                ..Scene::default()
             },
         ];
         config.bindings = vec![
@@ -887,6 +903,7 @@ mod tests {
                     disambiguator: None,
                 }),
                 scene_ids: vec!["trade".to_string()],
+                scene_variants: Default::default(),
                 always_visible: false,
                 enabled: true,
             },
@@ -901,6 +918,7 @@ mod tests {
                 },
                 instance_hint: None,
                 scene_ids: vec!["trade".to_string()],
+                scene_variants: Default::default(),
                 always_visible: true,
                 enabled: true,
             },
@@ -951,11 +969,11 @@ mod tests {
 
         let original_binding = vm.config_draft.bindings[0].clone();
         let existing = sys.query_window(0x100).unwrap();
-        vm.add_window_to_scene(&existing, "code");
+        vm.add_window_to_scene(&existing, "code", None);
         let mut shared = original_binding;
         shared.scene_ids.push("code".into());
         assert_eq!(vm.config_draft.bindings[0], shared);
-        vm.add_window_to_scene(&existing, "code");
+        vm.add_window_to_scene(&existing, "code", None);
         assert_eq!(vm.config_draft.bindings[0], shared);
         vm.toggle_scene_binding("bind-mt5", "code");
 
@@ -1008,6 +1026,7 @@ mod tests {
         let new_id = vm.bind_window_to_scene_with_options(
             &vscode_instance,
             "code",
+            None,
             false,
             Some("Kiri".to_string()),
             true,
@@ -1063,6 +1082,7 @@ mod tests {
             },
             instance_hint: None,
             scene_ids: vec!["code".to_string()],
+            scene_variants: Default::default(),
             always_visible: false,
             enabled: true,
         }];

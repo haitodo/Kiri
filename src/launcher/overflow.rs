@@ -9,15 +9,16 @@
 //! - Closes automatically on item selection, clicking `⋯` again, or a short one-shot timer after pointer leave.
 
 use crate::config::{RectData, Scene};
-use crate::launcher::input::CORNER_RADIUS_DIP;
+use crate::launcher::input::{CORNER_RADIUS_DIP, SCENE_VARIANT_BUTTON_DIP};
 use crate::launcher::paint::{
-    colors, draw_rounded_rect_border_gdiplus, draw_scene_icon, fill_rounded_rect_gdiplus,
-    GdiThemeCache, GdiplusContext,
+    colors, draw_rounded_rect_border_gdiplus, draw_scene_icon, draw_variant_arrow,
+    fill_rounded_rect_gdiplus, GdiThemeCache, GdiplusContext,
 };
 use crate::platform::monitors::dip_to_px;
 
 /// Custom message sent to the main launcher HWND when an overflow scene item is clicked.
 /// `WPARAM` contains the index into the current `overflow_scenes` list.
+/// `LPARAM` is 1 when the variant arrow was clicked.
 pub const WM_APP_OVERFLOW_SELECT: u32 = 0x8000 + 3; // WM_APP + 3
 
 const TIMER_OVERFLOW_MOUSE_CHECK: usize = 301;
@@ -70,7 +71,7 @@ pub struct OverflowPopup {
     scenes: Vec<Scene>,
     active_scene_id: Option<String>,
     hovered_idx: Option<usize>,
-    pressed_idx: Option<usize>,
+    pressed: Option<(usize, bool)>,
     tracking_leave: bool,
     dpi: u32,
     font_dpi: u32,
@@ -155,7 +156,7 @@ impl OverflowPopup {
                 scenes: Vec::new(),
                 active_scene_id: None,
                 hovered_idx: None,
-                pressed_idx: None,
+                pressed: None,
                 tracking_leave: false,
                 dpi: 96,
                 font_dpi: 96,
@@ -199,7 +200,7 @@ impl OverflowPopup {
         }
         self.visible = false;
         self.hovered_idx = None;
-        self.pressed_idx = None;
+        self.pressed = None;
         self.tracking_leave = false;
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_OVERFLOW_MOUSE_CHECK);
@@ -248,7 +249,7 @@ impl OverflowPopup {
             }
         }
         self.hovered_idx = None;
-        self.pressed_idx = None;
+        self.pressed = None;
         self.tracking_leave = false;
         self.visible = true;
 
@@ -286,6 +287,33 @@ impl OverflowPopup {
         } else {
             None
         }
+    }
+
+    fn variant_arrow_rect(&self, index: usize, width: i32) -> Option<RectData> {
+        if self.scenes[index].variants.len() < 2 {
+            return None;
+        }
+        let pad = dip_to_px(POPUP_PAD_DIP, self.dpi);
+        let height = dip_to_px(ROW_HEIGHT_DIP, self.dpi);
+        let right = width - pad;
+        let top = pad + index as i32 * height;
+        Some(RectData {
+            left: right - dip_to_px(SCENE_VARIANT_BUTTON_DIP, self.dpi),
+            top,
+            right,
+            bottom: top + height,
+        })
+    }
+
+    fn hit_test(&self, lparam: windows::Win32::Foundation::LPARAM) -> Option<(usize, bool)> {
+        let x = lparam.0 as i16 as i32;
+        let y = (lparam.0 >> 16) as i16 as i32;
+        let index = self.row_at_y(y)?;
+        let width = dip_to_px(POPUP_WIDTH_DIP, self.dpi);
+        let arrow = self
+            .variant_arrow_rect(index, width)
+            .is_some_and(|rect| crate::launcher::input::point_in_rect(x, y, &rect));
+        Some((index, arrow))
     }
 }
 
@@ -347,33 +375,31 @@ unsafe extern "system" fn overflow_wndproc(
             }
             WM_MOUSELEAVE => {
                 popup.tracking_leave = false;
-                if popup.hovered_idx.take().is_some() || popup.pressed_idx.take().is_some() {
+                let had_press = popup.pressed.take().is_some();
+                if popup.hovered_idx.take().is_some() || had_press {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                popup.pressed_idx = popup.row_at_y(y);
+                popup.pressed = popup.hit_test(lparam);
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let pressed = popup.pressed_idx.take();
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                let up_idx = popup.row_at_y(y);
-                if let (Some(p_idx), Some(idx)) = (pressed, up_idx) {
-                    if p_idx == idx {
-                        let parent = popup.parent_hwnd;
-                        popup.hide();
-                        let _ = PostMessageW(
-                            parent,
-                            WM_APP_OVERFLOW_SELECT,
-                            WPARAM(idx),
-                            windows::Win32::Foundation::LPARAM(0),
-                        );
-                        return LRESULT(0);
-                    }
+                let pressed = popup.pressed.take();
+                if let Some((idx, variants)) =
+                    popup.hit_test(lparam).filter(|hit| Some(*hit) == pressed)
+                {
+                    let parent = popup.parent_hwnd;
+                    popup.hide();
+                    let _ = PostMessageW(
+                        parent,
+                        WM_APP_OVERFLOW_SELECT,
+                        WPARAM(idx),
+                        windows::Win32::Foundation::LPARAM(isize::from(variants)),
+                    );
+                    return LRESULT(0);
                 }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
@@ -451,7 +477,7 @@ unsafe extern "system" fn overflow_wndproc(
                         let is_active =
                             popup.active_scene_id.as_deref() == Some(scene.id.as_str());
                         let is_hovered = popup.hovered_idx == Some(idx);
-                        let is_pressed = popup.pressed_idx == Some(idx);
+                        let is_pressed = popup.pressed.is_some_and(|(index, _)| index == idx);
 
                         if is_active {
                             let fill = if is_pressed {
@@ -535,6 +561,14 @@ unsafe extern "system" fn overflow_wndproc(
                             is_active,
                             popup.dpi,
                         );
+                        if let Some(arrow) = popup.variant_arrow_rect(idx, w) {
+                            draw_variant_arrow(
+                                graphics,
+                                arrow,
+                                colors::TEXT_PRIMARY_ARGB,
+                                popup.dpi,
+                            );
+                        }
                     }
 
                     let _ = GdipDeleteGraphics(graphics);
@@ -556,10 +590,13 @@ unsafe extern "system" fn overflow_wndproc(
                     } else {
                         dip_to_px(8, popup.dpi)
                     };
+                    let content_right = popup
+                        .variant_arrow_rect(idx, w)
+                        .map_or(client_rc.right - pad, |arrow| arrow.left);
                     let mut text_rc = RECT {
                         left: pad + dip_to_px(32, popup.dpi),
                         top,
-                        right: client_rc.right - pad - right_pad,
+                        right: content_right - right_pad,
                         bottom: top + row_h,
                     };
                     let mut wide: Vec<u16> = scene.name.encode_utf16().collect();
@@ -573,9 +610,9 @@ unsafe extern "system" fn overflow_wndproc(
                     if is_active {
                         let _ = SetTextColor(mem_dc, COLORREF(0x00FF_D8BD)); // soft accent blue
                         let mut check_rc = RECT {
-                            left: client_rc.right - pad - dip_to_px(22, popup.dpi),
+                            left: content_right - dip_to_px(22, popup.dpi),
                             top,
-                            right: client_rc.right - pad - dip_to_px(8, popup.dpi),
+                            right: content_right - dip_to_px(8, popup.dpi),
                             bottom: top + row_h,
                         };
                         let mut chk: Vec<u16> = "✓".encode_utf16().collect();

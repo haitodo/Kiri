@@ -16,25 +16,45 @@
         <button type="button" class="primary" data-edit id="create-scene" data-icon="plus">シーンを作る</button>
       </header>
       <div class="guide band" id="first-run" hidden>
-        <div><strong>はじめての設定</strong><p>操作する画面を選び、シーンに開いているウィンドウを追加しましょう。</p></div>
-        <button type="button" id="start-setup" data-edit>画面を選ぶ</button>
-      </div>
-      <div class="band scope">
-        <div class="inline"><div id="mini-monitors" aria-hidden="true"></div>
-          <div><strong id="target-summary"></strong><p>登録済みのウィンドウが切替の対象です。</p></div>
-        </div>
-        <button type="button" class="quiet" data-link="behavior" id="target-link">操作する画面を変更</button>
+        <div><strong>はじめての設定</strong><p>シーンに開いているウィンドウを追加しましょう。</p></div>
+        <button type="button" id="start-setup" data-edit>共通の画面を選ぶ</button>
       </div>
       <div class="scene-list" id="scene-list" role="group" aria-label="編集するシーン"></div>
       <div class="stack" id="scene-editor" hidden>
         <div class="row wrap">
-          <h2 id="scene-windows"></h2>
-          <button id="add-windows" type="button" data-edit data-icon="plus">ウィンドウを追加</button>
+          <h2 id="scene-name"></h2>
+          <div class="actions">
+            <button id="inspect" type="button" class="quiet" data-icon="eye">切替の影響を見る</button>
+            <button id="scene-details" type="button" class="quiet" data-icon="sliders">シーンの詳細設定</button>
+          </div>
         </div>
-        <ul class="rows" id="scene-bindings"></ul>
-        <div class="row wrap scene-actions">
-          <button id="scene-details" type="button" class="quiet" data-icon="sliders">シーンの詳細設定</button>
-          <button id="inspect" type="button" class="quiet" data-icon="eye">切替の影響を見る</button>
+        <div class="columns band monitor-options">
+          <div class="stack">
+            <label class="field">切り替える画面<select id="scene-target" data-edit></select></label>
+            <p class="notice" id="scene-target-hint" hidden></p>
+          </div>
+          <div class="monitor-map" id="scene-monitor-map" role="group" aria-label="画面の配置"></div>
+        </div>
+        <div class="stack" id="common-windows" hidden>
+          <div class="row wrap">
+            <h3>どの構成でも使うウィンドウ</h3>
+            <button id="add-common-windows" type="button" data-edit data-icon="plus">共通に追加</button>
+          </div>
+          <ul class="rows" id="common-bindings"></ul>
+        </div>
+        <div class="row wrap">
+          <div class="actions variant-tabs" id="variant-tabs" role="tablist" aria-label="ウィンドウ構成" hidden></div>
+          <button id="create-variant" type="button" data-edit data-icon="plus">構成を追加</button>
+        </div>
+        <div class="stack" id="variant-panel">
+          <div class="row wrap">
+            <h3 id="scene-windows"></h3>
+            <div class="actions">
+              <button id="edit-variant" type="button" class="quiet" data-edit data-icon="sliders">構成の設定</button>
+              <button id="add-windows" type="button" data-edit data-icon="plus">ウィンドウを追加</button>
+            </div>
+          </div>
+          <ul class="rows" id="scene-bindings"></ul>
         </div>
       </div>
       <details id="binding-details">
@@ -77,9 +97,9 @@
     <section id="behavior" class="page" aria-labelledby="behavior-title" hidden>
       <header class="page-head"><div><h1 id="behavior-title" tabindex="-1">ウィンドウの動作</h1><p>どの画面で、どのようにウィンドウを切り替えるかを選びます。</p></div></header>
       <div class="band stack">
-        <div class="row wrap"><h2>操作する画面</h2><button id="refresh-monitors" type="button" class="quiet" data-icon="refresh">接続を確認</button></div>
+        <div class="row wrap"><h2>切り替える画面の共通設定</h2><button id="refresh-monitors" type="button" class="quiet" data-icon="refresh">接続を確認</button></div>
         <div class="columns monitor-options">
-          <div id="monitor-map" role="group" aria-label="画面の配置"></div>
+          <div class="monitor-map" id="monitor-map" role="group" aria-label="画面の配置"></div>
           <label class="field">対象の選び方<select id="target" data-edit></select></label>
         </div>
         <p id="monitor-hint"></p>

@@ -124,7 +124,20 @@
           "name": { "type": "string", "minLength": 1 },
           "icon": { "type": "string" },
           "order": { "type": "integer" },
-          "pinned": { "type": "boolean" }
+          "pinned": { "type": "boolean" },
+          "target": { "$ref": "#/properties/target" },
+          "variants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "name"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "name": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "last_variant_id": { "type": "string", "minLength": 1 }
         }
       }
     },
@@ -187,7 +200,18 @@
           },
           "scene_ids": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": { "type": "string" },
+            "description": "Scenes in which this window belongs to every variant."
+          },
+          "scene_variants": {
+            "type": "object",
+            "description": "Additional memberships, keyed by scene ID, with variant IDs as values.",
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
           },
           "always_visible": { "type": "boolean" },
           "enabled": { "type": "boolean" }

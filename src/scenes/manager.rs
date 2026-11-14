@@ -1,4 +1,4 @@
-//! Scene state machine (`Unknown` vs `Active(scene_id)`).
+//! Tracks the active scene and its selected variant.
 //!
 //! Per Section 5.1 & 12 of spec.md:
 //! - On startup and immediately after "Restore All" or crash recovery, the scene state is `Unknown`.
@@ -14,7 +14,10 @@ pub enum SceneState {
     /// Initial state at startup or after recovery/restore-all.
     Unknown,
     /// A scene has been actively switched to and confirmed.
-    Active(String),
+    Active {
+        scene_id: String,
+        variant_id: Option<String>,
+    },
 }
 
 impl Default for SceneState {
@@ -43,7 +46,14 @@ impl SceneStateManager {
 
     pub fn active_scene_id(&self) -> Option<&str> {
         match &self.state {
-            SceneState::Active(id) => Some(id.as_str()),
+            SceneState::Active { scene_id, .. } => Some(scene_id),
+            SceneState::Unknown => None,
+        }
+    }
+
+    pub fn active_variant_id(&self) -> Option<&str> {
+        match &self.state {
+            SceneState::Active { variant_id, .. } => variant_id.as_deref(),
             SceneState::Unknown => None,
         }
     }
@@ -53,17 +63,16 @@ impl SceneStateManager {
         self.last_known_scene_id.as_deref()
     }
 
-    pub fn is_already_active(&self, scene_id: &str) -> bool {
-        match &self.state {
-            SceneState::Active(current) => current == scene_id,
-            SceneState::Unknown => false,
-        }
+    pub fn is_already_active(&self, scene_id: &str, variant_id: Option<&str>) -> bool {
+        self.active_scene_id() == Some(scene_id) && self.active_variant_id() == variant_id
     }
 
-    pub fn set_active(&mut self, scene_id: impl Into<String>) {
-        let id = scene_id.into();
-        self.last_known_scene_id = Some(id.clone());
-        self.state = SceneState::Active(id);
+    pub fn set_active(&mut self, scene_id: &str, variant_id: Option<&str>) {
+        self.last_known_scene_id = Some(scene_id.to_owned());
+        self.state = SceneState::Active {
+            scene_id: scene_id.to_owned(),
+            variant_id: variant_id.map(str::to_owned),
+        };
     }
 
     pub fn reset_to_unknown(&mut self) {

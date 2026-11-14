@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 pub const OUTER_PADDING_DIP: i32 = 3;
 pub const ELEMENT_GAP_DIP: i32 = 2;
 pub const CORNER_RADIUS_DIP: i32 = 6;
+pub const SCENE_VARIANT_BUTTON_DIP: i32 = 20;
 
 #[derive(Default)]
 pub(super) struct SceneWheel {
@@ -60,6 +61,8 @@ pub enum HitTarget {
     Grip,
     /// A pinned scene button on the main bar.
     SceneButton { index: usize, scene_id: String },
+    /// The arrow beside a scene with multiple variants.
+    SceneVariants { index: usize, scene_id: String },
     /// The `⋯` overflow button.
     OverflowButton,
 }
@@ -67,6 +70,7 @@ pub enum HitTarget {
 #[derive(Debug, Clone)]
 pub struct ButtonSlotLayout {
     pub rect: RectData,
+    pub variants_rect: Option<RectData>,
     pub scene: Scene,
 }
 
@@ -94,7 +98,7 @@ impl LauncherLayout {
         let btn_size = dip_to_px(launcher_cfg.button_size_dip.max(20), dpi);
         let grip_len = dip_to_px(launcher_cfg.grip_size_dip.max(10), dpi);
 
-        let total_buttons = visible_scenes.len() + usize::from(has_overflow);
+        let variant_size = dip_to_px(SCENE_VARIANT_BUTTON_DIP, dpi);
 
         match launcher_cfg.orientation {
             Orientation::Horizontal => {
@@ -117,8 +121,18 @@ impl LauncherLayout {
                         bottom: pad + btn_size,
                     };
                     cursor_x += btn_size;
+                    let variants_rect = (scene.variants.len() > 1).then(|| {
+                        let arrow = RectData {
+                            left: cursor_x,
+                            right: cursor_x + variant_size,
+                            ..rect
+                        };
+                        cursor_x += variant_size;
+                        arrow
+                    });
                     scene_buttons.push(ButtonSlotLayout {
                         rect,
+                        variants_rect,
                         scene: scene.clone(),
                     });
                 }
@@ -137,7 +151,6 @@ impl LauncherLayout {
                     None
                 };
 
-                let _ = total_buttons;
                 let width_px = cursor_x + pad;
                 let height_px = pad + btn_size + pad;
 
@@ -153,10 +166,16 @@ impl LauncherLayout {
             }
             Orientation::Vertical => {
                 let mut cursor_y = pad;
+                let arrow_width = if visible_scenes.iter().any(|scene| scene.variants.len() > 1) {
+                    variant_size
+                } else {
+                    0
+                };
+                let full_width = btn_size + arrow_width;
                 let grip_rect = RectData {
                     left: pad,
                     top: cursor_y,
-                    right: pad + btn_size,
+                    right: pad + full_width,
                     bottom: cursor_y + grip_len,
                 };
                 cursor_y += grip_len;
@@ -164,15 +183,22 @@ impl LauncherLayout {
                 let mut scene_buttons = Vec::with_capacity(visible_scenes.len());
                 for scene in visible_scenes {
                     cursor_y += gap;
+                    let has_variants = scene.variants.len() > 1;
                     let rect = RectData {
                         left: pad,
                         top: cursor_y,
-                        right: pad + btn_size,
+                        right: pad + if has_variants { btn_size } else { full_width },
                         bottom: cursor_y + btn_size,
                     };
                     cursor_y += btn_size;
+                    let variants_rect = has_variants.then_some(RectData {
+                        left: rect.right,
+                        right: rect.right + variant_size,
+                        ..rect
+                    });
                     scene_buttons.push(ButtonSlotLayout {
                         rect,
+                        variants_rect,
                         scene: scene.clone(),
                     });
                 }
@@ -182,7 +208,7 @@ impl LauncherLayout {
                     let rect = RectData {
                         left: pad,
                         top: cursor_y,
-                        right: pad + btn_size,
+                        right: pad + full_width,
                         bottom: cursor_y + btn_size,
                     };
                     cursor_y += btn_size;
@@ -191,7 +217,7 @@ impl LauncherLayout {
                     None
                 };
 
-                let width_px = pad + btn_size + pad;
+                let width_px = pad + full_width + pad;
                 let height_px = cursor_y + pad;
 
                 Self {
@@ -213,6 +239,15 @@ impl LauncherLayout {
             return HitTarget::Grip;
         }
         for (index, slot) in self.scene_buttons.iter().enumerate() {
+            if slot
+                .variants_rect
+                .is_some_and(|rect| point_in_rect(client_x, client_y, &rect))
+            {
+                return HitTarget::SceneVariants {
+                    index,
+                    scene_id: slot.scene.id.clone(),
+                };
+            }
             if point_in_rect(client_x, client_y, &slot.rect) {
                 return HitTarget::SceneButton {
                     index,
@@ -294,6 +329,33 @@ mod tests {
                 scene_id: "trade".to_string()
             }
         );
+    }
+
+    #[test]
+    fn variant_arrow_is_a_separate_target_in_both_orientations() {
+        let mut config = crate::config::AppConfig::default_initial();
+        config.scenes[1].variants = ["Antigravity", "Codex"]
+            .into_iter()
+            .map(|name| crate::config::SceneVariant {
+                id: name.into(),
+                name: name.into(),
+            })
+            .collect();
+        for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+            config.launcher.orientation = orientation;
+            let layout = LauncherLayout::compute(&config.launcher, &config.scenes, false, 144);
+            let slot = &layout.scene_buttons[1];
+            let arrow = slot.variants_rect.unwrap();
+            assert!(matches!(
+                layout.hit_test(slot.rect.left, slot.rect.top),
+                HitTarget::SceneButton { index: 1, .. }
+            ));
+            assert!(matches!(
+                layout.hit_test(arrow.left, arrow.top),
+                HitTarget::SceneVariants { index: 1, .. }
+            ));
+            assert!(layout.scene_buttons[0].variants_rect.is_none());
+        }
     }
 
     #[test]
