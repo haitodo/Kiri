@@ -18,6 +18,27 @@ use crate::platform::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+#[cfg(windows)]
+pub(crate) fn apps_use_dark_theme() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+    let mut use_light = 1u32;
+    let mut length = std::mem::size_of_val(&use_light) as u32;
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut use_light as *mut u32).cast()),
+            Some(&mut length),
+        )
+    };
+    result.is_ok() && use_light == 0
+}
+
 pub struct Win32WindowSystem {
     own_pid: u32,
     #[cfg(windows)]

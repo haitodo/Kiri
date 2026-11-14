@@ -3,7 +3,7 @@
 use super::{win_rect, CursorPopup, Hit, CORNER_RADIUS_DIP};
 use crate::config::{RectData, ShortcutKind};
 use crate::platform::monitors::dip_to_px;
-use std::mem::size_of;
+use crate::platform::windows::apps_use_dark_theme;
 use std::ptr::null_mut;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, SIZE};
@@ -24,7 +24,6 @@ use windows::Win32::Graphics::GdiPlus::{
     InterpolationModeHighQualityBicubic, LineCapRound, LineJoinRound, Ok as GpOk, PointF,
     SmoothingModeAntiAlias, UnitPixel,
 };
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct PopupPalette {
@@ -64,20 +63,7 @@ impl PopupPalette {
     };
 
     pub(super) fn system() -> Self {
-        let mut use_light = 1u32;
-        let mut length = size_of::<u32>() as u32;
-        let result = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                w!("AppsUseLightTheme"),
-                RRF_RT_REG_DWORD,
-                None,
-                Some((&mut use_light as *mut u32).cast()),
-                Some(&mut length),
-            )
-        };
-        if result.is_ok() && use_light == 0 {
+        if apps_use_dark_theme() {
             Self::DARK
         } else {
             Self::LIGHT

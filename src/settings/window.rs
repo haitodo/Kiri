@@ -7,6 +7,7 @@ use super::{
 use crate::app::AppController;
 use crate::diagnostics::{log_error, log_info, log_warn};
 use crate::platform::monitors::dip_to_px;
+use crate::platform::windows::apps_use_dark_theme;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -14,6 +15,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     path::Path,
     sync::OnceLock,
+    time::Instant,
 };
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
@@ -30,7 +32,7 @@ use webview_windows::{
 };
 use windows::{
     core::{w, HSTRING},
-    Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Win32::Graphics::{
         Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Gdi::*,
@@ -41,6 +43,7 @@ use windows::{
         SystemServices::{SS_CENTER, SS_NOPREFIX},
     },
     Win32::UI::{
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
         Shell::ShellExecuteW,
         WindowsAndMessaging::*,
@@ -48,7 +51,7 @@ use windows::{
 };
 
 pub(crate) const WM_SETTINGS_REQUEST: u32 = WM_APP + 5;
-const WM_SETTINGS_READY: u32 = WM_APP + 10;
+const WM_SETTINGS_START: u32 = WM_APP + 10;
 const WM_SETTINGS_FAILED: u32 = WM_APP + 11;
 const WM_SETTINGS_CLOSE: u32 = WM_APP + 12;
 const TIMER_STARTUP: usize = 1;
@@ -189,13 +192,91 @@ pub struct SettingsWindow {
     loading_label: HWND,
     retry: HWND,
     icon: HICON,
-    editor: RefCell<Editor>,
+    editor: RefCell<Option<Editor>>,
     page: Cell<SettingsPage>,
+    palette: Cell<SettingsPalette>,
     controller: RefCell<Option<ICoreWebView2Controller>>,
     initializing: Cell<bool>,
     attempt: Cell<u32>,
+    opened_at: Cell<Instant>,
     file_pending: Cell<bool>,
     _apartment: Apartment,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SettingsPalette {
+    background: COLORREF,
+    text: COLORREF,
+    dark_title_bar: bool,
+}
+
+impl SettingsPalette {
+    unsafe fn system(dark: bool) -> Self {
+        let size = std::mem::size_of::<HIGHCONTRASTW>() as u32;
+        let mut contrast = HIGHCONTRASTW {
+            cbSize: size,
+            ..Default::default()
+        };
+        let high_contrast = SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            size,
+            Some((&mut contrast as *mut HIGHCONTRASTW).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+        .is_ok()
+            && contrast.dwFlags.contains(HCF_HIGHCONTRASTON);
+        if high_contrast {
+            Self {
+                background: COLORREF(GetSysColor(COLOR_WINDOW)),
+                text: COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
+                dark_title_bar: false,
+            }
+        } else if dark {
+            // Match --surface and --text in settings.css. COLORREF stores bytes in BGR order.
+            Self {
+                background: COLORREF(0x31_26_20),
+                text: COLORREF(0xfa_f3_f0),
+                dark_title_bar: true,
+            }
+        } else {
+            Self {
+                background: COLORREF(0xff_ff_ff),
+                text: COLORREF(0x38_25_19),
+                dark_title_bar: false,
+            }
+        }
+    }
+
+    fn web_background(self) -> COREWEBVIEW2_COLOR {
+        let [r, g, b, _] = self.background.0.to_le_bytes();
+        COREWEBVIEW2_COLOR {
+            A: 255,
+            R: r,
+            G: g,
+            B: b,
+        }
+    }
+
+    unsafe fn brush(self, dc: HDC) -> HBRUSH {
+        let _ = SetDCBrushColor(dc, self.background);
+        HBRUSH(GetStockObject(DC_BRUSH).0)
+    }
+
+    unsafe fn apply_title_bar(self, hwnd: HWND) {
+        let dark = i32::from(self.dark_title_bar);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            std::mem::size_of_val(&dark) as u32,
+        );
+    }
+
+    unsafe fn apply_web_background(self, controller: &ICoreWebView2Controller) {
+        if let Ok(controller) = controller.cast::<ICoreWebView2Controller2>() {
+            let _ = controller.SetDefaultBackgroundColor(self.web_background());
+        }
+    }
 }
 
 struct Apartment;
@@ -216,7 +297,7 @@ impl SettingsWindow {
         }
     }
 
-    pub fn show(owner: HWND, app: &AppController, page: SettingsPage) -> Result<(), String> {
+    pub fn show(owner: HWND, page: SettingsPage) -> Result<(), String> {
         unsafe {
             let existing = ACTIVE.with(Cell::get);
             if !existing.0.is_null() {
@@ -232,6 +313,7 @@ impl SettingsWindow {
                 return Ok(());
             }
 
+            let opened_at = Instant::now();
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
                 .ok()
                 .map_err(|e| e.to_string())?;
@@ -243,7 +325,6 @@ impl SettingsWindow {
                 RegisterClassW(&WNDCLASSW {
                     lpfnWndProc: Some(window_proc),
                     hInstance: instance.into(),
-                    hbrBackground: GetSysColorBrush(COLOR_WINDOW),
                     hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                     lpszClassName: class,
                     ..Default::default()
@@ -332,24 +413,36 @@ impl SettingsWindow {
                 (&rounding as *const u32).cast(),
                 4,
             );
+            let palette = SettingsPalette::system(apps_use_dark_theme());
+            palette.apply_title_bar(hwnd);
             let window = Box::new(Self {
                 hwnd,
                 loading_label,
                 retry,
                 icon,
-                editor: RefCell::new(Editor::new(app)),
+                editor: RefCell::new(None),
                 page: Cell::new(page),
+                palette: Cell::new(palette),
                 controller: RefCell::new(None),
                 initializing: Cell::new(false),
                 attempt: Cell::new(0),
+                opened_at: Cell::new(opened_at),
                 file_pending: Cell::new(false),
                 _apartment: apartment,
             });
+            window.layout();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(window) as isize);
             ACTIVE.with(|active| active.set(hwnd));
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
-            if PostMessageW(hwnd, WM_SETTINGS_READY, WPARAM(0), LPARAM(0)).is_err() {
+            // Paint the native placeholder before starting the browser or enumerating windows.
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+            if PostMessageW(hwnd, WM_SETTINGS_START, WPARAM(0), LPARAM(0)).is_err() {
                 let _ = DestroyWindow(hwnd);
                 return Err("設定画面を読み込めませんでした。".into());
             }
@@ -373,8 +466,16 @@ impl SettingsWindow {
         });
         self.attempt.set(attempt);
         let hwnd = self.hwnd;
-        let _ = SetWindowTextW(self.loading_label, w!("設定を読み込んでいます…"));
-        let _ = ShowWindow(self.retry, SW_HIDE);
+        if IsWindowVisible(self.retry).as_bool() {
+            let _ = SetWindowTextW(self.loading_label, w!("設定を読み込んでいます…"));
+            let _ = ShowWindow(self.retry, SW_HIDE);
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
+        }
         let _ = SetTimer(hwnd, TIMER_STARTUP, 15_000, None);
         let profile = CoTaskMemPWSTR::from(
             crate::diagnostics::default_app_data_dir()
@@ -396,7 +497,7 @@ impl SettingsWindow {
                 {
                     return Ok(());
                 }
-                guarded(hwnd, || {
+                guarded(hwnd, attempt, || {
                     result?;
                     log_info("settings", "Settings browser environment initialized");
                     if let Some((window, environment)) = Self::get(hwnd).zip(environment) {
@@ -406,6 +507,11 @@ impl SettingsWindow {
                         let env = environment.cast::<ICoreWebView2Environment10>()?;
                         let opts = env.CreateCoreWebView2ControllerOptions()?;
                         opts.SetIsInPrivateModeEnabled(true)?;
+                        // Set the color at creation when supported, before the controller can paint.
+                        if let Ok(options) = opts.cast::<ICoreWebView2ControllerOptions3>() {
+                            let _ = options
+                                .SetDefaultBackgroundColor(window.palette.get().web_background());
+                        }
                         env.CreateCoreWebView2ControllerWithOptions(
                             WebHwnd(hwnd.0),
                             &opts,
@@ -419,7 +525,7 @@ impl SettingsWindow {
                                         }
                                         return Ok(());
                                     }
-                                    guarded(hwnd, || {
+                                    guarded(hwnd, attempt, || {
                                         result?;
                                         if let Some((window, controller)) =
                                             Self::get(hwnd).zip(controller)
@@ -459,6 +565,15 @@ impl SettingsWindow {
                 &format!("WebView2 initialization failed: {error}"),
             );
             self.failed();
+        } else if self.editor.borrow().is_none() {
+            // The browser starts asynchronously. Prepare the data on the launcher thread while it starts.
+            enqueue(
+                hwnd,
+                Request {
+                    id: 0,
+                    command: Command::Prepare,
+                },
+            );
         }
     }
 
@@ -467,6 +582,8 @@ impl SettingsWindow {
         controller: ICoreWebView2Controller,
         environment: &ICoreWebView2Environment,
     ) -> webview_windows::core::Result<()> {
+        controller.SetIsVisible(false)?;
+        self.palette.get().apply_web_background(&controller);
         let view = controller.CoreWebView2()?;
         let settings = view.Settings()?;
         settings.SetAreHostObjectsAllowed(false)?;
@@ -565,8 +682,10 @@ impl SettingsWindow {
         )?;
         view.add_WebMessageReceived(
             &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
-                guarded(hwnd, || {
-                    if !Self::get(hwnd).is_some_and(|w| w.attempt.get() == self_attempt) {
+                guarded(hwnd, self_attempt, || {
+                    if !Self::get(hwnd).is_some_and(|w| {
+                        w.attempt.get() == self_attempt && w.controller.borrow().is_some()
+                    }) {
                         return Ok(());
                     }
                     let Some(args) = args else { return Ok(()) };
@@ -599,10 +718,52 @@ impl SettingsWindow {
         )?;
 
         *self.controller.borrow_mut() = Some(controller);
+        self.layout();
         let url = CoTaskMemPWSTR::from(LOCAL_DOCUMENT);
         view.Navigate(*url.as_ref().as_pcwstr())?;
-        self.layout();
         Ok(())
+    }
+
+    unsafe fn apply_appearance(&self, dark: bool) {
+        let palette = SettingsPalette::system(dark);
+        if self.palette.replace(palette) != palette {
+            palette.apply_title_bar(self.hwnd);
+            if let Some(controller) = &*self.controller.borrow() {
+                palette.apply_web_background(controller);
+            }
+            let _ = RedrawWindow(self.hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+    }
+
+    unsafe fn reveal(&self, dark: bool) {
+        if !self.initializing.get() || self.editor.borrow().is_none() {
+            return;
+        }
+        let Some(controller) = self.controller.borrow().clone() else {
+            return;
+        };
+        self.apply_appearance(dark);
+        if let Err(error) = controller.SetIsVisible(true) {
+            log_warn(
+                "settings",
+                &format!("Could not show the settings page: {error}"),
+            );
+            self.failed();
+            return;
+        }
+        self.initializing.set(false);
+        let _ = KillTimer(self.hwnd, TIMER_STARTUP);
+        let _ = ShowWindow(self.loading_label, SW_HIDE);
+        if GetForegroundWindow() == self.hwnd {
+            let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        }
+        log_info(
+            "settings",
+            &format!(
+                "Settings page ready ({} ms from open)",
+                self.opened_at.get().elapsed().as_millis(),
+            ),
+        );
     }
 
     unsafe fn layout(&self) {
@@ -641,14 +802,19 @@ impl SettingsWindow {
     unsafe fn failed(&self) {
         let _ = KillTimer(self.hwnd, TIMER_STARTUP);
         self.initializing.set(false);
-        if let Some(controller) = self.controller.borrow_mut().take() {
+        REQUESTS.with_borrow_mut(|requests| requests.retain(|(sender, _)| *sender != self.hwnd));
+        let controller = self.controller.borrow_mut().take();
+        if let Some(controller) = controller {
             let _ = controller.Close();
         }
         let _ = SetWindowTextW(self.loading_label, w!("設定画面を読み込めませんでした。\nMicrosoft Edge WebView2 ランタイムが利用できることを確認し、再試行してください。"));
         let _ = ShowWindow(self.loading_label, SW_SHOW);
         let _ = ShowWindow(self.retry, SW_SHOW);
-        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.retry);
+        if GetForegroundWindow() == self.hwnd {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.retry);
+        }
         self.layout();
+        let _ = RedrawWindow(self.hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
 
     fn post(&self, message: Value) {
@@ -677,8 +843,45 @@ impl SettingsWindow {
             return false;
         };
         let Request { id, command } = request;
+        match command {
+            Command::Prepare => {
+                if window.initializing.get() {
+                    window
+                        .editor
+                        .borrow_mut()
+                        .get_or_insert_with(|| Editor::new(app));
+                }
+                return false;
+            }
+            Command::Rendered { dark } => {
+                window.reveal(dark);
+                return false;
+            }
+            Command::StartupFailed => {
+                if window.initializing.get() {
+                    log_warn("settings", "Could not render the settings page");
+                    window.failed();
+                }
+                return false;
+            }
+            Command::Appearance { dark } => {
+                window.apply_appearance(dark);
+                return false;
+            }
+            _ => {}
+        }
+        if window.controller.borrow().is_none()
+            || (window.initializing.get() && !matches!(command, Command::Initialize))
+        {
+            return false;
+        }
+        let read_only = window
+            .editor
+            .borrow()
+            .as_ref()
+            .is_some_and(|editor| editor.read_only);
         let file_action = match command {
-            Command::Import if !window.editor.borrow().read_only => Some(FileAction::Import),
+            Command::Import if !read_only => Some(FileAction::Import),
             Command::Export => Some(FileAction::Export),
             Command::OpenFolder => Some(FileAction::OpenFolder),
             Command::Browse { kind } => Some(FileAction::Browse(kind)),
@@ -693,21 +896,12 @@ impl SettingsWindow {
             }
             return false;
         }
-        if let Command::Appearance { dark } = command {
-            let dark = i32::from(dark);
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&dark as *const i32).cast(),
-                4,
-            );
-            return false;
-        }
         let mut changed = false;
         let result = window.request(command, app, &mut changed);
         let reply = match result {
             Ok(extra) => {
-                json!({ "kind": "reply", "id": id, "extra": extra, "ok": true, "state": window.editor.borrow().state() })
+                let state = window.editor.borrow().as_ref().map(Editor::state);
+                json!({ "kind": "reply", "id": id, "extra": extra, "ok": true, "state": state })
             }
             Err(error) => json!({ "kind": "reply", "id": id, "error": error, "ok": false }),
         };
@@ -722,21 +916,17 @@ impl SettingsWindow {
         changed: &mut bool,
     ) -> Result<Value, String> {
         use Command::*;
-        let mut editor = self.editor.borrow_mut();
+        let mut slot = self.editor.borrow_mut();
+        if matches!(command, Initialize) {
+            // Usually prepared while WebView2 starts. Build it here if the page arrived first.
+            slot.get_or_insert_with(|| Editor::new(app));
+            return Ok(json!({
+                "page": self.page.get().id(),
+                "first_run": !app.config.bindings.iter().any(|b| b.enabled),
+            }));
+        }
+        let editor = slot.as_mut().ok_or("設定を読み込んでいます…")?;
         match command {
-            Ready => {
-                let _ = KillTimer(self.hwnd, TIMER_STARTUP);
-                self.initializing.set(false);
-                log_info("settings", "Settings page ready");
-                let _ = ShowWindow(self.loading_label, SW_HIDE);
-                if let Some(controller) = &*self.controller.borrow() {
-                    let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-                }
-                Ok(json!({
-                    "page": self.page.get().id(),
-                    "first_run": !app.config.bindings.iter().any(|b| b.enabled),
-                }))
-            }
             Refresh => {
                 editor.refresh(app);
                 Ok(Value::Null)
@@ -823,14 +1013,19 @@ fn file_error(error: windows::core::Error) -> String {
     format!("ファイル選択を開けませんでした。{error}")
 }
 
-fn guarded(hwnd: HWND, f: impl FnOnce() -> webview_windows::core::Result<()>) {
+fn guarded(hwnd: HWND, attempt: u32, f: impl FnOnce() -> webview_windows::core::Result<()>) {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => return,
         Ok(Err(error)) => log_warn("settings", &format!("WebView2 callback failed: {error}")),
         Err(_) => log_error("settings", "Caught panic in settings WebView2 callback"),
     }
     unsafe {
-        let _ = PostMessageW(hwnd, WM_SETTINGS_FAILED, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(
+            hwnd,
+            WM_SETTINGS_FAILED,
+            WPARAM(attempt as usize),
+            LPARAM(0),
+        );
     }
 }
 
@@ -863,15 +1058,34 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
         match msg {
-            WM_SETTINGS_READY => window.begin_webview(),
-            WM_SETTINGS_FAILED if window.attempt.get() == wp.0 as u32 || wp.0 == 0 => {
-                window.failed()
-            }
-            WM_TIMER if wp.0 == TIMER_STARTUP => {
+            WM_SETTINGS_START => window.begin_webview(),
+            WM_SETTINGS_FAILED if window.attempt.get() == wp.0 as u32 => window.failed(),
+            WM_TIMER if wp.0 == TIMER_STARTUP && window.initializing.get() => {
                 log_warn("settings", "Timed out waiting for the settings page");
                 window.failed();
             }
-            WM_COMMAND if wp.0 & 0xffff == ID_RETRY => window.begin_webview(),
+            WM_COMMAND if wp.0 & 0xffff == ID_RETRY => {
+                window.opened_at.set(Instant::now());
+                window.begin_webview();
+            }
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let _ = FillRect(dc, &paint.rcPaint, window.palette.get().brush(dc));
+                let _ = EndPaint(hwnd, &paint);
+            }
+            WM_ERASEBKGND => return LRESULT(1),
+            WM_CTLCOLORSTATIC if lp.0 as *mut _ == window.loading_label.0 => {
+                let dc = HDC(wp.0 as *mut _);
+                let palette = window.palette.get();
+                let _ = SetTextColor(dc, palette.text);
+                let _ = SetBkColor(dc, palette.background);
+                return LRESULT(palette.brush(dc).0 as isize);
+            }
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+                window.apply_appearance(apps_use_dark_theme());
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
             WM_SIZE => window.layout(),
             WM_MOVE => {
                 if let Some(controller) = &*window.controller.borrow() {

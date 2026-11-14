@@ -31,7 +31,13 @@ impl SettingsPage {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(super) enum Command {
-    Ready,
+    #[serde(skip_deserializing)]
+    Prepare,
+    Initialize,
+    Rendered {
+        dark: bool,
+    },
+    StartupFailed,
     Appearance {
         dark: bool,
     },

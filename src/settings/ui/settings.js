@@ -11,7 +11,7 @@ const dialogError = byId('dialog-error');
 const dialogSubmit = byId('dialog-submit');
 const bridge = window.chrome.webview;
 let sceneId, state, setup = false, onboarding = false, visited = 'scenes';
-let pending, pendingFocus, sequence = 0, commitDialog;
+let pending, pendingFocus, requestedPage, sequence = 0, commitDialog;
 let invalidLauncher = false;
 
 const iconPaths = {
@@ -128,7 +128,8 @@ function request(action, values = {}) {
 bridge.addEventListener('message', ({ data }) => {
   if (data.kind === 'close') { void closeSettings(); return; }
   if (data.kind === 'page') {
-    if (state && !dialog.open) go(data.page, true);
+    if (state && !dialog.open) go(data.page);
+    else if (!state) requestedPage = data.page;
     return;
   }
   if (data.kind === 'warning') { showMessage(data.message); return; }
@@ -165,8 +166,8 @@ async function act(action, values, after) {
   }
 }
 
-function go(page, focus = true) {
-  if (!pages.some((node) => node.id === page)) return;
+function go(page) {
+  if (!state || !pages.some((node) => node.id === page)) return;
   if (visited !== page) {
     pages.forEach((node) => { node.hidden = node.id !== page; });
     nav.forEach((node) => {
@@ -176,20 +177,24 @@ function go(page, focus = true) {
     content.scrollTop = 0;
     visited = page;
   }
-  if (focus) byId(page + '-title').focus({ preventScroll: true });
   pendingFocus = undefined;
+  redraw();
+  byId(page + '-title').focus({ preventScroll: true });
 }
 
 function redraw() {
   if (!state) return;
   const focusKey = document.activeElement?.dataset.focus;
   sceneId = state.scenes.some((scene) => scene.id === sceneId) ? sceneId : state.scenes[0]?.id;
-  renderScenes();
-  renderLauncher();
-  renderBehavior();
-  renderShortcuts();
+  // Offscreen pages are populated when opened, using the latest settings state.
+  switch (visited) {
+    case 'scenes': renderScenes(); break;
+    case 'launcher': renderLauncher(); break;
+    case 'behavior': renderBehavior(); break;
+    case 'shortcuts': renderShortcuts(); break;
+  }
   renderFooter();
-  root.querySelectorAll('[data-edit]').forEach((node) => { node.disabled = state.read_only; });
+  byId(visited).querySelectorAll('[data-edit]').forEach((node) => { node.disabled = state.read_only; });
   const restore = focusKey || pendingFocus;
   pendingFocus = undefined;
   if (restore && !dialog.open) {
@@ -703,10 +708,10 @@ function importSettings() {
 }
 
 document.querySelectorAll('[data-icon]').forEach((node) => node.prepend(icon(node.dataset.icon)));
-nav.forEach((node) => node.addEventListener('click', () => { if (state) { go(node.dataset.page); if (visited === 'behavior') renderBehavior(); } }));
-root.querySelectorAll('[data-link]').forEach((node) => node.addEventListener('click', () => { go(node.dataset.link); renderBehavior(); }));
-byId('start-setup').addEventListener('click', () => { setup = true; go('behavior'); renderBehavior(); });
-byId('setup-next').addEventListener('click', () => { setup = false; go('scenes'); redraw(); byId('create-scene').focus(); });
+nav.forEach((node) => node.addEventListener('click', () => go(node.dataset.page)));
+root.querySelectorAll('[data-link]').forEach((node) => node.addEventListener('click', () => go(node.dataset.link)));
+byId('start-setup').addEventListener('click', () => { setup = true; go('behavior'); });
+byId('setup-next').addEventListener('click', () => { setup = false; go('scenes'); byId('create-scene').focus(); });
 byId('create-scene').addEventListener('click', openCreate);
 byId('add-windows').addEventListener('click', openWindowPicker);
 byId('scene-details').addEventListener('click', openSceneDetails);
@@ -757,9 +762,9 @@ function syncAppearance() {
 }
 darkScheme.addEventListener('change', syncAppearance);
 
-request('ready').then((extra) => {
+request('initialize').then((extra) => {
   onboarding = Boolean(extra.first_run);
-  go(extra.page, true);
-  redraw();
-  syncAppearance();
-}).catch((error) => showMessage(error.message));
+  go(requestedPage || extra.page);
+  // A hidden WebView can throttle animation callbacks. Signal after updating the DOM.
+  bridge.postMessage({ id: 0, action: 'rendered', dark: darkScheme.matches });
+}).catch(() => bridge.postMessage({ id: 0, action: 'startup_failed' }));

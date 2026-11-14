@@ -837,7 +837,7 @@ impl LauncherWindowHost {
     }
 
     fn show_settings(&self, page: SettingsPage) {
-        if let Err(error) = SettingsWindow::show(self.hwnd, &self.app, page) {
+        if let Err(error) = SettingsWindow::show(self.hwnd, page) {
             log_warn("settings", &error);
             self.notify_tray("Kiri 設定", "設定画面を開けませんでした。", true);
         }
