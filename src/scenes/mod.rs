@@ -336,7 +336,7 @@ mod tests {
         assert!(!sys.query_window(40).unwrap().is_iconic);
         assert!(!sys.query_window(50).unwrap().is_iconic);
 
-        // AT-03: Clicking "code" again is an idempotent no-op
+        // AT-03: Clicking "code" again with its windows still in front is a no-op.
         let out2 = execute_scene_switch(
             "code",
             &cfg,
@@ -1376,6 +1376,26 @@ mod tests {
             }
             assert_eq!(sys.windows[0].hwnd, 20);
             assert_eq!(sys.get_foreground_window(), foreground);
+
+            // Selecting the active scene again should raise it after another app covers it.
+            sys.simulate_user_restore(99);
+            sys.last_input_tick += 1;
+            assert_eq!(sys.windows[0].hwnd, 99);
+            let reselected = execute_scene_switch(
+                "trade",
+                &cfg,
+                &mut state_mgr,
+                &mut resolver,
+                &mut recovery,
+                &mut sys,
+                None,
+            );
+            assert!(!reselected.was_noop_same_scene);
+            assert!(reselected.switched);
+            assert!(reselected.verification.is_some());
+            assert_eq!(sys.windows[0].hwnd, 20);
+            assert_eq!(sys.get_foreground_window(), foreground);
+            assert!(sys.issued_commands.is_empty());
 
             let _ = std::fs::remove_file(jpath);
         }

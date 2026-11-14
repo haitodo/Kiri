@@ -120,9 +120,9 @@ impl PendingVerification {
 
 #[derive(Debug, Clone)]
 pub struct SwitchOutcome {
-    /// True if the scene was already active and nothing was needed (Step 1 idempotency, AT-03).
+    /// True if the scene was already active and needed no window state or presentation changes.
     pub was_noop_same_scene: bool,
-    /// True if the scene state transitioned to `Active(next_scene_id)`.
+    /// True if the requested scene was applied, including a reapplication of the active scene.
     pub switched: bool,
     pub minimized_hwnds: Vec<u64>,
     pub restored_hwnds: Vec<u64>,
@@ -232,6 +232,7 @@ struct SwitchPlan {
     to_minimize: Vec<(String, WindowInstance)>,
     to_restore: Vec<(String, WindowInstance, usize)>,
     to_bring_to_front: Vec<(WindowInstance, usize)>,
+    was_noop_same_scene: bool,
     warnings: Vec<SwitchWarning>,
     stale_actions: Vec<u64>,
     unchanged: Vec<(WindowInstance, &'static str)>,
@@ -257,6 +258,7 @@ pub fn preview_scene_switch(
         trace: &SwitchTrace::silent(),
         input_tick: None,
         preview: true,
+        already_active: false,
     };
     let plan =
         resolve_scene_selection(config, next_scene_id, variant_id).and_then(|(scene, variant)| {
@@ -291,6 +293,7 @@ struct PlanContext<'a> {
     trace: &'a SwitchTrace,
     input_tick: Option<u32>,
     preview: bool,
+    already_active: bool,
 }
 
 fn plan_scene_switch(
@@ -303,7 +306,12 @@ fn plan_scene_switch(
     launcher_monitor_id: Option<&str>,
     context: PlanContext<'_>,
 ) -> Result<SwitchPlan, SwitchWarning> {
-    let PlanContext { trace, input_tick, preview } = context;
+    let PlanContext {
+        trace,
+        input_tick,
+        preview,
+        already_active,
+    } = context;
     let mut warnings = Vec::new();
     let mut stale_actions = Vec::new();
     let mut unchanged = Vec::new();
@@ -614,7 +622,26 @@ fn plan_scene_switch(
         }
     }
 
-    Ok(SwitchPlan { target_mon_id, to_minimize, to_restore, to_bring_to_front, warnings, stale_actions, unchanged })
+    let was_noop_same_scene = already_active
+        && to_minimize.is_empty()
+        && to_restore.is_empty()
+        && !needs_scene_presentation(
+            &to_bring_to_front,
+            &all_windows,
+            config.launcher.focus_on_switch,
+            sys,
+        );
+
+    Ok(SwitchPlan {
+        target_mon_id,
+        to_minimize,
+        to_restore,
+        to_bring_to_front,
+        was_noop_same_scene,
+        warnings,
+        stale_actions,
+        unchanged,
+    })
 }
 
 pub fn execute_scene_switch_from(
@@ -651,7 +678,12 @@ pub fn execute_scene_switch_from(
         })
     });
     let already_active = state_mgr.is_already_active(next_scene_id, variant_id);
-    let context = PlanContext { trace: &trace, input_tick, preview: false };
+    let context = PlanContext {
+        trace: &trace,
+        input_tick,
+        preview: false,
+        already_active,
+    };
     let plan = selection.and_then(|(scene, variant)| {
         plan_scene_switch(
             scene,
@@ -669,6 +701,7 @@ pub fn execute_scene_switch_from(
         to_minimize,
         mut to_restore,
         mut to_bring_to_front,
+        was_noop_same_scene,
         warnings,
         stale_actions,
         ..
@@ -689,13 +722,13 @@ pub fn execute_scene_switch_from(
             };
         }
     };
+    let journal_dirty = !stale_actions.is_empty() || !to_minimize.is_empty() || !to_restore.is_empty();
     for hwnd in stale_actions {
         recovery.invalidate_hwnd(hwnd);
     }
 
-    // Step 1 idempotency check (AT-03): If `state == Active(next)` and no newly reopened windows need
-    // minimizing/restoring, return a clean no-op without issuing any OS commands.
-    if already_active && to_minimize.is_empty() && to_restore.is_empty() {
+    // AT-03: Reselecting the active scene can change stacking even without minimizing or restoring.
+    if was_noop_same_scene {
         trace.record("finished", || json!({"reason": "already_active"}));
         return SwitchOutcome {
             was_noop_same_scene: true,
@@ -903,7 +936,9 @@ pub fn execute_scene_switch_from(
         });
     }
 
-    let _ = recovery.persist_journal();
+    if !already_active || journal_dirty {
+        let _ = recovery.persist_journal();
+    }
 
     // Step 9: Confirm `state = Active(next)`
     state_mgr.set_active(next_scene_id, variant_id);
@@ -1079,6 +1114,45 @@ fn can_receive_focus(win: &WindowInstance) -> bool {
     win.is_visible && !win.is_iconic && win.is_enabled && !win.is_hung
 }
 
+fn needs_scene_presentation(
+    windows: &[(WindowInstance, usize)],
+    live_windows: &[WindowInstance],
+    focus: bool,
+    sys: &dyn WindowSystem,
+) -> bool {
+    if focus {
+        let focus_target = windows
+            .iter()
+            .rev()
+            .filter(|(win, _)| can_receive_focus(win))
+            .min_by_key(|(_, z)| *z);
+        if focus_target.is_some_and(|(win, _)| sys.get_foreground_window() != Some(win.hwnd)) {
+            return true;
+        }
+    }
+
+    let scene_hwnds: HashSet<_> = windows.iter().map(|(win, _)| win.hwnd).collect();
+    windows
+        .iter()
+        .any(|(win, _)| !win.is_hung && is_covered_by_other_window(win, live_windows, &scene_hwnds))
+}
+
+fn is_covered_by_other_window(
+    target: &WindowInstance,
+    live_windows: &[WindowInstance],
+    scene_hwnds: &HashSet<u64>,
+) -> bool {
+    live_windows
+        .iter()
+        .take_while(|above| above.hwnd != target.hwnd)
+        .any(|above| {
+            above.is_topmost == target.is_topmost
+                && !above.is_iconic
+                && !scene_hwnds.contains(&above.hwnd)
+                && above.window_rect.intersection_area(&target.window_rect) > 0
+        })
+}
+
 fn can_still_minimize(sys: &dyn WindowSystem, win: &WindowInstance) -> bool {
     sys.query_window(win.hwnd).is_some_and(|live| {
         live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
@@ -1163,17 +1237,7 @@ fn repair_scene_presentation(
         .collect();
 
     let scene_hwnds: HashSet<_> = windows.iter().map(|win| win.hwnd).collect();
-    let is_covered = |target: &WindowInstance| {
-        live_windows
-            .iter()
-            .take_while(|above| above.hwnd != target.hwnd)
-            .any(|above| {
-                above.is_topmost == target.is_topmost
-                    && !above.is_iconic
-                    && !scene_hwnds.contains(&above.hwnd)
-                    && above.window_rect.intersection_area(&target.window_rect) > 0
-            })
-    };
+    let is_covered = |target| is_covered_by_other_window(target, &live_windows, &scene_hwnds);
     let normal_windows_covered = windows.iter().any(|win| !win.is_topmost && is_covered(win));
     let topmost_windows_covered = windows.iter().any(|win| win.is_topmost && is_covered(win));
     trace.record("presentation_checked", || {
