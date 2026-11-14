@@ -140,6 +140,9 @@ fn run_message_loop() {
         while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            if msg.message == crate::settings::window::WM_SETTINGS_REQUEST {
+                crate::settings::window::run_file_request();
+            }
         }
     }
 }

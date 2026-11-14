@@ -1,0 +1,133 @@
+<div class="settings" id="settings" aria-busy="true">
+  <aside class="sidebar">
+    <div class="brand" aria-hidden="true"><span class="brand-mark"></span><strong>Kiri</strong><span>設定</span></div>
+    <nav aria-label="設定カテゴリ">
+      <button type="button" data-page="scenes" data-icon="layers" aria-current="page">シーン</button>
+      <button type="button" data-page="launcher" data-icon="panel">ランチャー</button>
+      <button type="button" data-page="behavior" data-icon="monitor">ウィンドウの動作</button>
+      <button type="button" data-page="shortcuts" data-icon="keyboard">ショートカット</button>
+      <button type="button" data-page="backup" data-icon="archive">バックアップ・復旧</button>
+    </nav>
+  </aside>
+  <main id="content" class="content">
+    <section id="scenes" class="page" aria-labelledby="scenes-title">
+      <header class="page-head">
+        <div><h1 id="scenes-title" tabindex="-1">シーン</h1><p>一緒に表示したいウィンドウを、作業ごとにまとめます。</p></div>
+        <button type="button" class="primary" data-edit id="create-scene" data-icon="plus">シーンを作る</button>
+      </header>
+      <div class="guide band" id="first-run" hidden>
+        <div><strong>はじめての設定</strong><p>操作する画面を選び、シーンに開いているウィンドウを追加しましょう。</p></div>
+        <button type="button" id="start-setup" data-edit>画面を選ぶ</button>
+      </div>
+      <div class="band scope">
+        <div class="inline"><div id="mini-monitors" aria-hidden="true"></div>
+          <div><strong id="target-summary"></strong><p>登録済みのウィンドウが切替の対象です。</p></div>
+        </div>
+        <button type="button" class="quiet" data-link="behavior" id="target-link">操作する画面を変更</button>
+      </div>
+      <div class="scene-list" id="scene-list" role="group" aria-label="編集するシーン"></div>
+      <div class="stack" id="scene-editor" hidden>
+        <div class="row wrap">
+          <h2 id="scene-windows"></h2>
+          <button id="add-windows" type="button" data-edit data-icon="plus">ウィンドウを追加</button>
+        </div>
+        <ul class="rows" id="scene-bindings"></ul>
+        <div class="row wrap scene-actions">
+          <button id="scene-details" type="button" class="quiet" data-icon="sliders">シーンの詳細設定</button>
+          <button id="inspect" type="button" class="quiet" data-icon="eye">切替の影響を見る</button>
+        </div>
+      </div>
+      <details id="binding-details">
+        <summary>登録済みウィンドウを管理</summary>
+        <p>複数のシーンでの共有や、再起動後にウィンドウを見分ける条件を設定できます。</p>
+        <div class="row wrap"><h2>ウィンドウの登録</h2><button id="refresh-bindings" type="button" data-icon="refresh">状態を更新</button></div>
+        <ul class="rows" id="all-bindings"></ul>
+      </details>
+    </section>
+    <section id="launcher" class="page" aria-labelledby="launcher-title" hidden>
+      <header class="page-head"><div><h1 id="launcher-title" tabindex="-1">ランチャー</h1><p>Kiri の呼び出し方と、固定バーの見た目を選びます。</p></div></header>
+      <div class="options">
+        <label class="setting"><span><strong>固定バーを表示する</strong><small>画面上にシーンのボタンを表示します。</small></span><input data-edit type="checkbox" id="show_bar"></label>
+        <label class="setting"><span><strong>Ctrl を 2 回押して開く</strong><small>カーソルの近くにランチャーを表示します。</small></span><input data-edit type="checkbox" id="ctrl_double_tap"></label>
+        <p class="notice" id="tray-hint" hidden>どちらもオフの場合は、タスクトレイの Kiri アイコンから開けます。</p>
+      </div>
+      <div class="columns band">
+        <div class="stack">
+          <label class="field">固定バーの向き<select data-edit id="orientation"><option value="horizontal">横向き</option><option value="vertical">縦向き</option></select></label>
+          <label class="field">カーソル付近で開く位置<select data-edit id="cursor_popup_position"><option value="scene_centered">シーンをカーソルに寄せる</option><option value="beside_cursor">カーソルの斜め横に表示</option></select></label>
+        </div>
+        <div class="stack">
+          <h2>固定バーのプレビュー</h2>
+          <div id="bar-preview"></div>
+        </div>
+      </div>
+      <details>
+        <summary>固定バーの詳細設定</summary>
+        <div class="columns">
+          <label class="field">ボタンの大きさ（20〜96）<input data-edit type="number" id="button_size_dip" min="20" max="96" required></label>
+          <label class="field">移動用のつまみ（8〜48）<input data-edit type="number" id="grip_size_dip" min="8" max="48" required></label>
+          <label class="field">固定バーに表示する最大件数（1〜12）<input data-edit type="number" id="visible_slots" min="1" max="12" required></label>
+        </div>
+        <label class="setting"><strong>常に手前に表示する</strong><input data-edit type="checkbox" id="always_on_top"></label>
+        <label class="setting"><strong>画面の端に吸着させる</strong><input data-edit type="checkbox" id="snap_to_edges"></label>
+        <label class="setting"><span><strong>ホイールでシーンを一巡する</strong><small>最後のシーンから先頭に戻ります。</small></span><input data-edit type="checkbox" id="wheel_wrap"></label>
+        <button id="reset-position" type="button" data-edit>固定バーの位置を初期化</button>
+      </details>
+    </section>
+    <section id="behavior" class="page" aria-labelledby="behavior-title" hidden>
+      <header class="page-head"><div><h1 id="behavior-title" tabindex="-1">ウィンドウの動作</h1><p>どの画面で、どのようにウィンドウを切り替えるかを選びます。</p></div></header>
+      <div class="band stack">
+        <div class="row wrap"><h2>操作する画面</h2><button id="refresh-monitors" type="button" class="quiet" data-icon="refresh">接続を確認</button></div>
+        <div class="columns monitor-options">
+          <div id="monitor-map" role="group" aria-label="画面の配置"></div>
+          <label class="field">対象の選び方<select id="target" data-edit></select></label>
+        </div>
+        <p id="monitor-hint"></p>
+        <div class="row" id="setup-next-row" hidden><button type="button" id="setup-next" class="primary">シーンの設定へ進む</button></div>
+      </div>
+      <div class="options">
+        <label class="setting"><span><strong>自分で最小化したウィンドウも表示する</strong><small>切替先のシーンに登録されているウィンドウを再表示します。</small></span><input data-edit id="restore" type="checkbox"></label>
+        <label class="setting"><span><strong>切替先のウィンドウに入力を移す</strong><small>切替後、表示されたアプリですぐ入力できます。</small></span><input data-edit id="focus" type="checkbox"></label>
+        <label class="setting"><span><strong>Windows へのサインイン時に Kiri を起動する</strong><small>次に Windows にサインインするときから有効になります。</small></span><input data-edit id="autostart" type="checkbox"></label>
+      </div>
+    </section>
+    <section id="shortcuts" class="page" aria-labelledby="shortcuts-title" hidden>
+      <header class="page-head"><div><h1 id="shortcuts-title" tabindex="-1">ショートカット</h1><p>シーンを切り替えるキーと、ランチャーから開く項目を管理します。</p></div></header>
+      <div class="stack"><h2>シーンを切り替えるキー</h2><ul class="rows" id="hotkeys"></ul></div>
+      <div class="stack">
+        <div class="row wrap"><h2>ランチャーから開く項目</h2><button type="button" id="new-shortcut" data-edit data-icon="plus">ショートカットを追加</button></div>
+        <ul class="rows" id="shortcut-list"></ul>
+      </div>
+    </section>
+    <section id="backup" class="page" aria-labelledby="backup-title" hidden>
+      <header class="page-head"><div><h1 id="backup-title" tabindex="-1">バックアップ・復旧</h1><p>設定の引き継ぎと、Kiri が最小化したウィンドウの復元ができます。</p></div></header>
+      <div class="band stack">
+        <div><h2>ウィンドウを復元</h2><p>Kiri が最小化したウィンドウだけが対象です。</p></div>
+        <div class="actions"><button type="button" id="recovery-preview" data-icon="restore">復元できるウィンドウを確認</button></div>
+      </div>
+      <div class="band stack">
+        <div><h2>設定を引き継ぐ</h2><p>保存済みの設定を書き出せます。別の PC では、対象の画面やアプリの場所を確認してください。</p></div>
+        <div class="actions"><button type="button" id="export">書き出す</button><button type="button" id="import" data-edit>読み込む</button><button type="button" class="quiet" id="open-folder">保存先を開く</button></div>
+      </div>
+      <details>
+        <summary>診断ログ</summary>
+        <label class="setting"><span><strong>ウィンドウ名を省略せず記録する</strong><small>ファイル名や口座番号などがログに含まれることがあります。</small></span><input data-edit id="verbose" type="checkbox"></label>
+      </details>
+    </section>
+  </main>
+  <footer class="footer">
+    <div class="feedback">
+      <div id="status" role="status">読み込み中…</div>
+      <div id="message" role="alert" hidden></div>
+    </div>
+    <div class="actions"><button type="button" class="quiet" id="discard" disabled>変更を破棄</button><button type="button" class="primary" id="save" disabled>変更を保存</button></div>
+  </footer>
+</div>
+<dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-caption">
+  <form id="dialog-form">
+    <header><h2 id="dialog-title"></h2><p id="dialog-caption"></p></header>
+    <div class="dialog-body stack" id="dialog-body"></div>
+    <div class="dialog-error" id="dialog-error" role="alert" hidden></div>
+    <footer class="dialog-footer"><button type="button" id="dialog-cancel">キャンセル</button><button type="submit" class="primary" id="dialog-submit"></button></footer>
+  </form>
+</dialog>

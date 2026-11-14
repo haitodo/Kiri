@@ -40,6 +40,7 @@ impl AppController {
         sys: Box<dyn WindowSystem>,
     ) -> Self {
         let config = config_mgr.load();
+        crate::diagnostics::set_verbose_title_logging(config.verbose_title_logging);
         let last_scene = config
             .target
             .monitor_id
@@ -71,6 +72,30 @@ impl AppController {
     pub fn check_startup_crash_recovery(&mut self) -> Vec<ManagedAction> {
         self.state_mgr.reset_to_unknown();
         self.recovery.check_previous_crash_journal(&*self.sys)
+    }
+
+    /// Commit new settings before changing the in-memory configuration or launcher behavior.
+    pub fn save_user_settings(&mut self, config: AppConfig) -> Result<(), String> {
+        self.config_mgr.save(&config)?;
+        for binding in &self.config.bindings {
+            if !config.bindings.iter().any(|next| next.id == binding.id
+                && next.match_rule == binding.match_rule
+                && next.instance_hint == binding.instance_hint && next.enabled == binding.enabled)
+            {
+                self.resolver.clear_binding(&binding.id);
+            }
+        }
+        if let Some(pending) = &mut self.pending_verification {
+            pending.cancel_presentation_retry();
+        }
+        if self.config.target != config.target || self.state_mgr.active_scene_id().is_some_and(|id| {
+            !config.scenes.iter().any(|s| s.id == id)
+        }) {
+            self.state_mgr.reset_to_unknown();
+        }
+        crate::diagnostics::set_verbose_title_logging(config.verbose_title_logging);
+        self.config = config;
+        Ok(())
     }
 
     /// Compute the current `LauncherLayout` for `dpi`.
@@ -217,11 +242,19 @@ impl AppController {
 
     /// Restore all windows minimized by Kiri and reset scene state to `Unknown` (Section 8.1, AT-15).
     pub fn restore_all_minimized_windows(&mut self) -> usize {
+        self.restore_minimized_windows(None)
+    }
+
+    pub fn restore_settings_windows(&mut self, windows: &[crate::platform::WindowInstance]) -> usize {
+        self.restore_minimized_windows(Some(windows))
+    }
+
+    fn restore_minimized_windows(&mut self, windows: Option<&[crate::platform::WindowInstance]>) -> usize {
         self.process_queued_win_events();
         if let Some(pending) = self.pending_verification.take() {
             pending.skip_verification("restore_all");
         }
-        let count = self.recovery.restore_all_minimized_by_us(&mut *self.sys);
+        let count = self.recovery.restore_minimized_by_us(&mut *self.sys, windows);
         self.state_mgr.reset_to_unknown();
         self.last_warnings.clear();
         count

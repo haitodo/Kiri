@@ -275,10 +275,16 @@ impl RecoveryManager {
     /// Restore all windows currently minimized by Kiri (Section 8.1 "Kiriが最小化したウィンドウをすべて復元", AT-15).
     /// Restores in reverse Z-order (bottom to top) and returns the number of windows restored.
     pub fn restore_all_minimized_by_us(&mut self, sys: &mut dyn WindowSystem) -> usize {
+        self.restore_minimized_by_us(sys, None)
+    }
+
+    pub fn restore_minimized_by_us(&mut self, sys: &mut dyn WindowSystem, windows: Option<&[WindowInstance]>) -> usize {
         let mut candidates: Vec<ManagedAction> = self
             .actions
             .values()
-            .filter(|a| a.is_restorable_by_us_command())
+            .filter(|a| a.is_restorable_by_us_command() && windows.is_none_or(|windows| windows.iter().any(|win| {
+                win.matches_runtime_identity(a.hwnd, a.pid, a.process_start_time)
+            })))
             .cloned()
             .collect();
 
@@ -315,6 +321,15 @@ impl RecoveryManager {
             &format!("Restored {} window(s) via restore_all_minimized_by_us", restored_count),
         );
         restored_count
+    }
+
+    pub fn restorable_windows(&self, sys: &dyn WindowSystem) -> Vec<WindowInstance> {
+        self.actions.values().filter(|action| action.is_restorable_by_us_command())
+            .filter_map(|action| sys.query_window(action.hwnd).filter(|live| {
+                live.is_iconic && live.matches_runtime_identity(
+                    action.hwnd, action.pid, action.process_start_time
+                )
+            })).collect()
     }
 
     /// Flush current `actions` to `runtime-state.json` atomically.

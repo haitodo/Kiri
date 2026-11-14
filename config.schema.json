@@ -6,6 +6,10 @@
   "required": ["schema_version", "launcher", "target", "scenes", "bindings"],
   "additionalProperties": true,
   "properties": {
+    "verbose_title_logging": {
+      "type": "boolean",
+      "default": false
+    },
     "schema_version": {
       "type": "integer",
       "minimum": 1

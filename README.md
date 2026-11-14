@@ -32,7 +32,7 @@
 | **Win32 ウィンドウシステム** | [src/platform/windows.rs](file:///d:/dev/Kiri/src/platform/windows.rs) | `EnumWindows`（Z順）、`DWMWA_CLOAKED` クローク除外、`IVirtualDesktopManager` 別仮想デスクトップ除外、所有窓除外、`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` によるEXEパス・開始時刻・昇格状態取得、`PKEY_AppUserModel_ID` 取得、最小化窓の `rcNormalPosition` モニター帰属判定、同期 `SendMessage` 完全排除 |
 | **WinEventフック・トレイ** | [src/platform/hooks.rs](file:///d:/dev/Kiri/src/platform/hooks.rs), [src/platform/tray.rs](file:///d:/dev/Kiri/src/platform/tray.rs) | `EVENT_SYSTEM_MINIMIZESTART`〜`MINIMIZEEND` 限定の `WINEVENT_OUTOFCONTEXT` フック、`Shell_NotifyIconW` システムトレイアイコン＋エクスプローラー再起動時（`TaskbarCreated`）自動再登録 |
 | **常駐ランチャーUI** | [src/launcher/window.rs](file:///d:/dev/Kiri/src/launcher/window.rs), [src/launcher/paint.rs](file:///d:/dev/Kiri/src/launcher/paint.rs), [src/launcher/overflow.rs](file:///d:/dev/Kiri/src/launcher/overflow.rs), [src/launcher/input.rs](file:///d:/dev/Kiri/src/launcher/input.rs) | `WS_EX_NOACTIVATE` + `MA_NOACTIVATE`、専用グリップ `HTCAPTION` ドラッグ、グリップダブルクリック位置リセット、右クリックコンテキストメニュー、GDIダブルバッファ＋ブラシ/ペンキャッシュ描画、内蔵ベクターアイコン（chart/code/globe）および外部 `.ico` ファイルロード・キャッシュ、トラッキングツールチップ（`TOOLTIPS_CLASSW`）、フォーカス非奪取 `⋯` ポップアップ、FFI境界 `catch_unwind` パニック保護 |
-| **ネイティブ設定画面** | [src/settings/window.rs](file:///d:/dev/Kiri/src/settings/window.rs), [src/settings/mod.rs](file:///d:/dev/Kiri/src/settings/mod.rs) | Win32標準コントロールによる5タブ構成（シーン／アプリとシーン／ランチャー／動作／ショートカット）。候補ウィンドウ列挙・警告表示、自動起動レジストリ（`HKCU\...\Run`）連携、アトミック保存 |
+| **設定画面** | [src/settings/window.rs](file:///d:/dev/Kiri/src/settings/window.rs), [src/settings/mod.rs](file:///d:/dev/Kiri/src/settings/mod.rs) | 固定サイズの Win32 ウィンドウにローカルの WebView2 UI を表示。シーン単位のウィンドウ登録と切替プレビュー、対象画面、ショートカット、バックアップ・復旧 |
 | **単一インスタンス・DPIマニフェスト** | [src/main.rs](file:///d:/dev/Kiri/src/main.rs), [app.manifest](file:///d:/dev/Kiri/app.manifest), [build.rs](file:///d:/dev/Kiri/build.rs) | `CreateMutexW("Local\\Kiri-...")` によるセッション単一インスタンス化、多重起動時の `AllowSetForegroundWindow` + 既存インスタンス設定画面起動通知、Per-Monitor DPI Awareness V2 マニフェスト埋め込み |
 | **構造化ログ・タイトルマスク** | [src/diagnostics.rs](file:///d:/dev/Kiri/src/diagnostics.rs) | 口座番号等を含むウィンドウタイトルの既定マスク出力（`mask_title`）、GDI/USERオブジェクト計測ヘルパー |
 | **テスト用ダミーアプリ** | [tools/testwin/src/main.rs](file:///d:/dev/Kiri/tools/testwin/src/main.rs) | 複数窓、モーダル表示中、応答なし、最小化時トレイ非表示、タスクバーボタンなし、最大化、動的タイトル変化を再現する検証用Win32アプリ |
@@ -139,32 +139,17 @@ cargo build --release --workspace
 
 ## 7. 設定画面の使い方
 
-固定バーまたはトレイアイコンを右クリックして「設定」を開きます。
+固定バーまたはタスクトレイの Kiri アイコンを右クリックして「設定」を開きます。カテゴリを切り替えてもウィンドウの大きさと下部の「変更を保存」の位置は固定です。項目が長いときは内容欄だけがスクロールします。
 
-1. **シーン（Scenes）タブ**:
-   - シーンの追加（ID / 表示名 / アイコン種別 `chart` / `code` / `globe` または外部 `.ico` パス / 固定表示ピン）。
-   - シーンの削除、並び順の変更（上へ / 下へ）。
-2. **ウィンドウ（Windows）タブ**:
-   - 現在デスクトップ上で開いているトップレベルウィンドウを `[左モニター]` / `[右モニター]` ラベル付きで列挙。
-   - **シーンへの追加・複数シーン共有**: 1つのウィンドウを複数のシーン（例: `Workspace A` と `Workspace B`）に登録することで、シーン間でそのモニターのウィンドウを表示維持し、反対側のモニターだけを切り替える運用が可能。
-   - **再起動後の自動認識ルール**: アプリ（Edgeの複数ウィンドウ、チャート、エディタ等）を閉じて再度開いた際も、「配置モニター（左/右）」と「タイトル識別キーワード（サイト名・タブ名等）」の組み合わせで自動的に再認識。
-   - 危険なウィンドウに対するリアルタイム警告表示（タスクバーボタンを持たない窓、管理者昇格プロセス、対象モニター外の窓、動的タイトルによる曖昧化リスク）。
-3. **ランチャー（Launcher）タブ**:
-   - 横型／縦型の切替。
-   - ボタンサイズ（既定 32 DIP）、グリップ幅（既定 18 DIP）、固定表示スロット数（既定 3）。
-   - 常時最前面（Topmost）、画面端スナップ（12 DIP）、位置リセット。
-   - 固定バーの表示と Ctrl の二度押しを個別に切り替えられます。どちらも既定で有効です。
-   - 「ポップアップの表示位置」で「シーンをカーソルに寄せる」（既定）と「カーソルの斜め横に表示」を選べます。
-   - 「ホイールでシーンを一巡する」を有効にすると、固定バーとカーソル付近のランチャーの両方で先頭・末尾から反対側に切り替わります。
-4. **動作（Behavior）タブ**:
-   - 制御対象モニターの指定（既定: **「すべてのモニター (左右/全画面の登録ウィンドウを切替)」**、または特定モニターの単一固定、ランチャー所在モニターへの自動追従）。
-   - **登録アプリの全復元保証**: 「シーン切替時に登録アプリを確実にすべて表示する (手動最小化されたアプリも復元)」オプション（既定有効）。手動で最小化していたアプリも含め、シーン選択時に登録アプリを100%確実に画面に復元・表示します。
-   - Windowsログオン時の自動起動（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`）の有効化／無効化。
-   - 詳細タイトルログ出力のON/OFF。
-   - フェイルセーフ「最小化した全ウィンドウを今すぐ復元」ボタン。
-5. **ショートカット**
-   - 表示名、種類、場所を入力し、［リストに反映］から［適用］へ進みます。フォルダーとファイルは［参照…］で選択でき、サイトには `https://` または `http://` で始まる URL を指定します。
-   - ［上へ］と［下へ］で、カーソル付近のランチャーに表示する順番を変更できます。
+1. **シーン**：初回は「画面を選ぶ」から始めます。「シーンを作る」で名前を付け、「ウィンドウを追加」から開いているアプリを選びます。追加候補にはアプリ名・ウィンドウ名・画面番号が出ます。対象外や候補が複数ある場合はその理由を確認できます。「切替の影響を見る」は、現在のウィンドウと編集中の設定から、表示・最小化・維持の見込みを表示します。この操作でアプリのウィンドウは変わりません。
+2. **ランチャー**：固定バーの表示、Ctrl の二度押し、表示位置、縦横を切り替えられます。固定バーの見た目はその場で確認できます。大きさ、表示件数、端への吸着、ホイールの一巡、位置の初期化は「固定バーの詳細設定」にあります。
+3. **ウィンドウの動作**：画面の配置図から対象を選べます。すべての画面、特定の画面、固定バーのある画面を選択できます。手動で最小化したウィンドウの再表示、切替後の入力先、Windows サインイン時の自動起動もここで変更します。
+4. **ショートカット**：シーンを切り替えるキーと、カーソル付近のランチャーから開くフォルダー・ファイル・サイトを設定します。
+5. **バックアップ・復旧**：保存済みの設定をエクスポートできます。インポートした内容は確認してから保存します。Kiri が最小化したウィンドウの復元と、診断ログもここにあります。
+
+「登録済みウィンドウを管理」では、別シーンへの共有、常に表示する設定、再起動後の識別条件を編集できます。候補が複数出る場合は「候補を確認」から対象を選んでください。シーンのアイコン、並び順、固定表示、保存したウィンドウ配置は「シーンの詳細設定」で管理します。
+
+編集は画面下の「変更を保存」で反映します。書き込みエラーの場合は編集中の内容が残ります。既存の設定ファイルは引き継がれます。設定画面は Windows 11 の **Microsoft Edge WebView2 ランタイム**で開きます。ランタイムは設定を開くときだけ読み込み、画面の表示に通信は不要です。
 
 ---
 

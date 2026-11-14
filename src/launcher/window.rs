@@ -32,6 +32,7 @@ use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
 use crate::scenes::manager::SceneState;
 use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
+use crate::settings::{window::{SettingsWindow, WM_SETTINGS_REQUEST}, SettingsPage};
 use windows::core::PWSTR;
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
@@ -44,8 +45,6 @@ pub const LAUNCHER_WINDOW_CLASS: &str = "KiriLauncherWindowClass";
 
 /// Message sent by a 2nd process instance to open Settings on the running instance (Section 7.2 & 8.2).
 pub const WM_APP_OPEN_SETTINGS: u32 = 0x8000 + 4; // WM_APP + 4
-pub const WM_APP_SETTINGS_SAVED: u32 = 0x8000 + 5; // WM_APP + 5
-pub const WM_APP_RESTORE_ALL: u32 = 0x8000 + 6; // WM_APP + 6
 
 const TIMER_VERIFY_SWITCH: usize = 101;
 const TIMER_DISPLAY_DEBOUNCE: usize = 102;
@@ -258,7 +257,7 @@ impl LauncherWindowHost {
         }
     }
 
-    pub fn register_configured_hotkeys(&mut self) {
+    pub fn register_configured_hotkeys(&mut self) -> Vec<String> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
         };
@@ -312,6 +311,7 @@ impl LauncherWindowHost {
                 true,
             );
         }
+        failed_scenes
     }
 
     fn apply_launcher_settings(&mut self) {
@@ -827,17 +827,20 @@ impl LauncherWindowHost {
                 self.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
             }
             PopupAction::OpenShortcut(shortcut) => super::shortcuts::open(shortcut),
-            PopupAction::OpenSettings => crate::settings::window::SettingsWindow::show(
-                self.hwnd,
-                &self.app,
-                Some(crate::settings::SettingsTab::Shortcuts),
-            ),
+            PopupAction::OpenSettings => self.show_settings(SettingsPage::Shortcuts),
         }
     }
 
     pub fn open_settings_dialog(&mut self) {
         self.hide_cursor_popup();
-        crate::settings::window::SettingsWindow::show(self.hwnd, &self.app, None);
+        self.show_settings(SettingsPage::Scenes);
+    }
+
+    fn show_settings(&self, page: SettingsPage) {
+        if let Err(error) = SettingsWindow::show(self.hwnd, &self.app, page) {
+            log_warn("settings", &error);
+            self.notify_tray("Kiri 設定", "設定画面を開けませんでした。", true);
+        }
     }
 }
 
@@ -849,7 +852,7 @@ unsafe extern "system" fn launcher_wndproc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use crate::config::RectData;
-    use windows::Win32::Foundation::{LRESULT, POINT, RECT};
+    use windows::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
     };
@@ -1291,28 +1294,16 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
-            WM_APP_SETTINGS_SAVED => {
-                let ptr = wparam.0 as *mut crate::config::AppConfig;
-                if !ptr.is_null() {
+            WM_SETTINGS_REQUEST => {
+                let settings = HWND(wparam.0 as *mut _);
+                if SettingsWindow::dispatch(settings, hwnd, &mut host.app) {
                     host.hide_cursor_popup();
-                    if let Some(pending) = &mut host.app.pending_verification {
-                        pending.cancel_presentation_retry();
-                    }
-                    let new_cfg = *Box::from_raw(ptr);
-                    host.app.config = new_cfg;
-                    let _ = host.app.config_mgr.save(&host.app.config);
                     let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                     host.apply_window_bounds(x, y, w, h);
-                    host.register_configured_hotkeys();
+                    let failed = host.register_configured_hotkeys();
+                    SettingsWindow::show_hotkey_conflicts(settings, &failed);
                     host.apply_launcher_settings();
-                    let _ = InvalidateRect(hwnd, None, false);
                 }
-                LRESULT(0)
-            }
-
-            WM_APP_RESTORE_ALL => {
-                host.hide_cursor_popup();
-                host.app.restore_all_minimized_windows();
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }

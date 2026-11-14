@@ -1,33 +1,19 @@
-//! Settings Window framework, view-model preparation, and Windows Autostart (`HKCU\...\Run`) helper.
-//!
-//! Per Section 2.4 & 11 of spec.md:
-//! - The Settings window is a normal top-level window opened on demand ("右クリック → 設定" or 2nd instance activation).
-//! - When closed, the window and all its GDI/Win32 control resources are destroyed so resident memory stays minimal.
-//! - Provides `SettingsViewModel` and helper methods for the settings tabs:
-//!   1. Scenes (`SceneTab`): create/delete/rename scenes, icon, order, `pinned`.
-//!   2. Windows (`WindowsTab`): live open window list with `RegistrationWarning` badges & safe `TitleRule` suggestion.
-//!   3. Launcher (`LauncherTab`): orientation, button/grip size, visible slots, always-on-top, snap, reset position.
-//!   4. Behavior (`BehaviorTab`): target monitor selector, focus_on_switch, hotkeys, autostart registry, recovery.
-//!   5. Shortcuts: register and reorder folders, files, and sites.
+//! Settings draft, matching helpers and Windows logon startup preference.
 
+mod editor;
+mod files;
 pub mod window;
+pub use editor::SettingsPage;
 
-use crate::config::{AppConfig, InstanceHint, MonitorPolicy, TitleRule, TitleRuleType, WindowBinding, WindowMatch};
+use crate::config::{
+    AppConfig, InstanceHint, MonitorPolicy, TitleRule, TitleRuleType, WindowBinding, WindowMatch,
+};
 use crate::platform::{MonitorInfoData, WindowInstance, WindowSystem};
 use crate::scenes::bindings::{
     evaluate_registration_warnings, exe_paths_equal, extract_smart_title_keyword,
     suggest_safe_title_rule, RegistrationWarning,
 };
 use std::collections::HashSet;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsTab {
-    Scenes,
-    Windows,
-    Launcher,
-    Behavior,
-    Shortcuts,
-}
 
 #[derive(Debug, Clone)]
 pub struct CandidateWindowRow {
@@ -62,45 +48,26 @@ pub struct AppBindingRow {
 /// Snapshot of data needed to render and edit the Settings window.
 #[derive(Debug, Clone)]
 pub struct SettingsViewModel {
-    pub active_tab: SettingsTab,
     pub config_draft: AppConfig,
     pub monitors: Vec<MonitorInfoData>,
     pub candidate_windows: Vec<CandidateWindowRow>,
     pub binding_rows: Vec<AppBindingRow>,
-    pub autostart_enabled: bool,
+    launcher_monitor_id: Option<String>,
 }
 
 impl SettingsViewModel {
     /// Build a fresh `SettingsViewModel` by enumerating monitors and open windows via `WindowSystem`.
-    /// If `target.monitor_id` is not set yet, pre-populates the recommended monitor (launcher's monitor or secondary/primary).
     pub fn build(
         config: &AppConfig,
         sys: &dyn WindowSystem,
         launcher_monitor_id: Option<&str>,
     ) -> Self {
-        let mut draft = config.clone();
-        let monitors = sys.monitors();
-
-        if draft.target.monitor_id.is_none() {
-            let recommended = launcher_monitor_id
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    monitors
-                        .iter()
-                        .find(|m| !m.is_primary)
-                        .or_else(|| monitors.first())
-                        .map(|m| m.monitor_id.clone())
-                });
-            draft.target.monitor_id = recommended;
-        }
-
         let mut vm = Self {
-            active_tab: SettingsTab::Windows,
-            config_draft: draft,
-            monitors,
+            config_draft: config.clone(),
+            monitors: Vec::new(),
             candidate_windows: Vec::new(),
             binding_rows: Vec::new(),
-            autostart_enabled: is_autostart_enabled(),
+            launcher_monitor_id: launcher_monitor_id.map(str::to_owned),
         };
         vm.refresh_candidates(sys);
         vm
@@ -109,29 +76,44 @@ impl SettingsViewModel {
     /// Re-enumerate live windows from `sys` and match against `self.config_draft.bindings`.
     pub fn refresh_candidates(&mut self, sys: &dyn WindowSystem) {
         self.monitors = sys.monitors();
-        let target_mon_ref = if self.config_draft.target.monitor_policy == MonitorPolicy::AllMonitors
-        {
-            None
-        } else {
-            self.config_draft.target.monitor_id.as_deref()
-        };
-        let open_windows = sys.enumerate_windows();
-
-        self.candidate_windows = open_windows
+        self.monitors
+            .sort_by_key(|m| (m.monitor_rect.left, m.monitor_rect.top));
+        self.candidate_windows = sys
+            .enumerate_windows()
             .into_iter()
-            .map(|win| {
-                let warnings = evaluate_registration_warnings(&win, target_mon_ref);
-                CandidateWindowRow {
-                    instance: win,
-                    warnings,
-                    bound_scene_ids: Vec::new(),
-                    existing_binding_id: None,
-                    always_visible: false,
-                }
+            .map(|win| CandidateWindowRow {
+                instance: win,
+                warnings: Vec::new(),
+                bound_scene_ids: Vec::new(),
+                existing_binding_id: None,
+                always_visible: false,
             })
             .collect();
+        self.refresh_annotations();
+    }
+
+    pub fn refresh_annotations(&mut self) {
+        let target = self.target_monitor();
+        for row in &mut self.candidate_windows {
+            row.warnings = evaluate_registration_warnings(&row.instance, target.as_deref());
+        }
         self.sync_binding_annotations();
         self.sync_binding_rows();
+    }
+
+    pub fn set_launcher_monitor(&mut self, launcher_monitor_id: Option<&str>) {
+        self.launcher_monitor_id = launcher_monitor_id.map(str::to_owned);
+    }
+
+    pub fn target_monitor(&self) -> Option<String> {
+        (self.config_draft.target.monitor_policy != MonitorPolicy::AllMonitors)
+            .then(|| {
+                crate::scenes::switch::resolve_effective_target_monitor_id(
+                    &self.config_draft,
+                    self.launcher_monitor_id.as_deref(),
+                )
+            })
+            .flatten()
     }
 
     /// Return a user-friendly position label for a monitor (e.g. "左モニター", "右モニター").
@@ -227,31 +209,48 @@ impl SettingsViewModel {
             }
         }
 
-        // Pass 2: Rule + monitor placement match (preferring specific title rules first)
-        for require_specific_title in [true, false] {
-            for row in &mut self.candidate_windows {
-                if row.existing_binding_id.is_some() {
-                    continue;
-                }
-                if let Some(b) = bindings.iter().find(|b| {
-                    if !b.enabled || claimed_binding_ids.contains(&b.id) {
-                        return false;
-                    }
-                    let is_specific = b.match_rule.title_rule.rule_type != TitleRuleType::Any;
-                    if is_specific != require_specific_title {
-                        return false;
-                    }
-                    if let Some(ref req_mon) = b.match_rule.monitor_id {
-                        if req_mon != &row.instance.monitor_id {
-                            return false;
-                        }
-                    }
-                    crate::scenes::bindings::matches_window_rule(&b.match_rule, &row.instance)
-                }) {
-                    row.bound_scene_ids = b.scene_ids.clone();
-                    row.existing_binding_id = Some(b.id.clone());
-                    row.always_visible = b.always_visible;
-                    claimed_binding_ids.insert(b.id.clone());
+        let instances: Vec<_> = self
+            .candidate_windows
+            .iter()
+            .map(|row| row.instance.clone())
+            .collect();
+        let monitor_ids: Vec<_> = self
+            .monitors
+            .iter()
+            .map(|monitor| monitor.monitor_id.clone())
+            .collect();
+        let mut claimed: HashSet<_> = self
+            .candidate_windows
+            .iter()
+            .filter(|row| row.existing_binding_id.is_some())
+            .map(|row| row.instance.hwnd)
+            .collect();
+        let mut resolver = crate::scenes::bindings::BindingResolver::new();
+        let mut remaining: Vec<_> = bindings
+            .iter()
+            .filter(|b| b.enabled && !claimed_binding_ids.contains(&b.id))
+            .collect();
+        remaining.sort_by_key(|b| {
+            (
+                b.match_rule.title_rule.rule_type == TitleRuleType::Any,
+                b.match_rule.monitor_id.is_none(),
+            )
+        });
+        // Identify existing registrations even outside the selected monitor. Never mark an
+        // ambiguous candidate as registered just because it was first in the window list.
+        for binding in remaining {
+            if let crate::scenes::bindings::BindingResolution::Resolved(win) =
+                resolver.resolve_binding_multi_monitor(binding, &instances, &monitor_ids, &claimed)
+            {
+                if let Some(row) = self
+                    .candidate_windows
+                    .iter_mut()
+                    .find(|row| row.instance.hwnd == win.hwnd)
+                {
+                    row.bound_scene_ids = binding.scene_ids.clone();
+                    row.existing_binding_id = Some(binding.id.clone());
+                    row.always_visible = binding.always_visible;
+                    claimed.insert(win.hwnd);
                 }
             }
         }
@@ -266,6 +265,28 @@ impl SettingsViewModel {
     ) -> String {
         let suggested_kw = self.suggest_default_title_keyword(win);
         self.bind_window_to_scene_with_options(win, scene_id, always_visible, suggested_kw, true)
+    }
+
+    pub fn add_window_to_scene(&mut self, win: &WindowInstance, scene_id: &str) {
+        let existing = self
+            .candidate_windows
+            .iter()
+            .find(|row| row.instance.hwnd == win.hwnd)
+            .and_then(|row| row.existing_binding_id.as_deref());
+        if let Some(binding) = self
+            .config_draft
+            .bindings
+            .iter_mut()
+            .find(|binding| Some(binding.id.as_str()) == existing)
+        {
+            if !binding.scene_ids.iter().any(|id| id == scene_id) {
+                binding.scene_ids.push(scene_id.into());
+                self.sync_binding_annotations();
+                self.sync_binding_rows();
+            }
+        } else {
+            self.bind_window_to_scene(win, scene_id, false);
+        }
     }
 
     /// Register or update a `WindowInstance` into `scene_id` with explicit title keyword and monitor pinning.
@@ -308,7 +329,7 @@ impl SettingsViewModel {
                         && h.last_start_time == Some(win.process_start_time)
                 })
                 .unwrap_or(false);
-            exact_hwnd || synced_binding_id.as_deref() == Some(b.id.as_str())
+            b.enabled && (exact_hwnd || synced_binding_id.as_deref() == Some(b.id.as_str()))
         }) {
             if !existing.scene_ids.iter().any(|s| s == scene_id) {
                 existing.scene_ids.push(scene_id.to_string());
@@ -355,7 +376,15 @@ impl SettingsViewModel {
             }
         }
 
-        let binding_id = format!("bind-{}-{:x}", win.pid, win.hwnd);
+        let base_id = format!("bind-{}-{:x}", win.pid, win.hwnd);
+        let binding_id = if self.config_draft.bindings.iter().all(|b| b.id != base_id) {
+            base_id
+        } else {
+            (2..)
+                .map(|n| format!("{base_id}-{n}"))
+                .find(|id| self.config_draft.bindings.iter().all(|b| &b.id != id))
+                .unwrap()
+        };
         let binding = WindowBinding {
             id: binding_id.clone(),
             match_rule: WindowMatch {
@@ -382,7 +411,7 @@ impl SettingsViewModel {
         binding_id
     }
 
-    /// Remove `scene_id` from a binding. If the binding has no remaining scenes, remove the binding itself.
+    /// Stop managing an ordinary binding when its last scene is removed.
     pub fn unbind_window_from_scene(&mut self, binding_id: &str, scene_id: &str) {
         if let Some(b) = self
             .config_draft
@@ -394,7 +423,17 @@ impl SettingsViewModel {
         }
         self.config_draft
             .bindings
-            .retain(|b| b.id != binding_id || !b.scene_ids.is_empty());
+            .retain(|b| b.id != binding_id || !b.scene_ids.is_empty() || b.always_visible);
+        for layout in self
+            .config_draft
+            .layouts
+            .iter_mut()
+            .filter(|l| l.scene_id == scene_id)
+        {
+            layout
+                .entries
+                .retain(|entry| entry.binding_id != binding_id);
+        }
         self.sync_binding_annotations();
         self.sync_binding_rows();
     }
@@ -407,12 +446,8 @@ impl SettingsViewModel {
             .iter()
             .map(|c| c.instance.clone())
             .collect();
-        let target_mon_id = self
-            .config_draft
-            .target
-            .monitor_id
-            .as_deref()
-            .or_else(|| self.monitors.first().map(|m| m.monitor_id.as_str()));
+        let target_mon_id = self.target_monitor();
+        let monitor_ids: Vec<String> = self.monitors.iter().map(|m| m.monitor_id.clone()).collect();
         let mut resolver = crate::scenes::bindings::BindingResolver::new();
 
         let mut rows = Vec::new();
@@ -425,17 +460,32 @@ impl SettingsViewModel {
             let is_running = matching_cand.is_some();
             let live_hwnd = matching_cand.map(|c| c.instance.hwnd);
             let live_pid = matching_cand.map(|c| c.instance.pid);
-            let mut warnings = matching_cand.map(|c| c.warnings.clone()).unwrap_or_default();
+            let mut warnings = matching_cand
+                .map(|c| c.warnings.clone())
+                .unwrap_or_default();
             let mut ambiguous_candidates: Vec<WindowInstance> = Vec::new();
 
-            if let Some(mon_id) = target_mon_id {
+            if b.enabled {
                 let mut rule_matches: Vec<WindowInstance> = all_instances
                     .iter()
                     .filter(|w| crate::scenes::bindings::matches_window_rule(&b.match_rule, w))
                     .cloned()
                     .collect();
 
-                match resolver.resolve_binding(b, &all_instances, mon_id) {
+                let resolution = match (
+                    self.config_draft.target.monitor_policy,
+                    target_mon_id.as_deref(),
+                ) {
+                    (MonitorPolicy::AllMonitors, _) => resolver.resolve_binding_multi_monitor(
+                        b,
+                        &all_instances,
+                        &monitor_ids,
+                        &HashSet::new(),
+                    ),
+                    (_, Some(mon_id)) => resolver.resolve_binding(b, &all_instances, mon_id),
+                    _ => crate::scenes::bindings::BindingResolution::NotFound,
+                };
+                match resolution {
                     crate::scenes::bindings::BindingResolution::AmbiguousSameMonitor(cands) => {
                         if !warnings
                             .iter()
@@ -486,21 +536,21 @@ impl SettingsViewModel {
                 "(未起動)".to_string()
             };
 
-            let custom_title_keyword = b
-                .match_rule
-                .title_rule
-                .value
-                .clone()
-                .unwrap_or_default();
+            let custom_title_keyword = b.match_rule.title_rule.value.clone().unwrap_or_default();
 
-            let monitor_id = b.match_rule.monitor_id.clone().or_else(|| {
-                matching_cand.map(|c| c.instance.monitor_id.clone())
-            });
+            let monitor_id = b
+                .match_rule
+                .monitor_id
+                .clone()
+                .or_else(|| matching_cand.map(|c| c.instance.monitor_id.clone()));
 
             let monitor_label = match &b.match_rule.monitor_id {
                 Some(m) => self.format_monitor_short_label(m),
                 None => match matching_cand {
-                    Some(cand) => format!("{}(不問)", self.format_monitor_short_label(&cand.instance.monitor_id)),
+                    Some(cand) => format!(
+                        "{}(不問)",
+                        self.format_monitor_short_label(&cand.instance.monitor_id)
+                    ),
                     None => "全画面".to_string(),
                 },
             };
@@ -542,6 +592,11 @@ impl SettingsViewModel {
                 disambiguator: extract_smart_title_keyword(&win.title),
             });
             b.match_rule.monitor_id = Some(win.monitor_id.clone());
+            if b.match_rule.title_rule.rule_type == TitleRuleType::Any {
+                if let Some(keyword) = extract_smart_title_keyword(&win.title) {
+                    b.match_rule.title_rule = TitleRule::contains(keyword);
+                }
+            }
         }
         self.sync_binding_annotations();
         self.sync_binding_rows();
@@ -595,6 +650,7 @@ impl SettingsViewModel {
     }
 
     /// Toggle membership of a binding in a specific scene.
+    #[cfg(test)]
     pub fn toggle_scene_binding(&mut self, binding_id: &str, scene_id: &str) {
         if let Some(b) = self
             .config_draft
@@ -613,6 +669,7 @@ impl SettingsViewModel {
     }
 
     /// Toggle always_visible flag on a binding.
+    #[cfg(test)]
     pub fn toggle_always_visible(&mut self, binding_id: &str) {
         if let Some(b) = self
             .config_draft
@@ -629,11 +686,17 @@ impl SettingsViewModel {
     /// Remove a binding completely from configuration.
     pub fn remove_binding(&mut self, binding_id: &str) {
         self.config_draft.bindings.retain(|b| b.id != binding_id);
+        for layout in &mut self.config_draft.layouts {
+            layout
+                .entries
+                .retain(|entry| entry.binding_id != binding_id);
+        }
         self.sync_binding_annotations();
         self.sync_binding_rows();
     }
 
     /// Update title keyword rule on an existing binding.
+    #[cfg(test)]
     pub fn update_binding_title_keyword(&mut self, binding_id: &str, keyword: Option<String>) {
         if let Some(b) = self
             .config_draft
@@ -645,28 +708,6 @@ impl SettingsViewModel {
             b.match_rule.title_rule = match kw_trimmed {
                 Some(kw) => TitleRule::contains(kw),
                 None => TitleRule::any(),
-            };
-        }
-        self.sync_binding_annotations();
-        self.sync_binding_rows();
-    }
-
-    /// Update monitor restriction rule on an existing binding.
-    pub fn update_binding_monitor_pin(&mut self, binding_id: &str, pin_to_monitor: bool, target_mon: Option<String>) {
-        if let Some(b) = self
-            .config_draft
-            .bindings
-            .iter_mut()
-            .find(|b| b.id == binding_id)
-        {
-            b.match_rule.monitor_id = if pin_to_monitor {
-                target_mon.or_else(|| {
-                    b.instance_hint
-                        .as_ref()
-                        .and_then(|h| h.last_monitor_id.clone())
-                })
-            } else {
-                None
             };
         }
         self.sync_binding_annotations();
@@ -710,46 +751,61 @@ pub fn is_autostart_enabled() -> bool {
 #[cfg(windows)]
 pub fn set_autostart_enabled(enable: bool) -> Result<(), String> {
     use windows::core::w;
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
+    let command = if enable {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let quoted = format!("\"{}\"", exe.display());
+        quoted
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     unsafe {
         let mut hkey = HKEY::default();
-        RegOpenKeyExW(
+        RegCreateKeyExW(
             HKEY_CURRENT_USER,
             w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
             0,
+            None,
+            REG_OPTION_NON_VOLATILE,
             KEY_SET_VALUE,
+            None,
             &mut hkey,
+            None,
         )
         .ok()
-        .map_err(|e| format!("RegOpenKeyExW failed: {}", e))?;
+        .map_err(|e| e.to_string())?;
 
-        let res = if enable {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let quoted = format!("\"{}\"", exe.display());
-            let wide: Vec<u16> = quoted.encode_utf16().chain(std::iter::once(0)).collect();
-            let byte_slice =
-                std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
-            RegSetValueExW(hkey, w!("Kiri"), 0, REG_SZ, Some(byte_slice))
-                .ok()
-                .map_err(|e| format!("RegSetValueExW failed: {}", e))
+        let result = if enable {
+            RegSetValueExW(hkey, w!("Kiri"), 0, REG_SZ, Some(&command)).ok()
         } else {
-            let _ = RegDeleteValueW(hkey, w!("Kiri"));
-            Ok(())
+            let result = RegDeleteValueW(hkey, w!("Kiri"));
+            if result == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                result.ok()
+            }
         };
 
         let _ = RegCloseKey(hkey);
-        res
+        result.map_err(|e| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, InstanceHint, RectData, Scene, TitleRule, WindowBinding, WindowMatch};
+    use crate::config::{
+        AppConfig, InstanceHint, RectData, Scene, TitleRule, WindowBinding, WindowMatch,
+    };
     use crate::platform::fake::FakeWindowSystem;
     use crate::platform::WindowInstance;
 
@@ -874,37 +930,71 @@ mod tests {
 
         // 1. Verify matrix binding_rows has 2 apps (running MT5 and non-running TickScope)
         assert_eq!(vm.binding_rows.len(), 2);
-        let mt5_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-mt5").unwrap();
+        let mt5_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-mt5")
+            .unwrap();
         assert!(mt5_row.is_running);
         assert_eq!(mt5_row.window_title, "MT5 - EURUSD");
         assert_eq!(mt5_row.bound_scene_ids, vec!["trade"]);
         assert!(!mt5_row.always_visible);
 
-        let offline_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-offline").unwrap();
+        let offline_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-offline")
+            .unwrap();
         assert!(!offline_row.is_running);
         assert!(offline_row.always_visible);
         assert_eq!(offline_row.custom_title_keyword, "Main");
 
+        let original_binding = vm.config_draft.bindings[0].clone();
+        let existing = sys.query_window(0x100).unwrap();
+        vm.add_window_to_scene(&existing, "code");
+        let mut shared = original_binding;
+        shared.scene_ids.push("code".into());
+        assert_eq!(vm.config_draft.bindings[0], shared);
+        vm.add_window_to_scene(&existing, "code");
+        assert_eq!(vm.config_draft.bindings[0], shared);
+        vm.toggle_scene_binding("bind-mt5", "code");
+
         // 2. Toggle MT5 into "code" scene as well (multiple scene binding)
         vm.toggle_scene_binding("bind-mt5", "code");
-        let mt5_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-mt5").unwrap();
+        let mt5_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-mt5")
+            .unwrap();
         assert!(mt5_row.bound_scene_ids.contains(&"trade".to_string()));
         assert!(mt5_row.bound_scene_ids.contains(&"code".to_string()));
 
         // Toggle MT5 out of "trade" scene
         vm.toggle_scene_binding("bind-mt5", "trade");
-        let mt5_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-mt5").unwrap();
+        let mt5_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-mt5")
+            .unwrap();
         assert!(!mt5_row.bound_scene_ids.contains(&"trade".to_string()));
         assert_eq!(mt5_row.bound_scene_ids, vec!["code"]);
 
         // 3. Toggle always_visible
         vm.toggle_always_visible("bind-mt5");
-        let mt5_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-mt5").unwrap();
+        let mt5_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-mt5")
+            .unwrap();
         assert!(mt5_row.always_visible);
 
         // 4. Update title keyword
         vm.update_binding_title_keyword("bind-mt5", Some("EURUSD".to_string()));
-        let mt5_row = vm.binding_rows.iter().find(|r| r.binding_id == "bind-mt5").unwrap();
+        let mt5_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "bind-mt5")
+            .unwrap();
         assert_eq!(mt5_row.custom_title_keyword, "EURUSD");
 
         // 5. Add new window (VS Code) to "code" scene
@@ -923,7 +1013,11 @@ mod tests {
             true,
         );
         assert_eq!(vm.binding_rows.len(), 3);
-        let vscode_row = vm.binding_rows.iter().find(|r| r.binding_id == new_id).unwrap();
+        let vscode_row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == new_id)
+            .unwrap();
         assert!(vscode_row.is_running);
         assert_eq!(vscode_row.exe_name, "Code.exe");
         assert_eq!(vscode_row.bound_scene_ids, vec!["code"]);
@@ -931,7 +1025,10 @@ mod tests {
         // 6. Remove offline binding
         vm.remove_binding("bind-offline");
         assert_eq!(vm.binding_rows.len(), 2);
-        assert!(vm.binding_rows.iter().all(|r| r.binding_id != "bind-offline"));
+        assert!(vm
+            .binding_rows
+            .iter()
+            .all(|r| r.binding_id != "bind-offline"));
 
         // 7. Hotkey + layout helpers
         assert_eq!(vm.get_scene_hotkey("trade"), None);
@@ -988,8 +1085,16 @@ mod tests {
         ));
 
         let mut vm = SettingsViewModel::build(&config, &sys, Some("MON-2-TARGET"));
-        let row = vm.binding_rows.iter().find(|r| r.binding_id == "b-dup").unwrap();
+        let row = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "b-dup")
+            .unwrap();
         assert_eq!(row.ambiguous_candidates.len(), 2);
+        assert!(vm
+            .candidate_windows
+            .iter()
+            .all(|window| window.existing_binding_id.is_none()));
         assert!(row
             .warnings
             .iter()
@@ -997,7 +1102,11 @@ mod tests {
 
         let chosen = row.ambiguous_candidates[1].clone();
         vm.resolve_binding_to_instance("b-dup", &chosen);
-        let row_after = vm.binding_rows.iter().find(|r| r.binding_id == "b-dup").unwrap();
+        let row_after = vm
+            .binding_rows
+            .iter()
+            .find(|r| r.binding_id == "b-dup")
+            .unwrap();
         assert!(row_after.ambiguous_candidates.is_empty());
         assert_eq!(row_after.live_hwnd, Some(0x302));
     }

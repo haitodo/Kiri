@@ -89,6 +89,10 @@ impl Drop for TraceState {
 }
 
 impl SwitchTrace {
+    pub(super) const fn silent() -> Self {
+        Self(None)
+    }
+
     pub(super) fn new() -> Self {
         if !is_verbose_title_logging() && !cfg!(debug_assertions) {
             return Self(None);

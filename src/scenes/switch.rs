@@ -198,117 +198,86 @@ pub fn execute_scene_switch(
     )
 }
 
-pub fn execute_scene_switch_from(
+struct SwitchPlan {
+    target_mon_id: String,
+    to_minimize: Vec<(String, WindowInstance)>,
+    to_restore: Vec<(String, WindowInstance, usize)>,
+    to_bring_to_front: Vec<(WindowInstance, usize)>,
+    warnings: Vec<SwitchWarning>,
+    stale_actions: Vec<u64>,
+    unchanged: Vec<(WindowInstance, &'static str)>,
+}
+
+pub struct SwitchPreview {
+    pub restore: Vec<WindowInstance>,
+    pub minimize: Vec<WindowInstance>,
+    pub unchanged: Vec<(WindowInstance, &'static str)>,
+    pub warnings: Vec<SwitchWarning>,
+}
+
+pub fn preview_scene_switch(
     next_scene_id: &str,
     config: &AppConfig,
-    state_mgr: &mut SceneStateManager,
-    resolver: &mut BindingResolver,
-    recovery: &mut RecoveryManager,
-    sys: &mut dyn WindowSystem,
+    mut resolver: BindingResolver,
+    recovery: &RecoveryManager,
+    sys: &dyn WindowSystem,
     launcher_monitor_id: Option<&str>,
-    source: SwitchSource,
-) -> SwitchOutcome {
-    let input_tick = sys.last_input_tick();
-    let trace = SwitchTrace::new();
-    trace.record("started", || {
-        json!({
-            "from_scene": state_mgr.active_scene_id(),
-            "to_scene": next_scene_id,
-            "source": source,
-            "monitor_policy": config.target.monitor_policy,
-            "configured_monitor": config.target.monitor_id,
-            "launcher_monitor": launcher_monitor_id,
-            "focus_on_switch": config.launcher.focus_on_switch,
-            "restore_all_on_switch": config.launcher.restore_all_on_switch,
-            "foreground": sys.foreground_state(),
-        })
-    });
-    let mut warnings = Vec::new();
+) -> SwitchPreview {
+    let context = PlanContext {
+        trace: &SwitchTrace::silent(),
+        input_tick: None,
+        preview: true,
+    };
+    match plan_scene_switch(next_scene_id, config, &mut resolver, recovery, sys, launcher_monitor_id, context) {
+        Ok(plan) => SwitchPreview {
+            restore: plan.to_restore.into_iter().map(|(_, win, _)| win).collect(),
+            minimize: plan.to_minimize.into_iter().map(|(_, win)| win).collect(),
+            unchanged: plan.unchanged,
+            warnings: plan.warnings,
+        },
+        Err(warning) => SwitchPreview {
+            restore: Vec::new(),
+            minimize: Vec::new(),
+            unchanged: Vec::new(),
+            warnings: vec![warning],
+        },
+    }
+}
 
-    // Verify scene exists
+struct PlanContext<'a> {
+    trace: &'a SwitchTrace,
+    input_tick: Option<u32>,
+    preview: bool,
+}
+
+fn plan_scene_switch(
+    next_scene_id: &str,
+    config: &AppConfig,
+    resolver: &mut BindingResolver,
+    recovery: &RecoveryManager,
+    sys: &dyn WindowSystem,
+    launcher_monitor_id: Option<&str>,
+    context: PlanContext<'_>,
+) -> Result<SwitchPlan, SwitchWarning> {
+    let PlanContext { trace, input_tick, preview } = context;
+    let mut warnings = Vec::new();
+    let mut stale_actions = Vec::new();
+    let mut unchanged = Vec::new();
+
     if !config.scenes.iter().any(|s| s.id == next_scene_id) {
-        trace.record("finished", || json!({"reason": "scene_not_found"}));
-        warnings.push(SwitchWarning::SceneNotFound {
-            scene_id: next_scene_id.to_string(),
-        });
-        return SwitchOutcome {
-            was_noop_same_scene: false,
-            switched: false,
-            minimized_hwnds: Vec::new(),
-            restored_hwnds: Vec::new(),
-            warnings,
-            verification: None,
-        };
+        return Err(SwitchWarning::SceneNotFound { scene_id: next_scene_id.to_string() });
     }
 
-    let already_active = state_mgr.is_already_active(next_scene_id);
-    let is_all_monitors =
-        config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors;
-
+    let is_all_monitors = config.target.monitor_policy == crate::config::MonitorPolicy::AllMonitors;
     let monitors = sys.monitors();
-    let connected_monitor_ids: Vec<String> =
-        monitors.iter().map(|m| m.monitor_id.clone()).collect();
-
+    let connected_monitor_ids: Vec<String> = monitors.iter().map(|m| m.monitor_id.clone()).collect();
     let target_mon_id = if is_all_monitors {
         "ALL_MONITORS".to_string()
     } else {
-        let Some(mon_id) = resolve_effective_target_monitor_id(config, launcher_monitor_id) else {
-            trace.record("finished", || {
-                json!({
-                    "reason": "target_monitor_not_configured",
-                    "already_active": already_active,
-                })
-            });
-            if already_active {
-                return SwitchOutcome {
-                    was_noop_same_scene: true,
-                    switched: false,
-                    minimized_hwnds: Vec::new(),
-                    restored_hwnds: Vec::new(),
-                    warnings,
-                    verification: None,
-                };
-            }
-            warnings.push(SwitchWarning::TargetMonitorNotConfigured);
-            return SwitchOutcome {
-                was_noop_same_scene: false,
-                switched: false,
-                minimized_hwnds: Vec::new(),
-                restored_hwnds: Vec::new(),
-                warnings,
-                verification: None,
-            };
-        };
-
-        if !monitors.iter().any(|m| m.monitor_id == mon_id) {
-            trace.record("finished", || {
-                json!({
-                    "reason": "target_monitor_disconnected",
-                    "target_monitor": mon_id,
-                    "already_active": already_active,
-                })
-            });
-            if already_active {
-                return SwitchOutcome {
-                    was_noop_same_scene: true,
-                    switched: false,
-                    minimized_hwnds: Vec::new(),
-                    restored_hwnds: Vec::new(),
-                    warnings,
-                    verification: None,
-                };
-            }
-            warnings.push(SwitchWarning::TargetMonitorDisconnected {
-                monitor_id: mon_id,
-            });
-            return SwitchOutcome {
-                was_noop_same_scene: false,
-                switched: false,
-                minimized_hwnds: Vec::new(),
-                restored_hwnds: Vec::new(),
-                warnings,
-                verification: None,
-            };
+        let mon_id = resolve_effective_target_monitor_id(config, launcher_monitor_id)
+            .ok_or(SwitchWarning::TargetMonitorNotConfigured)?;
+        if !connected_monitor_ids.contains(&mon_id) {
+            return Err(SwitchWarning::TargetMonitorDisconnected { monitor_id: mon_id });
         }
         mon_id
     };
@@ -377,7 +346,8 @@ pub fn execute_scene_switch_from(
                 }
                 resolved_bindings.push((binding.id.clone(), win, in_next, binding.always_visible));
             }
-            BindingResolution::MovedToOtherMonitor(_win) => {
+            BindingResolution::MovedToOtherMonitor(win) => {
+                if preview { unchanged.push((win, "操作する画面の外")); }
                 // User manually moved window to another monitor in single-monitor mode; do not touch it (Section 8.2)
             }
             BindingResolution::AmbiguousSameMonitor(candidates) => {
@@ -421,7 +391,7 @@ pub fn execute_scene_switch_from(
 
         // Step 5 (FR-17, AT-26): Never minimize a window that is disabled (modal dialog open, e.g. order confirmation)
         if !win.is_enabled {
-            log_warn(
+            if !preview { log_warn(
                 "switch",
                 &format!(
                     "Skipping minimize for disabled (modal) window 0x{:X} (binding '{}', title={})",
@@ -429,7 +399,7 @@ pub fn execute_scene_switch_from(
                     binding_id,
                     mask_title(&win.title)
                 ),
-            );
+            ); }
             warnings.push(SwitchWarning::SkippedModalDisabledWindow {
                 binding_id: binding_id.clone(),
                 hwnd: win.hwnd,
@@ -438,13 +408,13 @@ pub fn execute_scene_switch_from(
         }
 
         if win.is_elevated {
-            log_warn(
+            if !preview { log_warn(
                 "switch",
                 &format!(
                     "Skipping elevated window 0x{:X} (binding '{}')",
                     win.hwnd, binding_id
                 ),
-            );
+            ); }
             warnings.push(SwitchWarning::SkippedElevatedWindow {
                 binding_id: binding_id.clone(),
                 hwnd: win.hwnd,
@@ -558,10 +528,77 @@ pub fn execute_scene_switch_from(
                     action.pid,
                     action.process_start_time,
                 ) {
-                    recovery.invalidate_hwnd(action.hwnd);
+                    stale_actions.push(action.hwnd);
                 }
             }
         }
+    }
+
+    if preview {
+        let mut seen: HashSet<u64> = unchanged.iter().map(|(win, _)| win.hwnd)
+            .chain(to_minimize.iter().map(|(_, win)| win.hwnd))
+            .chain(to_restore.iter().map(|(_, win, _)| win.hwnd)).collect();
+        for (_, win, in_next, always_visible) in resolved_bindings {
+            if seen.insert(win.hwnd) {
+                let reason = if always_visible { "常に表示" }
+                    else if win.is_iconic && in_next { "最小化したまま" }
+                    else if !win.is_enabled { "ダイアログを表示中" }
+                    else if win.is_elevated { "管理者権限で実行中" }
+                    else if win.is_visible && in_next { "表示を維持" }
+                    else { "現在の状態を維持" };
+                unchanged.push((win, reason));
+            }
+        }
+    }
+
+    Ok(SwitchPlan { target_mon_id, to_minimize, to_restore, to_bring_to_front, warnings, stale_actions, unchanged })
+}
+
+pub fn execute_scene_switch_from(
+    next_scene_id: &str,
+    config: &AppConfig,
+    state_mgr: &mut SceneStateManager,
+    resolver: &mut BindingResolver,
+    recovery: &mut RecoveryManager,
+    sys: &mut dyn WindowSystem,
+    launcher_monitor_id: Option<&str>,
+    source: SwitchSource,
+) -> SwitchOutcome {
+    let input_tick = sys.last_input_tick();
+    let trace = SwitchTrace::new();
+    trace.record("started", || {
+        json!({
+            "from_scene": state_mgr.active_scene_id(),
+            "to_scene": next_scene_id,
+            "source": source,
+            "monitor_policy": config.target.monitor_policy,
+            "configured_monitor": config.target.monitor_id,
+            "launcher_monitor": launcher_monitor_id,
+            "focus_on_switch": config.launcher.focus_on_switch,
+            "restore_all_on_switch": config.launcher.restore_all_on_switch,
+            "foreground": sys.foreground_state(),
+        })
+    });
+    let already_active = state_mgr.is_already_active(next_scene_id);
+    let context = PlanContext { trace: &trace, input_tick, preview: false };
+    let SwitchPlan { target_mon_id, to_minimize, mut to_restore, mut to_bring_to_front, warnings, stale_actions, .. } =
+        match plan_scene_switch(next_scene_id, config, resolver, recovery, sys, launcher_monitor_id, context) {
+            Ok(plan) => plan,
+            Err(warning) => {
+                let was_noop_same_scene = already_active && !matches!(warning, SwitchWarning::SceneNotFound { .. });
+                trace.record("finished", || json!({"reason": format!("{warning:?}"), "already_active": already_active}));
+                return SwitchOutcome {
+                    was_noop_same_scene,
+                    switched: false,
+                    minimized_hwnds: Vec::new(),
+                    restored_hwnds: Vec::new(),
+                    warnings: if was_noop_same_scene { Vec::new() } else { vec![warning] },
+                    verification: None,
+                };
+            }
+        };
+    for hwnd in stale_actions {
+        recovery.invalidate_hwnd(hwnd);
     }
 
     // Step 1 idempotency check (AT-03): If `state == Active(next)` and no newly reopened windows need
@@ -588,6 +625,9 @@ pub fn execute_scene_switch_from(
 
     // Check if the current foreground window is among `to_minimize` (Section 5.4, FR-18, AT-25)
     let foreground_hwnd = sys.get_foreground_window();
+    let stays_on_target = |win: &WindowInstance, live: &WindowInstance| {
+        win.monitor_id == live.monitor_id && (target_mon_id == "ALL_MONITORS" || live.monitor_id == target_mon_id)
+    };
     trace.record("plan", || {
         json!({
             "minimize": to_minimize.iter().map(|(binding, win)| json!({
@@ -623,6 +663,10 @@ pub fn execute_scene_switch_from(
             deferred_foreground_minimize = Some((binding_id, win));
             continue;
         }
+        if !can_still_minimize(sys, &win) {
+            recovery.invalidate_hwnd(win.hwnd);
+            continue;
+        }
         match trace.show(sys, &binding_id, win.hwnd, ShowCmd::MinimizeNoActivate) {
             Ok(()) => {
                 recovery.mark_minimize_issued(win.hwnd);
@@ -654,6 +698,7 @@ pub fn execute_scene_switch_from(
         let live = sys.query_window(win.hwnd);
         let still_iconic = live.as_ref().is_some_and(|live| {
             live.is_iconic
+                && stays_on_target(&win, live)
                 && live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
         });
         if !still_iconic {
@@ -690,6 +735,9 @@ pub fn execute_scene_switch_from(
     // so keyboard focus never stays trapped on an invisible minimized window.
     let mut foreground_minimize_issued = false;
     if let Some((binding_id, fg_win)) = deferred_foreground_minimize {
+        if !can_still_minimize(sys, &fg_win) {
+            recovery.invalidate_hwnd(fg_win.hwnd);
+        } else {
         match trace.show(sys, &binding_id, fg_win.hwnd, ShowCmd::MinimizeActivateNext) {
             Ok(()) => {
                 recovery.mark_minimize_issued(fg_win.hwnd);
@@ -704,6 +752,7 @@ pub fn execute_scene_switch_from(
                 );
                 recovery.invalidate_hwnd(fg_win.hwnd);
             }
+        }
         }
     }
 
@@ -930,6 +979,14 @@ fn can_receive_focus(win: &WindowInstance) -> bool {
     win.is_visible && !win.is_iconic && win.is_enabled && !win.is_hung
 }
 
+fn can_still_minimize(sys: &dyn WindowSystem, win: &WindowInstance) -> bool {
+    sys.query_window(win.hwnd).is_some_and(|live| {
+        live.matches_runtime_identity(win.hwnd, win.pid, win.process_start_time)
+            && live.monitor_id == win.monitor_id
+            && live.is_visible && !live.is_iconic && live.is_enabled && !live.is_elevated
+    })
+}
+
 fn verify_scene_presentation(
     pending: &PendingVerification,
     sys: &mut dyn WindowSystem,
@@ -1106,7 +1163,7 @@ pub fn format_switch_warnings(
         .iter()
         .map(|w| match w {
             SwitchWarning::TargetMonitorNotConfigured => {
-                "切替対象のモニタが設定されていません。設定画面の「動作・モニタ」タブで対象モニタを指定してください。".to_string()
+                "操作する画面が設定されていません。「ウィンドウの動作」で対象の画面を選んでください。".to_string()
             }
             SwitchWarning::TargetMonitorDisconnected { monitor_id } => {
                 format!(

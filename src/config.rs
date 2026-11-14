@@ -383,6 +383,12 @@ pub struct AppConfig {
     pub layouts: Vec<LayoutSnapshot>,
     #[serde(default)]
     pub monitors: Vec<MonitorProfile>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verbose_title_logging: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for AppConfig {
@@ -439,6 +445,7 @@ impl AppConfig {
             hotkeys: Vec::new(),
             layouts: Vec::new(),
             monitors: Vec::new(),
+            verbose_title_logging: false,
         }
     }
 
@@ -734,6 +741,7 @@ impl ConfigManager {
             "hotkeys",
             "layouts",
             "monitors",
+            "verbose_title_logging",
         ];
         for key in obj.keys() {
             if !KNOWN_TOP_KEYS.contains(&key.as_str()) {

@@ -9,7 +9,7 @@ pub mod switch;
 mod tests {
     use super::bindings::BindingResolver;
     use super::manager::{SceneState, SceneStateManager};
-    use super::switch::{execute_scene_switch, verify_switch_results, SwitchWarning};
+    use super::switch::{execute_scene_switch, preview_scene_switch, verify_switch_results, SwitchWarning};
     use crate::config::{AppConfig, MonitorPolicy, RectData, Scene, TitleRule, WindowBinding, WindowMatch};
     use crate::platform::fake::FakeWindowSystem;
     use crate::platform::hooks::{MinimizeEvent, MinimizeEventKind};
@@ -393,6 +393,23 @@ mod tests {
         );
         assert!(out_code.switched);
         assert!(sys.query_window(70).unwrap().is_iconic);
+
+        let actions_before = recovery.actions().clone();
+        let preview = preview_scene_switch("trade", &cfg, resolver.clone(), &recovery, &sys, None);
+        let mut planned_restore: Vec<_> = preview.restore.iter().map(|win| win.hwnd).collect();
+        planned_restore.sort_unstable();
+        assert_eq!(planned_restore, [20, 70]);
+        assert_eq!(preview.minimize.iter().map(|win| win.hwnd).collect::<Vec<_>>(), [30]);
+        assert!(sys.query_window(20).unwrap().is_iconic);
+        assert!(sys.query_window(70).unwrap().is_iconic);
+        assert!(!sys.query_window(30).unwrap().is_iconic);
+        assert_eq!(*recovery.actions(), actions_before);
+
+        cfg.launcher.restore_all_on_switch = false;
+        let preview = preview_scene_switch("trade", &cfg, resolver.clone(), &recovery, &sys, None);
+        assert_eq!(preview.restore.iter().map(|win| win.hwnd).collect::<Vec<_>>(), [70]);
+        assert!(preview.unchanged.iter().any(|(win, _)| win.hwnd == 20));
+        cfg.launcher.restore_all_on_switch = true;
 
         // Now switch BACK to "trade" -> BOTH App A (20) and App B (70) must be restored and visible!
         let out_trade = execute_scene_switch(
