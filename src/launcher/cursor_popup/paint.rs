@@ -6,14 +6,13 @@ use crate::platform::monitors::dip_to_px;
 use crate::platform::windows::apps_use_dark_theme;
 use std::ptr::null_mut;
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, SIZE};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject,
-    DrawTextW, FillRect, GetStockObject, GetTextExtentPoint32W, SelectObject, SetBkMode,
-    SetDCBrushColor, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DC_BRUSH,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH,
-    HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
+    DrawTextW, FillRect, GetStockObject, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
+    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     DashCapRound, FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC,
@@ -73,8 +72,7 @@ impl PopupPalette {
 
 pub(super) struct PopupFonts {
     body: HFONT,
-    secondary: HFONT,
-    heading: HFONT,
+    tile: HFONT,
 }
 
 impl PopupFonts {
@@ -98,16 +96,15 @@ impl PopupFonts {
             )
         };
         Self {
-            body: create(14, FW_NORMAL.0 as i32),
-            secondary: create(12, FW_NORMAL.0 as i32),
-            heading: create(12, FW_SEMIBOLD.0 as i32),
+            body: create(12, FW_NORMAL.0 as i32),
+            tile: create(11, FW_NORMAL.0 as i32),
         }
     }
 }
 
 impl Drop for PopupFonts {
     fn drop(&mut self) {
-        for font in [self.body, self.secondary, self.heading] {
+        for font in [self.body, self.tile] {
             if !font.is_invalid() {
                 let _ = unsafe { DeleteObject(font) };
             }
@@ -169,31 +166,31 @@ impl CursorPopup {
             }
         }
 
-        let icon_size = px(16);
+        let icon_size = px(14);
+        let tile_radius = px(5);
         for (index, scene) in self.scenes.iter().enumerate() {
             let Some(rect) = self.viewport_rect(self.layout.scene(index, self.width)) else {
                 continue;
             };
             let active = self.active_scene_id.as_deref() == Some(scene.id.as_str());
             let focused = self.keyboard_focus == Some(Hit::Scene(index));
-            let radius = px(6);
             if active {
-                canvas.fill(rect, radius, palette.active_border);
-                canvas.fill(inset(rect, border), radius - border, palette.active);
+                canvas.fill(rect, tile_radius, palette.active_border);
+                canvas.fill(inset(rect, border), tile_radius - border, palette.active);
             } else if focused {
-                canvas.fill(rect, radius, palette.active_border);
-                canvas.fill(inset(rect, border), radius - border, palette.hover);
+                canvas.fill(rect, tile_radius, palette.active_border);
+                canvas.fill(inset(rect, border), tile_radius - border, palette.hover);
             } else {
                 let fill = if self.hover == Some(Hit::Scene(index)) {
                     palette.hover
                 } else {
                     palette.tile
                 };
-                canvas.fill(rect, radius, fill);
+                canvas.fill(rect, tile_radius, fill);
             }
 
             let x = rect.left + (rect.width() - icon_size) / 2;
-            let y = rect.top + px(9);
+            let y = rect.top + px(6);
             if let Some(image) = self.icon_cache.get_or_load_image(&scene.icon, self.dpi) {
                 let _ = GdipDrawImageRect(
                     canvas.graphics,
@@ -217,15 +214,20 @@ impl CursorPopup {
             }
             if scene.variants.len() > 1 {
                 let badge_color = 0xB800_0000 | if active { palette.accent } else { palette.muted };
+                let badge_rect = RectData {
+                    bottom: rect.top + px(11),
+                    ..rect
+                };
                 crate::launcher::paint::draw_variant_badge(
                     canvas.graphics,
-                    rect,
+                    badge_rect,
                     badge_color,
                     self.dpi,
                 );
             }
         }
 
+        let row_radius = px(4);
         for index in 0..self.shortcuts.len().max(1) {
             let Some(rect) = self.viewport_rect(self.layout.shortcut(index, self.width)) else {
                 continue;
@@ -237,10 +239,10 @@ impl CursorPopup {
                 Hit::Settings
             };
             if self.keyboard_focus == Some(hit) {
-                canvas.fill(rect, px(5), palette.active_border);
-                canvas.fill(inset(rect, border), px(5) - border, palette.hover);
+                canvas.fill(rect, row_radius, palette.active_border);
+                canvas.fill(inset(rect, border), row_radius - border, palette.hover);
             } else if self.hover == Some(hit) {
-                canvas.fill(rect, px(5), palette.hover);
+                canvas.fill(rect, row_radius, palette.hover);
             }
             if let Some(shortcut) = shortcut {
                 let icon = match shortcut.kind {
@@ -259,21 +261,7 @@ impl CursorPopup {
         let px = |dip| dip_to_px(dip, self.dpi);
         let palette = self.palette;
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let old_font = select_font(hdc, self.fonts.heading);
-        let heading = |text, top| {
-            if let Some(rect) = self.viewport_rect(RectData {
-                left: self.layout.pad,
-                right: self.width - self.layout.pad,
-                top,
-                bottom: top + px(17),
-            }) {
-                draw_text(hdc, text, rect, DT_LEFT, palette.muted);
-            }
-        };
-        if !self.scenes.is_empty() {
-            heading("シーン", self.layout.scene_header_top);
-        }
-        heading("ショートカット", self.layout.shortcut_header_top);
+        let old_font = select_font(hdc, self.fonts.tile);
 
         for (index, scene) in self.scenes.iter().enumerate() {
             let Some(rect) = self.viewport_rect(self.layout.scene(index, self.width)) else {
@@ -281,66 +269,39 @@ impl CursorPopup {
             };
             let active = self.active_scene_id.as_deref() == Some(scene.id.as_str());
             let color = if active { palette.accent } else { palette.text };
-            let right = rect.right;
-            select_font(hdc, self.fonts.body);
             draw_text(
                 hdc,
                 &scene.name,
                 RectData {
                     left: rect.left + px(3),
-                    right: right - px(3),
-                    top: rect.top + px(29),
-                    bottom: rect.top + px(49),
+                    right: rect.right - px(3),
+                    top: rect.top + px(22),
+                    bottom: rect.top + px(38),
                 },
                 DT_CENTER,
                 color,
             );
-            if active {
-                select_font(hdc, self.fonts.secondary);
-                draw_text(
-                    hdc,
-                    "✓",
-                    RectData {
-                        right: right - px(5),
-                        top: rect.top + px(3),
-                        bottom: rect.top + px(20),
-                        ..rect
-                    },
-                    DT_RIGHT,
-                    color,
-                );
-            }
         }
 
+        select_font(hdc, self.fonts.body);
         for index in 0..self.shortcuts.len().max(1) {
             let Some(rect) = self.viewport_rect(self.layout.shortcut(index, self.width)) else {
                 continue;
             };
             if let Some(shortcut) = self.shortcuts.get(index) {
-                select_font(hdc, self.fonts.secondary);
-                let right = rect.right - px(6);
-                let kind_width = text_width(hdc, shortcut.kind.label());
-                let kind = RectData {
-                    left: right - kind_width,
-                    right,
-                    ..rect
-                };
-                draw_text(hdc, shortcut.kind.label(), kind, DT_RIGHT, palette.muted);
-
-                select_font(hdc, self.fonts.body);
                 let name = RectData {
-                    left: rect.left + px(32),
-                    right: kind.left - px(8),
+                    left: rect.left + px(25),
+                    right: rect.right - px(6),
                     ..rect
                 };
                 draw_text(hdc, &shortcut.name, name, DT_LEFT, palette.text);
             } else {
-                select_font(hdc, self.fonts.body);
                 draw_text(
                     hdc,
                     "ショートカットを追加…",
                     RectData {
                         left: rect.left + px(6),
+                        right: rect.right - px(6),
                         ..rect
                     },
                     DT_LEFT,
@@ -372,13 +333,6 @@ unsafe fn select_font(hdc: HDC, font: HFONT) -> HGDIOBJ {
         font.into()
     };
     SelectObject(hdc, font)
-}
-
-unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
-    let text: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE::default();
-    let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
-    size.cx
 }
 
 unsafe fn draw_text(hdc: HDC, text: &str, rect: RectData, alignment: DRAW_TEXT_FORMAT, rgb: u32) {

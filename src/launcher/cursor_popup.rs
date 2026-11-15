@@ -30,9 +30,10 @@ pub const WM_APP_CURSOR_POPUP_FAN_STATE: u32 = 0x8000 + 14;
 const TIMER_CURSOR_FAN_HOLD: usize = 401;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const SCENE_COLUMNS: usize = 3;
-const WIDTH_DIP: i32 = 309;
-const CURSOR_GAP_DIP: i32 = 8;
-const CORNER_RADIUS_DIP: i32 = 10;
+const WIDTH_DIP: i32 = 228;
+const MAX_HEIGHT_DIP: i32 = 300;
+const CURSOR_GAP_DIP: i32 = 6;
+const CORNER_RADIUS_DIP: i32 = 8;
 
 fn bounds_beside_cursor(cursor: POINT, width: i32, height: i32, monitor: &MonitorInfoData) -> RectData {
     let work = monitor.work_area;
@@ -59,12 +60,10 @@ fn bounds_beside_cursor(cursor: POINT, width: i32, height: i32, monitor: &Monito
 struct PopupLayout {
     pad: i32,
     gap: i32,
-    scene_header_top: i32,
     scene_top: i32,
     tile_height: i32,
     row_height: i32,
     divider_top: Option<i32>,
-    shortcut_header_top: i32,
     shortcut_top: i32,
     content_height: i32,
 }
@@ -72,21 +71,19 @@ struct PopupLayout {
 impl PopupLayout {
     fn new(dpi: u32, scenes: usize, shortcuts: usize, scenes_at_bottom: bool) -> Self {
         let px = |dip| dip_to_px(dip, dpi);
-        let pad = px(13);
-        let gap = px(5);
-        let tile_height = px(58);
-        let row_height = px(36);
-        let scene_header_height = px(24);
-        let shortcut_header_height = px(20);
-        let section_gap = px(11);
+        let pad = px(8);
+        let gap = px(4);
+        let tile_height = px(42);
+        let row_height = px(28);
+        let section_gap = px(6);
         let scene_rows = scenes.div_ceil(SCENE_COLUMNS) as i32;
         let scene_height = if scene_rows > 0 {
-            scene_header_height + (tile_height + gap) * scene_rows - gap
+            (tile_height + gap) * scene_rows - gap
         } else {
             0
         };
-        let shortcut_height = shortcut_header_height + shortcuts.max(1) as i32 * row_height;
-        let (scene_header_top, shortcut_header_top, divider_top) = if scenes == 0 {
+        let shortcut_height = shortcuts.max(1) as i32 * row_height;
+        let (scene_top, shortcut_top, divider_top) = if scenes == 0 {
             (pad, pad, None)
         } else if scenes_at_bottom {
             let divider = pad + shortcut_height + section_gap;
@@ -96,17 +93,15 @@ impl PopupLayout {
             (pad, divider + section_gap, Some(divider))
         };
         let content_height =
-            (scene_header_top + scene_height).max(shortcut_header_top + shortcut_height) + pad;
+            (scene_top + scene_height).max(shortcut_top + shortcut_height) + pad;
         Self {
             pad,
             gap,
-            scene_header_top,
-            scene_top: scene_header_top + scene_header_height,
+            scene_top,
             tile_height,
             row_height,
             divider_top,
-            shortcut_header_top,
-            shortcut_top: shortcut_header_top + shortcut_header_height,
+            shortcut_top,
             content_height,
         }
     }
@@ -124,7 +119,7 @@ impl PopupLayout {
         let mut layout = Self::new(dpi, scenes, shortcuts, false);
         let max_height = layout
             .content_height
-            .min(dip_to_px(430, dpi))
+            .min(dip_to_px(MAX_HEIGHT_DIP, dpi))
             .min(work.height().max(1));
         if position == CursorPopupPosition::BesideCursor || scenes == 0 {
             let bounds = bounds_beside_cursor(cursor, width, max_height, monitor);
@@ -133,14 +128,18 @@ impl PopupLayout {
 
         let first_row_right = layout.scene(scenes.min(SCENE_COLUMNS) - 1, width).right;
         let x = cursor.x - (layout.pad + first_row_right) / 2;
-        let gap = dip_to_px(CURSOR_GAP_DIP, dpi);
-        let below_top = (cursor.y + gap - layout.scene_top).max(work.top);
-        let above_bottom = (cursor.y - gap + layout.pad).min(work.bottom);
+        let scene_center_offset = layout.scene_top + layout.tile_height / 2;
+        let below_top = (cursor.y - scene_center_offset).max(work.top);
+        let bottom_layout = Self::new(dpi, scenes, shortcuts, true);
+        let last_row_top = bottom_layout.scene(scenes - 1, width).top;
+        let center_from_bottom =
+            bottom_layout.content_height - (last_row_top + bottom_layout.tile_height / 2);
+        let above_bottom = (cursor.y + center_from_bottom).min(work.bottom);
         let below_height = work.bottom - below_top;
         let above_height = above_bottom - work.top;
         let (y, height, scroll) = if below_height < max_height && above_height > below_height {
-            // Keep the scene tiles by the cursor when the popup extends upwards.
-            layout = Self::new(dpi, scenes, shortcuts, true);
+            // Keep the scene tiles centered on the cursor when the popup extends upwards.
+            layout = bottom_layout;
             let height = max_height.min(above_height).max(1);
             (above_bottom - height, height, layout.content_height - height)
         } else {
@@ -664,8 +663,8 @@ impl CursorPopup {
             .layout
             .shortcut(self.shortcuts.len().max(1) - 1, self.width)
             .bottom;
-        let over_shortcuts = (self.layout.shortcut_header_top..shortcuts_bottom)
-            .contains(&(point.y + self.scroll));
+        let over_shortcuts =
+            (self.layout.shortcut_top..shortcuts_bottom).contains(&(point.y + self.scroll));
         let over_scroll_area = over_popup && (point.x >= self.width || over_shortcuts);
         if self.scenes.is_empty() || over_scroll_area {
             self.scene_wheel = SceneWheel::default();
@@ -1092,11 +1091,12 @@ mod tests {
 
         let cursor = POINT { x: -800, y: 250 };
         let (layout, bounds, scroll) = place(cursor, CursorPopupPosition::SceneCentered);
-        assert_eq!((bounds.left + bounds.right) / 2, cursor.x);
-        assert_eq!(bounds.top + layout.scene_top, cursor.y + gap);
+        let center_tile = layout.scene(1, bounds.width());
+        assert_eq!(bounds.left + (center_tile.left + center_tile.right) / 2, cursor.x);
+        assert_eq!(bounds.top + (center_tile.top + center_tile.bottom) / 2, cursor.y);
         assert_eq!(scroll, 0);
 
-        let cursor = POINT { x: -1910, y: -90 };
+        let cursor = POINT { x: -1910, y: -99 };
         let (_, bounds, _) = place(cursor, CursorPopupPosition::SceneCentered);
         assert_eq!(bounds.left, monitor.work_area.left);
         assert_eq!(bounds.top, monitor.work_area.top);
@@ -1111,10 +1111,17 @@ mod tests {
         let (layout, bounds, scroll) = place(cursor, CursorPopupPosition::SceneCentered);
         assert_eq!(bounds.right, monitor.work_area.right);
         assert_eq!(bounds.bottom, monitor.work_area.bottom);
-        assert!(layout.shortcut_top < layout.scene_header_top);
+        assert!(layout.shortcut_top < layout.scene_top);
         assert!(scroll > 0);
         let tile_bottom = bounds.top + layout.scene(2, bounds.width()).bottom - scroll;
         assert_eq!(tile_bottom, bounds.bottom - layout.pad);
+    }
+
+    #[test]
+    fn compact_popup_layout_keeps_footprint_small() {
+        let layout = PopupLayout::new(96, 3, 3, false);
+        assert_eq!(WIDTH_DIP, 228);
+        assert_eq!(layout.content_height, 154);
     }
 
     #[test]
@@ -1195,11 +1202,12 @@ mod tests {
             assert_eq!(popup.wheel_steps(-120, cursor), 1);
             assert_eq!(popup.scroll, initial_scroll);
             let x = cursor.x - bounds.rect.left;
-            let y = cursor.y - bounds.rect.top - CURSOR_GAP_DIP - 1;
+            let y = cursor.y - bounds.rect.top;
             let hit = LPARAM(((y as isize) << 16) | x as isize);
             assert!(popup.hit_test(hit) == Some(Hit::Scene(1)));
 
             let tile = popup.layout.scene(1, popup.width);
+            assert_eq!((tile.top + tile.bottom) / 2 - popup.scroll, y);
             let x = tile.left + 6;
             let y = tile.top + 4 - popup.scroll;
             let hit = LPARAM(((y as isize) << 16) | x as isize);
