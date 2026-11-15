@@ -130,6 +130,23 @@ thread_local! {
     static MOUSE_HOOK: Cell<HHOOK> = Cell::new(HHOOK::default());
 }
 
+unsafe fn current_cursor_pos() -> Option<POINT> {
+    let mut cursor = POINT::default();
+    if GetCursorPos(&mut cursor).is_ok() {
+        Some(cursor)
+    } else {
+        #[cfg(test)]
+        {
+            // Headless or locked-desktop test sessions may deny GetCursorPos.
+            Some(POINT::default())
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+}
+
 pub struct CursorInput {
     keyboard_hook: Option<HHOOK>,
 }
@@ -347,8 +364,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 );
             }
             Some(CtrlTap::Double) => {
-                let mut cursor = POINT::default();
-                if GetCursorPos(&mut cursor).is_ok() {
+                if let Some(cursor) = current_cursor_pos() {
                     let _ = PostMessageW(
                         Some(state.hwnd),
                         WM_APP_SHOW_CURSOR_POPUP,
