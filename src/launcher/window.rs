@@ -25,7 +25,7 @@ use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
 use crate::platform::cursor_input::{
     CursorInput, WM_APP_CURSOR_POPUP_KEY, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP,
-    WM_APP_TOGGLE_CURSOR_POPUP,
+    WM_APP_SHOW_CURSOR_POPUP,
 };
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
 use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
@@ -349,15 +349,21 @@ impl LauncherWindowHost {
     }
 
     fn toggle_cursor_popup(&mut self) {
-        use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
+        self.cursor_input.interrupt_gesture();
         if self.cursor_popup.as_ref().is_some_and(|popup| popup.visible) {
             self.hide_cursor_popup();
             return;
         }
         let mut cursor = POINT::default();
-        if self.drag_state.is_some() || unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+            self.show_cursor_popup_at(cursor);
+        }
+    }
+
+    fn show_cursor_popup_at(&mut self, cursor: POINT) {
+        if self.drag_state.is_some() {
             return;
         }
         let monitors = self.app.sys.monitors();
@@ -1351,9 +1357,12 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
-            WM_APP_TOGGLE_CURSOR_POPUP => {
+            WM_APP_SHOW_CURSOR_POPUP => {
                 if host.app.config.launcher.ctrl_double_tap {
-                    host.toggle_cursor_popup();
+                    host.show_cursor_popup_at(POINT {
+                        x: wparam.0 as i32,
+                        y: lparam.0 as i32,
+                    });
                 }
                 LRESULT(0)
             }

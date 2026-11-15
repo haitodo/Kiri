@@ -10,13 +10,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_UP, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
-    HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_XBUTTONDOWN,
+    CallNextHookEx, GetCursorPos, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+    WindowFromPoint, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_XBUTTONDOWN,
 };
 
-pub const WM_APP_TOGGLE_CURSOR_POPUP: u32 = 0x8000 + 7;
+pub const WM_APP_SHOW_CURSOR_POPUP: u32 = 0x8000 + 7;
 pub const WM_APP_DISMISS_CURSOR_POPUP: u32 = 0x8000 + 8;
 pub const WM_APP_CURSOR_POPUP_WHEEL: u32 = 0x8000 + 11;
 pub const WM_APP_CURSOR_POPUP_KEY: u32 = 0x8000 + 12;
@@ -59,6 +59,12 @@ impl PopupInput {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlTap {
+    Single,
+    Double,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CtrlTaps {
     held: u8,
@@ -72,7 +78,7 @@ impl CtrlTaps {
         self.first_release = None;
     }
 
-    fn ctrl(&mut self, side: u8, down: bool, time: u32, chord_held: bool) -> bool {
+    fn ctrl(&mut self, side: u8, down: bool, time: u32, chord_held: bool) -> Option<CtrlTap> {
         if down {
             if self.held & side == 0 {
                 if self.held != 0 || chord_held {
@@ -82,35 +88,34 @@ impl CtrlTaps {
                 }
                 self.held |= side;
             }
-            return false;
+            return None;
         }
 
         if self.held & side == 0 {
-            return false;
+            return None;
         }
         self.held &= !side;
-        let Some(press) = self.pressed_at.take() else {
-            return false;
-        };
+        let press = self.pressed_at.take()?;
         if time.wrapping_sub(press) > DOUBLE_TAP_MS {
             self.interrupt();
-            return false;
+            return None;
         }
         if self
             .first_release
             .take()
             .is_some_and(|first| time.wrapping_sub(first) <= DOUBLE_TAP_MS)
         {
-            return true;
+            return Some(CtrlTap::Double);
         }
         self.first_release = Some(time);
-        false
+        Some(CtrlTap::Single)
     }
 }
 
 #[derive(Clone, Copy, Default)]
 struct InputState {
     hwnd: HWND,
+    ctrl_enabled: bool,
     taps: CtrlTaps,
     popup: Option<PopupInput>,
     bar_hovered: bool,
@@ -123,7 +128,6 @@ thread_local! {
 }
 
 pub struct CursorInput {
-    ctrl_enabled: bool,
     keyboard_hook: Option<HHOOK>,
 }
 
@@ -134,13 +138,12 @@ impl CursorInput {
             ..InputState::default()
         });
         Self {
-            ctrl_enabled: false,
             keyboard_hook: None,
         }
     }
 
-    fn update_keyboard_hook(&mut self, popup_open: bool) -> windows::core::Result<()> {
-        let needed = self.ctrl_enabled || popup_open;
+    fn update_keyboard_hook(&mut self, state: InputState) -> windows::core::Result<()> {
+        let needed = state.ctrl_enabled || state.popup.is_some();
         if needed && self.keyboard_hook.is_none() {
             self.keyboard_hook = Some(unsafe {
                 SetWindowsHookExW(
@@ -159,12 +162,20 @@ impl CursorInput {
     }
 
     pub fn set_ctrl_enabled(&mut self, enabled: bool) -> windows::core::Result<()> {
-        self.ctrl_enabled = enabled;
+        let mut state = STATE.get();
+        state.ctrl_enabled = enabled;
         if !enabled {
-            self.reset_gesture();
+            state.taps = CtrlTaps::default();
         }
-        let popup_open = STATE.get().popup.is_some();
-        self.update_keyboard_hook(popup_open)
+        STATE.set(state);
+        self.update_keyboard_hook(state)?;
+        update_mouse_hook(state)
+    }
+
+    pub fn interrupt_gesture(&self) {
+        let mut state = STATE.get();
+        state.taps.interrupt();
+        STATE.set(state);
     }
 
     pub fn reset_gesture(&self) {
@@ -178,7 +189,7 @@ impl CursorInput {
         let mut state = STATE.get();
         state.popup = popup;
         STATE.set(state);
-        self.update_keyboard_hook(popup.is_some())?;
+        self.update_keyboard_hook(state)?;
         update_mouse_hook(state)
     }
 
@@ -192,10 +203,9 @@ impl CursorInput {
 
 impl Drop for CursorInput {
     fn drop(&mut self) {
-        self.ctrl_enabled = false;
         let state = InputState::default();
         STATE.set(state);
-        let _ = self.update_keyboard_hook(false);
+        let _ = self.update_keyboard_hook(state);
         let _ = update_mouse_hook(state);
     }
 }
@@ -251,6 +261,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             return true;
         }
 
+        if !state.ctrl_enabled {
+            return false;
+        }
         let side = match vk {
             code if code == VK_LCONTROL.0 => LEFT_CTRL,
             code if code == VK_RCONTROL.0 => RIGHT_CTRL,
@@ -284,13 +297,33 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             .iter()
             .any(|vk| GetAsyncKeyState(i32::from(vk.0)) < 0)
         };
-        let toggle = state.taps.ctrl(side, down, key.time, chord_held);
+        let tap = state.taps.ctrl(side, down, key.time, chord_held);
         STATE.set(state);
+        match tap {
+            Some(CtrlTap::Single) if state.popup.is_some() => {
+                // Keep the first release available to pair with the next tap after hiding.
+                let _ = PostMessageW(
+                    state.hwnd,
+                    WM_APP_DISMISS_CURSOR_POPUP,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            Some(CtrlTap::Double) => {
+                let mut cursor = POINT::default();
+                if GetCursorPos(&mut cursor).is_ok() {
+                    let _ = PostMessageW(
+                        state.hwnd,
+                        WM_APP_SHOW_CURSOR_POPUP,
+                        WPARAM(cursor.x as usize),
+                        LPARAM(cursor.y as isize),
+                    );
+                }
+            }
+            _ => {}
+        }
         if (was_held == 0) != (state.taps.held == 0) {
             let _ = update_mouse_hook(state);
-        }
-        if toggle {
-            let _ = PostMessageW(state.hwnd, WM_APP_TOGGLE_CURSOR_POPUP, WPARAM(0), LPARAM(0));
         }
         false
     })
@@ -357,17 +390,15 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYUP,
+    };
 
-    #[test]
-    fn wheel_at_the_invocation_point_routes_only_while_the_scene_popup_is_open() {
-        use windows::core::w;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
-            WINDOW_EX_STYLE, WINDOW_STYLE,
-        };
-
-        unsafe {
-            let hwnd = CreateWindowExW(
+    fn input_window() -> (HWND, CursorInput) {
+        let hwnd = unsafe {
+            CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("STATIC"),
                 None,
@@ -381,8 +412,15 @@ mod tests {
                 GetModuleHandleW(None).unwrap(),
                 None,
             )
-            .unwrap();
-            let mut input = CursorInput::new(hwnd);
+            .unwrap()
+        };
+        (hwnd, CursorInput::new(hwnd))
+    }
+
+    #[test]
+    fn wheel_at_the_invocation_point_routes_only_while_the_scene_popup_is_open() {
+        unsafe {
+            let (hwnd, mut input) = input_window();
             let mouse = MSLLHOOKSTRUCT {
                 pt: POINT { x: -350, y: 175 },
                 mouseData: u32::from(-120i16 as u16) << 16,
@@ -435,8 +473,8 @@ mod tests {
         }
     }
 
-    fn tap(taps: &mut CtrlTaps, side: u8, time: u32) -> bool {
-        assert!(!taps.ctrl(side, true, time, false));
+    fn tap(taps: &mut CtrlTaps, side: u8, time: u32) -> Option<CtrlTap> {
+        assert_eq!(taps.ctrl(side, true, time, false), None);
         taps.ctrl(side, false, time.wrapping_add(35), false)
     }
 
@@ -466,65 +504,116 @@ mod tests {
     #[test]
     fn two_released_ctrl_taps_trigger_once_even_across_tick_wrap() {
         let mut taps = CtrlTaps::default();
-        assert!(!tap(&mut taps, LEFT_CTRL, u32::MAX - 50));
-        assert!(tap(&mut taps, RIGHT_CTRL, 30));
-        assert!(!tap(&mut taps, RIGHT_CTRL, 130));
+        assert_eq!(
+            tap(&mut taps, LEFT_CTRL, u32::MAX - 50),
+            Some(CtrlTap::Single)
+        );
+        assert_eq!(tap(&mut taps, RIGHT_CTRL, 30), Some(CtrlTap::Double));
+        assert_eq!(tap(&mut taps, RIGHT_CTRL, 130), Some(CtrlTap::Single));
     }
 
     #[test]
-    fn slow_taps_and_key_repeat_do_not_trigger() {
+    fn long_holds_and_key_repeat_do_not_count_as_taps() {
         let mut taps = CtrlTaps::default();
-        assert!(!tap(&mut taps, LEFT_CTRL, 0));
-        assert!(!taps.ctrl(LEFT_CTRL, true, 100, false));
-        assert!(!taps.ctrl(LEFT_CTRL, true, 400, false));
-        assert!(!taps.ctrl(LEFT_CTRL, false, 600, false));
-        assert!(!tap(&mut taps, LEFT_CTRL, 650));
-        assert!(!tap(&mut taps, LEFT_CTRL, 1200));
+        assert_eq!(tap(&mut taps, LEFT_CTRL, 0), Some(CtrlTap::Single));
+        assert_eq!(taps.ctrl(LEFT_CTRL, true, 100, false), None);
+        assert_eq!(taps.ctrl(LEFT_CTRL, true, 400, false), None);
+        assert_eq!(taps.ctrl(LEFT_CTRL, false, 600, false), None);
+        assert_eq!(tap(&mut taps, LEFT_CTRL, 650), Some(CtrlTap::Single));
+        assert_eq!(
+            tap(&mut taps, LEFT_CTRL, 650 + DOUBLE_TAP_MS + 1),
+            Some(CtrlTap::Single)
+        );
     }
 
     #[test]
     fn chords_and_overlapping_ctrls_cancel_the_sequence() {
         let mut taps = CtrlTaps::default();
-        assert!(!tap(&mut taps, LEFT_CTRL, 0));
-        assert!(!taps.ctrl(LEFT_CTRL, true, 100, false));
+        assert_eq!(tap(&mut taps, LEFT_CTRL, 0), Some(CtrlTap::Single));
+        assert_eq!(taps.ctrl(LEFT_CTRL, true, 100, false), None);
         taps.interrupt(); // Ctrl+C or Ctrl+click.
-        assert!(!taps.ctrl(LEFT_CTRL, false, 135, false));
-        assert!(!tap(&mut taps, LEFT_CTRL, 200));
-        assert!(!taps.ctrl(LEFT_CTRL, true, 260, false));
-        assert!(!taps.ctrl(RIGHT_CTRL, true, 270, false));
-        assert!(!taps.ctrl(LEFT_CTRL, false, 285, false));
-        assert!(!taps.ctrl(RIGHT_CTRL, false, 300, false));
-        assert!(!taps.ctrl(RIGHT_CTRL, true, 310, true));
-        assert!(!taps.ctrl(RIGHT_CTRL, false, 340, false));
-        assert!(!tap(&mut taps, RIGHT_CTRL, 400));
-        assert!(tap(&mut taps, RIGHT_CTRL, 480));
+        assert_eq!(taps.ctrl(LEFT_CTRL, false, 135, false), None);
+        assert_eq!(tap(&mut taps, LEFT_CTRL, 200), Some(CtrlTap::Single));
+        assert_eq!(taps.ctrl(LEFT_CTRL, true, 260, false), None);
+        assert_eq!(taps.ctrl(RIGHT_CTRL, true, 270, false), None);
+        assert_eq!(taps.ctrl(LEFT_CTRL, false, 285, false), None);
+        assert_eq!(taps.ctrl(RIGHT_CTRL, false, 300, false), None);
+        assert_eq!(taps.ctrl(RIGHT_CTRL, true, 310, true), None);
+        assert_eq!(taps.ctrl(RIGHT_CTRL, false, 340, false), None);
+        assert_eq!(tap(&mut taps, RIGHT_CTRL, 400), Some(CtrlTap::Single));
+        assert_eq!(tap(&mut taps, RIGHT_CTRL, 480), Some(CtrlTap::Double));
+    }
+
+    #[test]
+    fn ctrl_taps_close_and_reopen_the_cursor_popup() {
+        unsafe {
+            let (hwnd, mut input) = input_window();
+            input.set_ctrl_enabled(true).unwrap();
+            let send_tap = |time| {
+                // Prepare the keydown without consulting the desktop's live modifier state.
+                let mut state = STATE.get();
+                assert_eq!(state.taps.ctrl(LEFT_CTRL, true, time, false), None);
+                STATE.set(state);
+                let release = KBDLLHOOKSTRUCT {
+                    vkCode: u32::from(VK_LCONTROL.0),
+                    flags: LLKHF_UP,
+                    time: time + 35,
+                    ..Default::default()
+                };
+                let result = keyboard_proc(
+                    HC_ACTION as i32,
+                    WPARAM(WM_KEYUP as usize),
+                    LPARAM(&release as *const _ as isize),
+                );
+                assert_eq!(result.0, 0);
+            };
+            let take_request = || {
+                let mut message = MSG::default();
+                PeekMessageW(
+                    &mut message,
+                    hwnd,
+                    WM_APP_SHOW_CURSOR_POPUP,
+                    WM_APP_DISMISS_CURSOR_POPUP,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                .then_some(message.message)
+            };
+            let popup = PopupInput {
+                rect: RectData::default(),
+                corner_radius: 0,
+                has_scenes: true,
+            };
+
+            send_tap(0);
+            assert_eq!(take_request(), None);
+            send_tap(150);
+            assert_eq!(take_request(), Some(WM_APP_SHOW_CURSOR_POPUP));
+
+            input.set_popup(Some(popup)).unwrap();
+            send_tap(300);
+            assert_eq!(take_request(), Some(WM_APP_DISMISS_CURSOR_POPUP));
+            assert_eq!(take_request(), None);
+            input.set_popup(None).unwrap();
+            send_tap(300 + DOUBLE_TAP_MS);
+            assert_eq!(take_request(), Some(WM_APP_SHOW_CURSOR_POPUP));
+
+            // The second tap still means show when the UI hasn't processed the hide request.
+            input.set_popup(Some(popup)).unwrap();
+            send_tap(900);
+            send_tap(1050);
+            assert_eq!(take_request(), Some(WM_APP_DISMISS_CURSOR_POPUP));
+            assert_eq!(take_request(), Some(WM_APP_SHOW_CURSOR_POPUP));
+            assert_eq!(take_request(), None);
+            drop(input);
+            DestroyWindow(hwnd).unwrap();
+        }
     }
 
     #[test]
     fn popup_navigation_keys_are_intercepted_only_when_popup_is_open() {
-        use windows::core::w;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
-            WINDOW_EX_STYLE, WINDOW_STYLE,
-        };
-
         unsafe {
-            let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                None,
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                None,
-                GetModuleHandleW(None).unwrap(),
-                None,
-            )
-            .unwrap();
-            let mut input = CursorInput::new(hwnd);
+            let (hwnd, mut input) = input_window();
             let kb = KBDLLHOOKSTRUCT {
                 vkCode: u32::from(VK_ESCAPE.0),
                 ..Default::default()
