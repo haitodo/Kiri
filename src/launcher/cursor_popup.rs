@@ -348,7 +348,7 @@ impl CursorPopup {
                 0,
                 None,
                 None,
-                module,
+                Some(module.into()),
                 None,
             )?;
             let mut popup = Box::new(Self {
@@ -440,15 +440,15 @@ impl CursorPopup {
             let diameter = radius * 2;
             let region = CreateRoundRectRgn(0, 0, width, height, diameter, diameter);
             if !region.is_invalid() {
-                if SetWindowRgn(self.hwnd, region, false) != 0 {
+                if SetWindowRgn(self.hwnd, Some(region), false) != 0 {
                     corner_radius = radius;
                 } else {
-                    let _ = DeleteObject(region);
+                    let _ = DeleteObject(region.into());
                 }
             }
             SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 bounds.left,
                 bounds.top,
                 width,
@@ -460,7 +460,7 @@ impl CursorPopup {
             GetClientRect(self.hwnd, &mut client)?;
             self.width = client.right;
             self.height = client.bottom;
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
         Ok(PopupInput {
             rect: bounds,
@@ -473,7 +473,7 @@ impl CursorPopup {
         if self.variant_fan.is_active() {
             let _ = self.variant_fan.cancel();
             unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                let _ = KillTimer(Some(self.hwnd), TIMER_CURSOR_FAN_HOLD);
                 let _ = ReleaseCapture();
             }
             self.notify_fan_state(false);
@@ -491,7 +491,7 @@ impl CursorPopup {
     fn notify_fan_state(&self, active: bool) {
         unsafe {
             let _ = PostMessageW(
-                self.owner,
+                Some(self.owner),
                 WM_APP_CURSOR_POPUP_FAN_STATE,
                 WPARAM(usize::from(active)),
                 LPARAM(0),
@@ -559,7 +559,7 @@ impl CursorPopup {
                     variant_id,
                 } => {
                     unsafe {
-                        let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                        let _ = KillTimer(Some(self.hwnd), TIMER_CURSOR_FAN_HOLD);
                         let _ = ReleaseCapture();
                     }
                     self.notify_fan_state(false);
@@ -569,7 +569,7 @@ impl CursorPopup {
                 }
                 FanOutcome::Cancelled => {
                     unsafe {
-                        let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                        let _ = KillTimer(Some(self.hwnd), TIMER_CURSOR_FAN_HOLD);
                         let _ = ReleaseCapture();
                     }
                     self.notify_fan_state(false);
@@ -642,7 +642,7 @@ impl CursorPopup {
                     self.ensure_hit_visible(hit);
                 }
                 unsafe {
-                    let _ = InvalidateRect(self.hwnd, None, false);
+                    let _ = InvalidateRect(Some(self.hwnd), None, false);
                 }
             }
             return CursorKeyOutcome::Redrawn;
@@ -694,7 +694,7 @@ impl CursorPopup {
             }
         }
         unsafe {
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
@@ -734,7 +734,7 @@ impl CursorPopup {
                     },
                     true,
                 );
-                let _ = InvalidateRect(self.hwnd, None, false);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
     }
@@ -791,7 +791,7 @@ unsafe extern "system" fn window_proc(
                     let palette = PopupPalette::system();
                     if popup.palette != palette {
                         popup.palette = palette;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
@@ -801,7 +801,7 @@ unsafe extern "system" fn window_proc(
                     if GetCursorPos(&mut pt).is_ok()
                         && matches!(popup.variant_fan.on_move(pt.x, pt.y), FanOutcome::Opened)
                     {
-                        let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                        let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                         popup.notify_fan_state(true);
                     }
                     return LRESULT(0);
@@ -819,7 +819,7 @@ unsafe extern "system" fn window_proc(
                 if hit != popup.hover {
                     popup.hover = hit;
                     popup.keyboard_focus = None;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             WM_MOUSELEAVE => {
@@ -829,7 +829,7 @@ unsafe extern "system" fn window_proc(
                 }
                 popup.pressed = None;
                 if popup.hover.take().is_some() {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             WM_LBUTTONDOWN => {
@@ -849,7 +849,7 @@ unsafe extern "system" fn window_proc(
                                 || pt.y >= win_rc.bottom)
                         {
                             let _ = PostMessageW(
-                                popup.owner,
+                                Some(popup.owner),
                                 WM_APP_DISMISS_CURSOR_POPUP,
                                 WPARAM(0),
                                 LPARAM(0),
@@ -877,7 +877,7 @@ unsafe extern "system" fn window_proc(
                             {
                                 let _ = SetCapture(hwnd);
                                 let _ = SetTimer(
-                                    hwnd,
+                                    Some(hwnd),
                                     TIMER_CURSOR_FAN_HOLD,
                                     HOLD_OPEN_DELAY_MS,
                                     None,
@@ -889,7 +889,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_TIMER => {
                 if wparam.0 == TIMER_CURSOR_FAN_HOLD {
-                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                     let mut pt = POINT::default();
                     if GetCursorPos(&mut pt).is_ok()
                         && matches!(popup.variant_fan.on_hold_timer(pt.x, pt.y), FanOutcome::Opened)
@@ -900,7 +900,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_LBUTTONUP => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     match popup.variant_fan.on_up(pt.x, pt.y) {
@@ -920,7 +920,7 @@ unsafe extern "system" fn window_proc(
                             {
                                 popup.pending_action = Some(popup.action_for_hit(hit));
                                 if PostMessageW(
-                                    popup.owner,
+                                    Some(popup.owner),
                                     WM_APP_CURSOR_POPUP_ACTION,
                                     WPARAM(0),
                                     LPARAM(0),
@@ -943,7 +943,7 @@ unsafe extern "system" fn window_proc(
                                 popup.pending_action =
                                     Some(PopupAction::SwitchSceneVariant(scene_id, variant_id));
                                 if PostMessageW(
-                                    popup.owner,
+                                    Some(popup.owner),
                                     WM_APP_CURSOR_POPUP_ACTION,
                                     WPARAM(0),
                                     LPARAM(0),
@@ -975,7 +975,7 @@ unsafe extern "system" fn window_proc(
                 {
                     popup.pending_action = Some(popup.action_for_hit(hit));
                     if PostMessageW(
-                        popup.owner,
+                        Some(popup.owner),
                         WM_APP_CURSOR_POPUP_ACTION,
                         WPARAM(0),
                         LPARAM(0),
@@ -988,7 +988,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_RBUTTONDOWN => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                     let _ = popup.variant_fan.cancel();
                     let _ = ReleaseCapture();
                     popup.notify_fan_state(false);
@@ -997,7 +997,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_CAPTURECHANGED => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                     let _ = popup.variant_fan.cancel();
                     popup.notify_fan_state(false);
                     popup.pressed = None;
@@ -1005,7 +1005,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_RBUTTONUP => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_CURSOR_FAN_HOLD);
                     let _ = popup.variant_fan.cancel();
                     let _ = ReleaseCapture();
                     popup.notify_fan_state(false);
@@ -1013,7 +1013,7 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
                 let _ = PostMessageW(
-                    popup.owner,
+                    Some(popup.owner),
                     WM_APP_DISMISS_CURSOR_POPUP,
                     WPARAM(0),
                     LPARAM(0),
@@ -1022,7 +1022,7 @@ unsafe extern "system" fn window_proc(
             WM_MOUSEWHEEL => {
                 // Also handle native wheel messages if the low-level hook is unavailable.
                 if popup.visible {
-                    let _ = PostMessageW(popup.owner, WM_APP_CURSOR_POPUP_WHEEL, wparam, lparam);
+                    let _ = PostMessageW(Some(popup.owner), WM_APP_CURSOR_POPUP_WHEEL, wparam, lparam);
                 }
             }
             WM_VSCROLL => {
@@ -1152,9 +1152,9 @@ mod tests {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                Some(HWND_MESSAGE),
                 None,
-                GetModuleHandleW(None).unwrap(),
+                Some(GetModuleHandleW(None).unwrap().into()),
                 None,
             )
             .unwrap();
@@ -1186,7 +1186,7 @@ mod tests {
             assert!(IsWindowVisible(popup.hwnd).as_bool());
             assert_ne!(GetForegroundWindow(), popup.hwnd);
             assert_eq!(
-                SendMessageW(popup.hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)).0,
+                SendMessageW(popup.hwnd, WM_MOUSEACTIVATE, Some(WPARAM(0)), Some(LPARAM(0))).0,
                 MA_NOACTIVATE as isize
             );
 
@@ -1211,15 +1211,15 @@ mod tests {
             let x = tile.left + 6;
             let y = tile.top + 4 - popup.scroll;
             let hit = LPARAM(((y as isize) << 16) | x as isize);
-            let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, WPARAM(0), hit);
-            let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), hit);
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, Some(WPARAM(0)), Some(hit));
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, Some(WPARAM(0)), Some(hit));
             assert!(
                 matches!(popup.pending_action.take(), Some(PopupAction::SwitchScene(scene)) if scene == "code")
             );
             let mut message = MSG::default();
             assert!(PeekMessageW(
                 &mut message,
-                owner,
+                Some(owner),
                 WM_APP_CURSOR_POPUP_ACTION,
                 WM_APP_CURSOR_POPUP_ACTION,
                 PM_REMOVE
@@ -1238,14 +1238,19 @@ mod tests {
                 Some(PopupAction::SwitchSceneVariant(scene, variant))
                 if scene == "code" && variant == "Codex"
             ));
-            let _ = SendMessageW(popup.hwnd, WM_VSCROLL, WPARAM(SB_TOP.0 as usize), LPARAM(0));
+            let _ = SendMessageW(
+                popup.hwnd,
+                WM_VSCROLL,
+                Some(WPARAM(SB_TOP.0 as usize)),
+                Some(LPARAM(0)),
+            );
             assert_eq!(popup.scroll, 0);
             let row = popup
                 .viewport_rect(popup.layout.shortcut(0, popup.width))
                 .unwrap();
             let hit = LPARAM((((row.top + 3) as isize) << 16) | (row.left + 3) as isize);
-            let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, WPARAM(0), hit);
-            let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), hit);
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, Some(WPARAM(0)), Some(hit));
+            let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, Some(WPARAM(0)), Some(hit));
             assert!(
                 matches!(popup.pending_action.take(), Some(PopupAction::OpenShortcut(shortcut))
                 if shortcut == config.shortcuts[0])
@@ -1253,7 +1258,7 @@ mod tests {
 
             assert!(PeekMessageW(
                 &mut message,
-                owner,
+                Some(owner),
                 WM_APP_CURSOR_POPUP_ACTION,
                 WM_APP_CURSOR_POPUP_ACTION,
                 PM_REMOVE

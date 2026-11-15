@@ -72,7 +72,8 @@ impl Win32WindowSystem {
 #[cfg(windows)]
 impl WindowSystem for Win32WindowSystem {
     fn enumerate_windows(&self) -> Vec<WindowInstance> {
-        use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::{HWND, LPARAM};
         use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
         let monitors = self.refresh_monitors();
@@ -139,7 +140,7 @@ impl WindowSystem for Win32WindowSystem {
 
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
-            if !IsWindow(hwnd).as_bool() {
+            if !IsWindow(Some(hwnd)).as_bool() {
                 return Err(PlatformError::WindowNotFound(hwnd_val));
             }
 
@@ -189,7 +190,7 @@ impl WindowSystem for Win32WindowSystem {
                 || (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0)
             {
                 return RaiseWindowResult::WindowPos {
-                    error: SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags)
+                    error: SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags)
                         .err()
                         .map(|error| error.code().0),
                 };
@@ -198,11 +199,11 @@ impl WindowSystem for Win32WindowSystem {
             // Moving a window out of the topmost group places it above other normal
             // windows even when a request for keyboard focus was rejected.
             let flags = flags | SWP_NOSENDCHANGING;
-            let promote_error = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            let promote_error = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags)
                 .err()
                 .map(|error| error.code().0);
             let demote_error = if promote_error.is_none() {
-                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+                SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags)
                     .err()
                     .map(|error| error.code().0)
             } else {
@@ -257,7 +258,8 @@ impl WindowSystem for Win32WindowSystem {
     }
 
     fn window_stack(&self) -> Vec<WindowStackEntry> {
-        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::{HWND, LPARAM, RECT};
         use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
         use windows::Win32::UI::WindowsAndMessaging::{
             EnumWindows, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
@@ -383,7 +385,7 @@ impl WindowSystem for Win32WindowSystem {
 
         let hwnd = HWND(hwnd_val as usize as *mut std::ffi::c_void);
         unsafe {
-            if !IsWindow(hwnd).as_bool() {
+            if !IsWindow(Some(hwnd)).as_bool() {
                 return Err(PlatformError::WindowNotFound(hwnd_val));
             }
             let mut wp = WINDOWPLACEMENT {
@@ -523,7 +525,7 @@ unsafe fn inspect_hwnd(
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     };
 
-    if !IsWindow(hwnd).as_bool() {
+    if !IsWindow(Some(hwnd)).as_bool() {
         return None;
     }
 
@@ -765,8 +767,9 @@ unsafe fn query_process_identity(pid: u32) -> (String, u64, bool) {
 #[cfg(windows)]
 unsafe fn query_window_aumid(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
     use windows::core::GUID;
+    use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::UI::Shell::PropertiesSystem::{
-        IPropertyStore, SHGetPropertyStoreForWindow, PROPERTYKEY,
+        IPropertyStore, SHGetPropertyStoreForWindow,
     };
 
     // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5

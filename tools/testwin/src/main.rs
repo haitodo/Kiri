@@ -40,7 +40,6 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
 #[cfg(windows)]
 unsafe fn run_testwin(mode: &str, base_title: &str) {
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DispatchMessageW, GetMessageW, LoadCursorW, MessageBoxW, RegisterClassW,
@@ -86,9 +85,9 @@ unsafe fn run_testwin(mode: &str, base_title: &str) {
         200,
         640,
         420,
-        HWND::default(),
         None,
-        hinstance,
+        None,
+        Some(hinstance.into()),
         None,
     )
     .expect("CreateWindowExW failed");
@@ -116,20 +115,20 @@ unsafe fn run_testwin(mode: &str, base_title: &str) {
             260,
             640,
             420,
-            HWND::default(),
             None,
-            hinstance,
+            None,
+            Some(hinstance.into()),
             None,
         );
     }
 
     if mode == "dynamic-title" {
-        let _ = SetTimer(hwnd, TIMER_DYNAMIC_TITLE, 1000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_DYNAMIC_TITLE, 1000, None);
     }
 
     if mode == "modal" {
         let _ = MessageBoxW(
-            hwnd,
+            Some(hwnd),
             w!("モーダル注文確認ダイアログのシミュレーション中（親ウィンドウは IsWindowEnabled == false になります）"),
             w!("TestWin Modal Dialog"),
             MB_OK | MB_ICONWARNING,
@@ -137,7 +136,7 @@ unsafe fn run_testwin(mode: &str, base_title: &str) {
     }
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

@@ -92,7 +92,6 @@ impl LauncherWindowHost {
     pub fn create_and_show(mut app: AppController) -> Result<Box<Self>, String> {
         use std::sync::Once;
         use windows::core::w;
-        use windows::Win32::Foundation::HWND;
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::System::RemoteDesktop::{
             WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
@@ -142,9 +141,9 @@ impl LauncherWindowHost {
                 y,
                 w,
                 h,
-                HWND::default(),
                 None,
-                hinstance,
+                None,
+                Some(hinstance.into()),
                 None,
             )
             .map_err(|e| format!("CreateWindowExW failed: {}", e))?;
@@ -166,9 +165,9 @@ impl LauncherWindowHost {
                 0,
                 0,
                 0,
-                hwnd,
+                Some(hwnd),
                 None,
-                hinstance,
+                Some(hinstance.into()),
                 None,
             )
             .unwrap_or_default();
@@ -186,8 +185,8 @@ impl LauncherWindowHost {
                 let _ = SendMessageW(
                     tooltip_hwnd,
                     TTM_ADDTOOLW,
-                    WPARAM(0),
-                    LPARAM(&mut ti as *mut _ as isize),
+                    Some(WPARAM(0)),
+                    Some(LPARAM(&mut ti as *mut _ as isize)),
                 );
             }
 
@@ -247,7 +246,7 @@ impl LauncherWindowHost {
 
         unsafe {
             let ans = MessageBoxW(
-                self.hwnd,
+                Some(self.hwnd),
                 w!("前回の異常終了時に Kiri が最小化したウィンドウが残っています。\nこれらを今すぐ復元しますか？"),
                 w!("Kiri - ウィンドウの復旧確認"),
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
@@ -272,7 +271,7 @@ impl LauncherWindowHost {
         let mut failed_scenes: Vec<String> = Vec::new();
         unsafe {
             for i in 0..self.registered_hotkey_count {
-                let _ = UnregisterHotKey(self.hwnd, HOTKEY_BASE_ID + i as i32);
+                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_BASE_ID + i as i32);
             }
             self.registered_hotkey_count = 0;
 
@@ -287,7 +286,7 @@ impl LauncherWindowHost {
                     );
                 }
                 let id = HOTKEY_BASE_ID + idx as i32;
-                if RegisterHotKey(self.hwnd, id, HOT_KEY_MODIFIERS(hk.modifiers), hk.vk).is_err() {
+                if RegisterHotKey(Some(self.hwnd), id, HOT_KEY_MODIFIERS(hk.modifiers), hk.vk).is_err() {
                     log_warn(
                         "hotkey",
                         &format!(
@@ -421,12 +420,12 @@ impl LauncherWindowHost {
         let diameter = dip_to_px(CORNER_RADIUS_DIP * 2, self.app.launcher_dpi);
         self.applying_bounds = true;
         unsafe {
-            let _ = SetWindowPos(self.hwnd, z_hwnd, x, y, w, h, SWP_NOACTIVATE);
+            let _ = SetWindowPos(self.hwnd, Some(z_hwnd), x, y, w, h, SWP_NOACTIVATE);
             let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, diameter, diameter);
-            if !rgn.is_invalid() && SetWindowRgn(self.hwnd, rgn, true) == 0 {
+            if !rgn.is_invalid() && SetWindowRgn(self.hwnd, Some(rgn), true) == 0 {
                 let _ = DeleteObject(HGDIOBJ(rgn.0));
             }
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
         self.applying_bounds = false;
     }
@@ -481,8 +480,8 @@ impl LauncherWindowHost {
                 let _ = SendMessageW(
                     self.tooltip_hwnd,
                     TTM_TRACKACTIVATE,
-                    WPARAM(0),
-                    LPARAM(&mut ti as *mut _ as isize),
+                    Some(WPARAM(0)),
+                    Some(LPARAM(&mut ti as *mut _ as isize)),
                 );
             }
             self.tooltip_visible = false;
@@ -550,8 +549,8 @@ impl LauncherWindowHost {
                 let _ = SendMessageW(
                     self.tooltip_hwnd,
                     TTM_UPDATETIPTEXTW,
-                    WPARAM(0),
-                    LPARAM(&mut ti as *mut _ as isize),
+                    Some(WPARAM(0)),
+                    Some(LPARAM(&mut ti as *mut _ as isize)),
                 );
                 let off_x = crate::platform::monitors::dip_to_px(12, self.app.launcher_dpi);
                 let off_y = crate::platform::monitors::dip_to_px(22, self.app.launcher_dpi);
@@ -561,15 +560,15 @@ impl LauncherWindowHost {
                 let _ = SendMessageW(
                     self.tooltip_hwnd,
                     TTM_TRACKPOSITION,
-                    WPARAM(0),
-                    LPARAM(pos as isize),
+                    Some(WPARAM(0)),
+                    Some(LPARAM(pos as isize)),
                 );
                 if !self.tooltip_visible {
                     let _ = SendMessageW(
                         self.tooltip_hwnd,
                         TTM_TRACKACTIVATE,
-                        WPARAM(1),
-                        LPARAM(&mut ti as *mut _ as isize),
+                        Some(WPARAM(1)),
+                        Some(LPARAM(&mut ti as *mut _ as isize)),
                     );
                     self.tooltip_visible = true;
                 }
@@ -601,14 +600,14 @@ impl LauncherWindowHost {
 
         if self.variant_fan.is_active() {
             unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_VARIANT_HOLD);
+                let _ = KillTimer(Some(self.hwnd), TIMER_VARIANT_HOLD);
                 let _ = ReleaseCapture();
             }
             let _ = self.variant_fan.cancel();
             let _ = self.cursor_input.set_bar_fan_active(false);
             self.pressed = HitTarget::None;
             unsafe {
-                let _ = InvalidateRect(self.hwnd, None, false);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
     }
@@ -668,7 +667,7 @@ impl LauncherWindowHost {
             // Per Section 0 & 6: Prompt user to select target monitor on first use, proposing launcher's monitor
             unsafe {
                 let ans = MessageBoxW(
-                    self.hwnd,
+                    Some(self.hwnd),
                     w!("制御対象モニターがまだ設定されていません。\n現在ランチャーがあるモニターを制御対象モニターとして設定しますか？"),
                     w!("Kiri - 初回モニター設定"),
                     MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST,
@@ -682,7 +681,7 @@ impl LauncherWindowHost {
                         self.schedule_switch_verification();
                     }
                 }
-                let _ = InvalidateRect(self.hwnd, None, false);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
             return;
         }
@@ -692,7 +691,7 @@ impl LauncherWindowHost {
                 if outcome.verification.is_some() {
                     self.schedule_switch_verification();
                 }
-                let _ = InvalidateRect(self.hwnd, None, false);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
     }
@@ -702,8 +701,8 @@ impl LauncherWindowHost {
         use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_VERIFY_SWITCH);
-            if SetTimer(self.hwnd, TIMER_VERIFY_SWITCH, 500, None) == 0 {
+            let _ = KillTimer(Some(self.hwnd), TIMER_VERIFY_SWITCH);
+            if SetTimer(Some(self.hwnd), TIMER_VERIFY_SWITCH, 500, None) == 0 {
                 let error = GetLastError().0;
                 if let Some(pending) = &self.app.pending_verification {
                     pending.record_timer_failure(error);
@@ -746,7 +745,7 @@ impl LauncherWindowHost {
                 let body_w = HSTRING::from(body);
                 let ans = unsafe {
                     MessageBoxW(
-                        self.hwnd,
+                        Some(self.hwnd),
                         &body_w,
                         w!("Kiri - 最新の切替警告"),
                         MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
@@ -755,7 +754,7 @@ impl LauncherWindowHost {
                 if ans == IDYES {
                     self.app.last_warnings.clear();
                     unsafe {
-                        let _ = InvalidateRect(self.hwnd, None, false);
+                        let _ = InvalidateRect(Some(self.hwnd), None, false);
                     }
                 }
             }
@@ -861,7 +860,7 @@ impl LauncherWindowHost {
                     false,
                 );
                 unsafe {
-                    let _ = InvalidateRect(self.hwnd, None, false);
+                    let _ = InvalidateRect(Some(self.hwnd), None, false);
                 }
             }
             MenuCommand::ExitAndRestore => {
@@ -960,7 +959,7 @@ unsafe extern "system" fn launcher_wndproc(
             WM_SETCURSOR => {
                 if host.drag_state.is_some() || host.hovered == HitTarget::Grip {
                     if let Ok(hcur) = LoadCursorW(None, IDC_SIZEALL) {
-                        let _ = SetCursor(hcur);
+                        let _ = SetCursor(Some(hcur));
                         return LRESULT(1);
                     }
                 }
@@ -1059,7 +1058,7 @@ unsafe extern "system" fn launcher_wndproc(
                         let _ = ReleaseCapture();
                         let _ = host.cursor_input.set_bar_fan_active(false);
                         host.pressed = HitTarget::None;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return LRESULT(0);
                 }
@@ -1087,7 +1086,7 @@ unsafe extern "system" fn launcher_wndproc(
                                 start_cursor_y: cursor_pt.y,
                                 moved: false,
                             });
-                            let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
+                            let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
                             let _ = SetCapture(hwnd);
                         }
                     }
@@ -1123,7 +1122,7 @@ unsafe extern "system" fn launcher_wndproc(
                                     ) {
                                         let _ = SetCapture(hwnd);
                                         let _ = SetTimer(
-                                            hwnd,
+                                            Some(hwnd),
                                             TIMER_VARIANT_HOLD,
                                             HOLD_OPEN_DELAY_MS,
                                             None,
@@ -1132,11 +1131,11 @@ unsafe extern "system" fn launcher_wndproc(
                                 }
                             }
                         }
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     HitTarget::OverflowButton => {
                         host.pressed = hit;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     HitTarget::None => {}
                 }
@@ -1164,7 +1163,7 @@ unsafe extern "system" fn launcher_wndproc(
                             FanOutcome::Opened
                         )
                     {
-                        let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                        let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
                         let _ = host.cursor_input.set_bar_fan_active(true);
                     }
                     return LRESULT(0);
@@ -1216,7 +1215,7 @@ unsafe extern "system" fn launcher_wndproc(
                     use windows::Win32::Graphics::Gdi::ClientToScreen;
                     let _ = ClientToScreen(hwnd, &mut pt);
                     host.update_tooltip(&new_target, pt.x, pt.y);
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -1229,7 +1228,7 @@ unsafe extern "system" fn launcher_wndproc(
                     host.hovered = HitTarget::None;
                     host.pressed = HitTarget::None;
                     host.hide_tooltip();
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -1266,11 +1265,11 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_CAPTURECHANGED => {
                 if host.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
                     let _ = host.variant_fan.cancel();
                     let _ = host.cursor_input.set_bar_fan_active(false);
                     host.pressed = HitTarget::None;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 if let Some(drag) = host.drag_state.take() {
                     if drag.moved {
@@ -1292,7 +1291,7 @@ unsafe extern "system" fn launcher_wndproc(
             WM_LBUTTONUP => {
                 host.hide_tooltip();
                 if host.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
                     let mut cursor_pt = POINT::default();
                     let _ = GetCursorPos(&mut cursor_pt);
                     match host.variant_fan.on_up(cursor_pt.x, cursor_pt.y) {
@@ -1304,7 +1303,7 @@ unsafe extern "system" fn launcher_wndproc(
                             let _ = ReleaseCapture();
                             let _ = host.cursor_input.set_bar_fan_active(false);
                             let pressed = std::mem::replace(&mut host.pressed, HitTarget::None);
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                             if host.layout.hit_test(client_x, client_y) == pressed {
@@ -1322,7 +1321,7 @@ unsafe extern "system" fn launcher_wndproc(
                             let _ = ReleaseCapture();
                             let _ = host.cursor_input.set_bar_fan_active(false);
                             host.pressed = HitTarget::None;
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             if let Some(ref mut ov) = host.overflow_popup {
                                 ov.hide();
                             }
@@ -1334,7 +1333,7 @@ unsafe extern "system" fn launcher_wndproc(
                             let _ = ReleaseCapture();
                             let _ = host.cursor_input.set_bar_fan_active(false);
                             host.pressed = HitTarget::None;
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         FanOutcome::None | FanOutcome::Opened | FanOutcome::Updated => {
@@ -1360,7 +1359,7 @@ unsafe extern "system" fn launcher_wndproc(
                     return LRESULT(0);
                 }
                 if pressed != HitTarget::None {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
 
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -1530,7 +1529,7 @@ unsafe extern "system" fn launcher_wndproc(
                     SettingsWindow::show_hotkey_conflicts(settings, &failed);
                     host.apply_launcher_settings();
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
 
@@ -1554,8 +1553,8 @@ unsafe extern "system" fn launcher_wndproc(
                     host.cursor_input.reset_gesture();
                 }
                 if host.drag_state.is_none() && !host.applying_bounds {
-                    let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
-                    let _ = SetTimer(hwnd, TIMER_DISPLAY_DEBOUNCE, 200, None);
+                    let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
+                    let _ = SetTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
                 }
                 LRESULT(0)
             }
@@ -1563,19 +1562,19 @@ unsafe extern "system" fn launcher_wndproc(
             WM_TIMER => {
                 match wparam.0 {
                     TIMER_VERIFY_SWITCH => {
-                        let _ = KillTimer(hwnd, TIMER_VERIFY_SWITCH);
+                        let _ = KillTimer(Some(hwnd), TIMER_VERIFY_SWITCH);
                         let new_warnings = host.app.run_post_switch_verification();
                         if !new_warnings.is_empty() {
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     TIMER_DISPLAY_DEBOUNCE => {
-                        let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
+                        let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
                         let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                         host.apply_window_bounds(x, y, w, h);
                     }
                     TIMER_VARIANT_HOLD => {
-                        let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                        let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
                         let mut cursor_pt = POINT::default();
                         if GetCursorPos(&mut cursor_pt).is_ok()
                             && matches!(

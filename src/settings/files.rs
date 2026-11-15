@@ -35,7 +35,7 @@ pub(super) unsafe fn open_file_dialog(
         let _ = dialog.SetFileTypes(&specs);
     }
 
-    if let Err(error) = dialog.Show(hwnd) {
+    if let Err(error) = dialog.Show(Some(hwnd)) {
         return if error.code() == ERROR_CANCELLED.to_hresult() {
             Ok(None)
         } else {
@@ -83,7 +83,7 @@ pub(super) unsafe fn save_file_dialog(
         let _ = dialog.SetFileTypes(&specs);
     }
 
-    if let Err(error) = dialog.Show(hwnd) {
+    if let Err(error) = dialog.Show(Some(hwnd)) {
         return if error.code() == ERROR_CANCELLED.to_hresult() {
             Ok(None)
         } else {

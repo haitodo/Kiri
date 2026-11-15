@@ -275,7 +275,8 @@ pub fn find_best_monitor_for_rect<'a>(
 #[cfg(windows)]
 pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
     use std::sync::{Mutex, OnceLock};
-    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
@@ -348,7 +349,7 @@ pub fn enumerate_connected_monitors() -> Vec<MonitorInfoData> {
     let mut raw_list: Vec<RawMon> = Vec::with_capacity(4);
     unsafe {
         let _ = EnumDisplayMonitors(
-            HDC::default(),
+            None,
             None,
             Some(enum_proc),
             LPARAM(&mut raw_list as *mut Vec<RawMon> as isize),

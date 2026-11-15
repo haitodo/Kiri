@@ -742,7 +742,7 @@ pub fn is_autostart_enabled() -> bool {
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
-            0,
+            None,
             KEY_READ,
             &mut hkey,
         )
@@ -787,7 +787,7 @@ pub fn set_autostart_enabled(enable: bool) -> Result<(), String> {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
             w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
-            0,
+            None,
             None,
             REG_OPTION_NON_VOLATILE,
             KEY_SET_VALUE,
@@ -799,7 +799,7 @@ pub fn set_autostart_enabled(enable: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
         let result = if enable {
-            RegSetValueExW(hkey, w!("Kiri"), 0, REG_SZ, Some(&command)).ok()
+            RegSetValueExW(hkey, w!("Kiri"), None, REG_SZ, Some(&command)).ok()
         } else {
             let result = RegDeleteValueW(hkey, w!("Kiri"));
             if result == ERROR_FILE_NOT_FOUND {

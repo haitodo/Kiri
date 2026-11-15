@@ -10,16 +10,15 @@ description = "Kiri - Windows 11 lightweight workspace scene switcher"
 license = "MIT"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-regex = { version = "1.10", default-features = false, features = ["std", "perf"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
 
 [target.'cfg(windows)'.dependencies]
-webview2-com = "0.38.2"
-webview-windows = { package = "windows", version = "0.61", features = ["Win32_UI_Shell"] }
+webview2-com = "0.39.1"
 
 [dependencies.windows]
-version = "0.58"
+version = "0.62.2"
 features = [
     "Win32_Foundation",
     "Win32_Devices_Display",

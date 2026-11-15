@@ -87,10 +87,10 @@ impl PopupFonts {
                 0,
                 0,
                 0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                CLEARTYPE_QUALITY.0 as u32,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
                 FF_DONTCARE.0 as u32,
                 w!("Segoe UI Variable Text"),
             )
@@ -106,7 +106,7 @@ impl Drop for PopupFonts {
     fn drop(&mut self) {
         for font in [self.body, self.tile] {
             if !font.is_invalid() {
-                let _ = unsafe { DeleteObject(font) };
+                let _ = unsafe { DeleteObject(font.into()) };
             }
         }
     }
@@ -117,12 +117,12 @@ impl CursorPopup {
         if self.width <= 0 || self.height <= 0 {
             return;
         }
-        let dc = CreateCompatibleDC(hdc);
+        let dc = CreateCompatibleDC(Some(hdc));
         let bitmap = CreateCompatibleBitmap(hdc, self.width, self.height);
         let buffered = !dc.is_invalid() && !bitmap.is_invalid();
         let target = if buffered { dc } else { hdc };
         let old_bitmap = if buffered {
-            SelectObject(dc, bitmap)
+            SelectObject(dc, bitmap.into())
         } else {
             HGDIOBJ::default()
         };
@@ -140,10 +140,10 @@ impl CursorPopup {
         self.paint_labels(target);
 
         if buffered {
-            let _ = BitBlt(hdc, 0, 0, self.width, self.height, dc, 0, 0, SRCCOPY);
+            let _ = BitBlt(hdc, 0, 0, self.width, self.height, Some(dc), 0, 0, SRCCOPY);
             let _ = SelectObject(dc, old_bitmap);
         }
-        let _ = DeleteObject(bitmap);
+        let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(dc);
     }
 

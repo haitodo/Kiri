@@ -152,7 +152,7 @@ impl CursorInput {
                 SetWindowsHookExW(
                     WH_KEYBOARD_LL,
                     Some(keyboard_proc),
-                    GetModuleHandleW(None)?,
+                    Some(GetModuleHandleW(None)?.into()),
                     0,
                 )?
             });
@@ -234,7 +234,12 @@ fn update_mouse_hook(state: InputState) -> windows::core::Result<()> {
     if state.taps.held != 0 || state.popup.is_some() || state.bar_hovered {
         if hook.0.is_null() {
             MOUSE_HOOK.set(unsafe {
-                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), GetModuleHandleW(None)?, 0)?
+                SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(mouse_proc),
+                    Some(GetModuleHandleW(None)?.into()),
+                    0,
+                )?
             });
         }
     } else if !hook.0.is_null() {
@@ -272,7 +277,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             STATE.set(state);
             if down {
                 let _ = PostMessageW(
-                    state.hwnd,
+                    Some(state.hwnd),
                     WM_APP_CURSOR_POPUP_KEY,
                     WPARAM(vk as usize),
                     LPARAM(0),
@@ -283,7 +288,12 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
         if state.bar_fan_active && vk == VK_ESCAPE.0 {
             if down {
-                let _ = PostMessageW(state.hwnd, WM_APP_CANCEL_VARIANT_FAN, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(state.hwnd),
+                    WM_APP_CANCEL_VARIANT_FAN,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
             return true;
         }
@@ -330,7 +340,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             Some(CtrlTap::Single) if state.popup.is_some() => {
                 // Keep the first release available to pair with the next tap after hiding.
                 let _ = PostMessageW(
-                    state.hwnd,
+                    Some(state.hwnd),
                     WM_APP_DISMISS_CURSOR_POPUP,
                     WPARAM(0),
                     LPARAM(0),
@@ -340,7 +350,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 let mut cursor = POINT::default();
                 if GetCursorPos(&mut cursor).is_ok() {
                     let _ = PostMessageW(
-                        state.hwnd,
+                        Some(state.hwnd),
                         WM_APP_SHOW_CURSOR_POPUP,
                         WPARAM(cursor.x as usize),
                         LPARAM(cursor.y as isize),
@@ -378,7 +388,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 && state.popup.is_some_and(|popup| !popup.contains(mouse.pt))
             {
                 let _ = PostMessageW(
-                    state.hwnd,
+                    Some(state.hwnd),
                     WM_APP_DISMISS_CURSOR_POPUP,
                     WPARAM(0),
                     LPARAM(0),
@@ -402,7 +412,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let x = u32::from(mouse.pt.x as u16);
             let y = u32::from(mouse.pt.y as u16);
             PostMessageW(
-                state.hwnd,
+                Some(state.hwnd),
                 target_message,
                 WPARAM(delta),
                 LPARAM(((y << 16) | x) as isize),
@@ -437,9 +447,9 @@ mod tests {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                Some(HWND_MESSAGE),
                 None,
-                GetModuleHandleW(None).unwrap(),
+                Some(GetModuleHandleW(None).unwrap().into()),
                 None,
             )
             .unwrap()
@@ -466,7 +476,7 @@ mod tests {
             let receive_wheel = |message: &mut MSG| {
                 PeekMessageW(
                     message,
-                    hwnd,
+                    Some(hwnd),
                     WM_APP_CURSOR_POPUP_WHEEL,
                     WM_APP_CURSOR_POPUP_WHEEL,
                     PM_REMOVE,
@@ -601,7 +611,7 @@ mod tests {
                 let mut message = MSG::default();
                 PeekMessageW(
                     &mut message,
-                    hwnd,
+                    Some(hwnd),
                     WM_APP_SHOW_CURSOR_POPUP,
                     WM_APP_DISMISS_CURSOR_POPUP,
                     PM_REMOVE,
@@ -675,7 +685,7 @@ mod tests {
             let mut msg = MSG::default();
             assert!(PeekMessageW(
                 &mut msg,
-                hwnd,
+                Some(hwnd),
                 WM_APP_CURSOR_POPUP_KEY,
                 WM_APP_CURSOR_POPUP_KEY,
                 PM_REMOVE,
@@ -713,7 +723,7 @@ mod tests {
             let mut msg = MSG::default();
             assert!(PeekMessageW(
                 &mut msg,
-                hwnd,
+                Some(hwnd),
                 WM_APP_CANCEL_VARIANT_FAN,
                 WM_APP_CANCEL_VARIANT_FAN,
                 PM_REMOVE,
@@ -746,7 +756,7 @@ mod tests {
             );
             assert!(!PeekMessageW(
                 &mut msg,
-                hwnd,
+                Some(hwnd),
                 WM_APP_DISMISS_CURSOR_POPUP,
                 WM_APP_DISMISS_CURSOR_POPUP,
                 PM_REMOVE,
@@ -769,7 +779,7 @@ mod tests {
             );
             assert!(PeekMessageW(
                 &mut msg,
-                hwnd,
+                Some(hwnd),
                 WM_APP_CURSOR_POPUP_KEY,
                 WM_APP_CURSOR_POPUP_KEY,
                 PM_REMOVE,

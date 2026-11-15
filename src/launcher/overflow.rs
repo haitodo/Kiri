@@ -112,10 +112,10 @@ unsafe fn create_popup_font(dpi: u32) -> windows::Win32::Graphics::Gdi::HFONT {
         0,
         0,
         0,
-        DEFAULT_CHARSET.0 as u32,
-        OUT_DEFAULT_PRECIS.0 as u32,
-        CLIP_DEFAULT_PRECIS.0 as u32,
-        CLEARTYPE_QUALITY.0 as u32,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
         FF_DONTCARE.0 as u32,
         w!("Segoe UI Variable Text"),
     )
@@ -180,9 +180,9 @@ impl OverflowPopup {
                 0,
                 10,
                 10,
-                parent_hwnd,
+                Some(parent_hwnd),
                 None,
-                hinstance,
+                Some(hinstance.into()),
                 None,
             )
             .map_err(|e| format!("Failed to create overflow popup: {}", e))?;
@@ -216,8 +216,8 @@ impl OverflowPopup {
         self.pressed = None;
         self.tracking_leave = false;
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_OVERFLOW_FAN_HOLD);
-            let _ = KillTimer(self.hwnd, TIMER_OVERFLOW_MOUSE_CHECK);
+            let _ = KillTimer(Some(self.hwnd), TIMER_OVERFLOW_FAN_HOLD);
+            let _ = KillTimer(Some(self.hwnd), TIMER_OVERFLOW_MOUSE_CHECK);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
@@ -271,7 +271,7 @@ impl OverflowPopup {
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 rc.left,
                 rc.top,
                 rc.width(),
@@ -280,13 +280,13 @@ impl OverflowPopup {
             );
             let diameter = dip_to_px(CORNER_RADIUS_DIP * 2, self.dpi);
             let rgn = CreateRoundRectRgn(0, 0, rc.width() + 1, rc.height() + 1, diameter, diameter);
-            if !rgn.is_invalid() && SetWindowRgn(self.hwnd, rgn, true) == 0 {
+            if !rgn.is_invalid() && SetWindowRgn(self.hwnd, Some(rgn), true) == 0 {
                 let _ = DeleteObject(HGDIOBJ(rgn.0));
             }
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
             // Fallback outside-close timer while popup is open
-            let _ = SetTimer(self.hwnd, TIMER_OVERFLOW_MOUSE_CHECK, 350, None);
+            let _ = SetTimer(Some(self.hwnd), TIMER_OVERFLOW_MOUSE_CHECK, 350, None);
         }
     }
 
@@ -380,7 +380,7 @@ unsafe extern "system" fn overflow_wndproc(
                     let mut pt = POINT::default();
                     if GetCursorPos(&mut pt).is_ok() {
                         if matches!(popup.variant_fan.on_move(pt.x, pt.y), FanOutcome::Opened) {
-                            let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                            let _ = KillTimer(Some(hwnd), TIMER_OVERFLOW_FAN_HOLD);
                         }
                     }
                     return LRESULT(0);
@@ -398,7 +398,7 @@ unsafe extern "system" fn overflow_wndproc(
                 let new_hover = popup.row_at_y(y);
                 if new_hover != popup.hovered_idx {
                     popup.hovered_idx = new_hover;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -409,7 +409,7 @@ unsafe extern "system" fn overflow_wndproc(
                 }
                 let had_press = popup.pressed.take().is_some();
                 if popup.hovered_idx.take().is_some() || had_press {
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -430,7 +430,7 @@ unsafe extern "system" fn overflow_wndproc(
                         {
                             popup.hide();
                         } else {
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     return LRESULT(0);
@@ -454,7 +454,7 @@ unsafe extern "system" fn overflow_wndproc(
                             {
                                 let _ = SetCapture(hwnd);
                                 let _ = SetTimer(
-                                    hwnd,
+                                    Some(hwnd),
                                     TIMER_OVERFLOW_FAN_HOLD,
                                     HOLD_OPEN_DELAY_MS,
                                     None,
@@ -463,31 +463,31 @@ unsafe extern "system" fn overflow_wndproc(
                         }
                     }
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_RBUTTONDOWN | WM_RBUTTONUP => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_OVERFLOW_FAN_HOLD);
                     let _ = popup.variant_fan.cancel();
                     let _ = ReleaseCapture();
                     popup.pressed = None;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_OVERFLOW_FAN_HOLD);
                     let _ = popup.variant_fan.cancel();
                     popup.pressed = None;
-                    let _ = InvalidateRect(hwnd, None, false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
                 if popup.variant_fan.is_active() {
-                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_OVERFLOW_FAN_HOLD);
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     match popup.variant_fan.on_up(pt.x, pt.y) {
@@ -501,14 +501,14 @@ unsafe extern "system" fn overflow_wndproc(
                                 let parent = popup.parent_hwnd;
                                 popup.hide();
                                 let _ = PostMessageW(
-                                    parent,
+                                    Some(parent),
                                     WM_APP_OVERFLOW_SELECT,
                                     WPARAM(idx),
                                     windows::Win32::Foundation::LPARAM(0),
                                 );
                                 return LRESULT(0);
                             }
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         FanOutcome::CommitVariant {
@@ -531,20 +531,20 @@ unsafe extern "system" fn overflow_wndproc(
                                 let parent = popup.parent_hwnd;
                                 popup.hide();
                                 let _ = PostMessageW(
-                                    parent,
+                                    Some(parent),
                                     WM_APP_OVERFLOW_SELECT,
                                     WPARAM(idx),
                                     windows::Win32::Foundation::LPARAM(v_param),
                                 );
                                 return LRESULT(0);
                             }
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         FanOutcome::Cancelled => {
                             let _ = ReleaseCapture();
                             popup.pressed = None;
-                            let _ = InvalidateRect(hwnd, None, false);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
                         FanOutcome::None | FanOutcome::Opened | FanOutcome::Updated => {
@@ -557,19 +557,19 @@ unsafe extern "system" fn overflow_wndproc(
                     let parent = popup.parent_hwnd;
                     popup.hide();
                     let _ = PostMessageW(
-                        parent,
+                        Some(parent),
                         WM_APP_OVERFLOW_SELECT,
                         WPARAM(idx),
                         windows::Win32::Foundation::LPARAM(0),
                     );
                     return LRESULT(0);
                 }
-                let _ = InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_TIMER => {
                 if wparam.0 == TIMER_OVERFLOW_FAN_HOLD {
-                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = KillTimer(Some(hwnd), TIMER_OVERFLOW_FAN_HOLD);
                     let mut pt = POINT::default();
                     if GetCursorPos(&mut pt).is_ok() {
                         let _ = popup.variant_fan.on_hold_timer(pt.x, pt.y);
@@ -603,7 +603,7 @@ unsafe extern "system" fn overflow_wndproc(
                 let w = (client_rc.right - client_rc.left).max(1);
                 let h = (client_rc.bottom - client_rc.top).max(1);
 
-                let mem_dc = CreateCompatibleDC(hdc);
+                let mem_dc = CreateCompatibleDC(Some(hdc));
                 let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
                 let old_bmp = SelectObject(mem_dc, HGDIOBJ(mem_bmp.0));
                 let font_obj = if !popup.font.0.is_null() {
@@ -803,7 +803,7 @@ unsafe extern "system" fn overflow_wndproc(
                     }
                 }
 
-                let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+                let _ = BitBlt(hdc, 0, 0, w, h, Some(mem_dc), 0, 0, SRCCOPY);
                 let _ = SelectObject(mem_dc, old_font);
                 let _ = SelectObject(mem_dc, old_bmp);
                 let _ = DeleteObject(HGDIOBJ(mem_bmp.0));

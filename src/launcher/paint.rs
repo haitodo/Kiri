@@ -337,7 +337,7 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
     let dpi = state.layout.dpi;
     theme.ensure_dpi(dpi);
 
-    let mem_dc = CreateCompatibleDC(hdc);
+    let mem_dc = CreateCompatibleDC(Some(hdc));
     let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
     let old_bmp = SelectObject(mem_dc, HGDIOBJ(mem_bmp.0));
 
@@ -456,7 +456,7 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
         let _ = GdipDeleteGraphics(graphics);
     }
 
-    let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+    let _ = BitBlt(hdc, 0, 0, w, h, Some(mem_dc), 0, 0, SRCCOPY);
 
     let _ = SelectObject(mem_dc, old_bmp);
     let _ = DeleteObject(HGDIOBJ(mem_bmp.0));

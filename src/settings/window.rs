@@ -23,15 +23,8 @@ use webview2_com::{
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
     WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
-use webview_windows::{
-    core::{Interface as _, PCWSTR as WebStr, PWSTR as WebMutStr},
-    Win32::{
-        Foundation::{HWND as WebHwnd, RECT as WebRect},
-        UI::Shell::SHCreateMemStream,
-    },
-};
 use windows::{
-    core::{w, HSTRING},
+    core::{w, Error as WinError, Interface as _, Result as WinResult, HSTRING, PCWSTR, PWSTR},
     Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Win32::Graphics::{
         Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
@@ -42,6 +35,7 @@ use windows::{
         LibraryLoader::GetModuleHandleW,
         SystemServices::{SS_CENTER, SS_NOPREFIX},
     },
+    Win32::UI::Shell::SHCreateMemStream,
     Win32::UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
@@ -153,7 +147,7 @@ pub(crate) fn run_file_request() {
                         .unwrap_or_else(|| Path::new("."))
                         .as_os_str(),
                 );
-                let result = ShellExecuteW(hwnd, w!("open"), &folder, None, None, SW_SHOWNORMAL);
+                let result = ShellExecuteW(Some(hwnd), w!("open"), &folder, None, None, SW_SHOWNORMAL);
                 if result.0 as isize <= 32 {
                     Err("設定の保存先を開けませんでした。".into())
                 } else {
@@ -193,7 +187,7 @@ unsafe fn enqueue(hwnd: HWND, request: Request) {
         REQUESTS.with_borrow_mut(|requests| {
             requests.push_back((hwnd, request));
             if PostMessageW(
-                owner,
+                Some(owner),
                 WM_SETTINGS_REQUEST,
                 WPARAM(hwnd.0 as usize),
                 LPARAM(0),
@@ -368,9 +362,9 @@ impl SettingsWindow {
                 area.top + (area.bottom - area.top - height) / 2,
                 width,
                 height,
-                owner,
+                Some(owner),
                 None,
-                instance,
+                Some(instance.into()),
                 None,
             )
             .map_err(|e| e.to_string())?;
@@ -383,9 +377,9 @@ impl SettingsWindow {
                 0,
                 0,
                 0,
-                hwnd,
+                Some(hwnd),
                 None,
-                instance,
+                Some(instance.into()),
                 None,
             )
             .unwrap_or_default();
@@ -398,9 +392,9 @@ impl SettingsWindow {
                 0,
                 0,
                 0,
-                hwnd,
-                HMENU(ID_RETRY as *mut _),
-                instance,
+                Some(hwnd),
+                Some(HMENU(ID_RETRY as *mut _)),
+                Some(instance.into()),
                 None,
             )
             .unwrap_or_default();
@@ -408,22 +402,22 @@ impl SettingsWindow {
                 let _ = SendMessageW(
                     child,
                     WM_SETFONT,
-                    WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize),
-                    LPARAM(1),
+                    Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
+                    Some(LPARAM(1)),
                 );
             }
             let icon = crate::launcher::paint::create_kiri_hicon(32).unwrap_or_default();
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
-                WPARAM(ICON_SMALL as usize),
-                LPARAM(icon.0 as isize),
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(icon.0 as isize)),
             );
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
-                WPARAM(ICON_BIG as usize),
-                LPARAM(icon.0 as isize),
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(icon.0 as isize)),
             );
             let rounding = 2u32; // DWMWCP_ROUND
             let _ = DwmSetWindowAttribute(
@@ -456,12 +450,12 @@ impl SettingsWindow {
             let _ = SetForegroundWindow(hwnd);
             // Paint the native placeholder before starting the browser or enumerating windows.
             let _ = RedrawWindow(
-                hwnd,
+                Some(hwnd),
                 None,
                 None,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             );
-            if PostMessageW(hwnd, WM_SETTINGS_START, WPARAM(0), LPARAM(0)).is_err() {
+            if PostMessageW(Some(hwnd), WM_SETTINGS_START, WPARAM(0), LPARAM(0)).is_err() {
                 let _ = DestroyWindow(hwnd);
                 return Err("設定画面を読み込めませんでした。".into());
             }
@@ -489,13 +483,13 @@ impl SettingsWindow {
             let _ = SetWindowTextW(self.loading_label, w!("設定を読み込んでいます…"));
             let _ = ShowWindow(self.retry, SW_HIDE);
             let _ = RedrawWindow(
-                hwnd,
+                Some(hwnd),
                 None,
                 None,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             );
         }
-        let _ = SetTimer(hwnd, TIMER_STARTUP, 15_000, None);
+        let _ = SetTimer(Some(hwnd), TIMER_STARTUP, 15_000, None);
         let profile = CoTaskMemPWSTR::from(
             crate::diagnostics::default_app_data_dir()
                 .join("SettingsWebView")
@@ -532,7 +526,7 @@ impl SettingsWindow {
                                 .SetDefaultBackgroundColor(window.palette.get().web_background());
                         }
                         env.CreateCoreWebView2ControllerWithOptions(
-                            WebHwnd(hwnd.0),
+                            hwnd,
                             &opts,
                             &CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
                                 move |result, controller| {
@@ -574,7 +568,7 @@ impl SettingsWindow {
             },
         ));
         if let Err(error) = CreateCoreWebView2EnvironmentWithOptions(
-            WebStr::null(),
+            PCWSTR::null(),
             *profile.as_ref().as_pcwstr(),
             &options,
             &handler,
@@ -600,7 +594,7 @@ impl SettingsWindow {
         &self,
         controller: ICoreWebView2Controller,
         environment: &ICoreWebView2Environment,
-    ) -> webview_windows::core::Result<()> {
+    ) -> WinResult<()> {
         controller.SetIsVisible(false)?;
         self.palette.get().apply_web_background(&controller);
         let view = controller.CoreWebView2()?;
@@ -622,7 +616,7 @@ impl SettingsWindow {
         // Serve the bundled page directly from memory. No loopback server or network requests.
         let environment = environment.clone();
         view.AddWebResourceRequestedFilter(
-            webview_windows::core::w!("*"),
+            w!("*"),
             COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
         )?;
         view.add_WebResourceRequested(
@@ -630,16 +624,16 @@ impl SettingsWindow {
                 let Some(args) = args else {
                     return Ok(());
                 };
-                let mut uri = WebMutStr::null();
+                let mut uri = PWSTR::null();
                 args.Request()?.Uri(&mut uri)?;
                 let response = if CoTaskMemPWSTR::from(uri).to_string() == LOCAL_DOCUMENT {
                     let stream = SHCreateMemStream(Some(PAGE.as_bytes()))
-                        .ok_or_else(webview_windows::core::Error::from_win32)?;
+                        .ok_or_else(WinError::from_thread)?;
                     environment.CreateWebResourceResponse(
                         &stream,
                         200,
-                        webview_windows::core::w!("OK"),
-                        webview_windows::core::w!(
+                        w!("OK"),
+                        w!(
                             "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store"
                         ),
                     )?
@@ -647,8 +641,8 @@ impl SettingsWindow {
                     environment.CreateWebResourceResponse(
                         None,
                         404,
-                        webview_windows::core::w!("Not found"),
-                        WebStr::null(),
+                        w!("Not found"),
+                        PCWSTR::null(),
                     )?
                 };
                 args.SetResponse(&response)
@@ -658,7 +652,7 @@ impl SettingsWindow {
         view.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(|_, args| {
                 if let Some(args) = args {
-                    let mut uri = WebMutStr::null();
+                    let mut uri = PWSTR::null();
                     args.Uri(&mut uri)?;
                     if CoTaskMemPWSTR::from(uri).to_string() != LOCAL_DOCUMENT {
                         args.SetCancel(true)?;
@@ -688,7 +682,7 @@ impl SettingsWindow {
                         || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
                     {
                         let _ = PostMessageW(
-                            hwnd,
+                            Some(hwnd),
                             WM_SETTINGS_FAILED,
                             WPARAM(self_attempt as usize),
                             LPARAM(0),
@@ -708,7 +702,7 @@ impl SettingsWindow {
                         return Ok(());
                     }
                     let Some(args) = args else { return Ok(()) };
-                    let mut source = WebMutStr::null();
+                    let mut source = PWSTR::null();
                     args.Source(&mut source)?;
                     let source = CoTaskMemPWSTR::from(source).to_string();
                     if source != LOCAL_DOCUMENT {
@@ -718,7 +712,7 @@ impl SettingsWindow {
                         );
                         return Ok(());
                     }
-                    let mut message = WebMutStr::null();
+                    let mut message = PWSTR::null();
                     args.WebMessageAsJson(&mut message)?;
                     let message = CoTaskMemPWSTR::from(message).to_string();
                     if message.len() > 256 * 1024 {
@@ -750,7 +744,7 @@ impl SettingsWindow {
             if let Some(controller) = &*self.controller.borrow() {
                 palette.apply_web_background(controller);
             }
-            let _ = RedrawWindow(self.hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
     }
 
@@ -771,7 +765,7 @@ impl SettingsWindow {
             return;
         }
         self.initializing.set(false);
-        let _ = KillTimer(self.hwnd, TIMER_STARTUP);
+        let _ = KillTimer(Some(self.hwnd), TIMER_STARTUP);
         let _ = ShowWindow(self.loading_label, SW_HIDE);
         if GetForegroundWindow() == self.hwnd {
             let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
@@ -789,7 +783,7 @@ impl SettingsWindow {
         let mut area = RECT::default();
         let _ = GetClientRect(self.hwnd, &mut area);
         if let Some(controller) = &*self.controller.borrow() {
-            let _ = controller.SetBounds(WebRect {
+            let _ = controller.SetBounds(RECT {
                 left: 0,
                 top: 0,
                 right: area.right,
@@ -819,7 +813,7 @@ impl SettingsWindow {
     }
 
     unsafe fn failed(&self) {
-        let _ = KillTimer(self.hwnd, TIMER_STARTUP);
+        let _ = KillTimer(Some(self.hwnd), TIMER_STARTUP);
         self.initializing.set(false);
         REQUESTS.with_borrow_mut(|requests| requests.retain(|(sender, _)| *sender != self.hwnd));
         let controller = self.controller.borrow_mut().take();
@@ -830,10 +824,10 @@ impl SettingsWindow {
         let _ = ShowWindow(self.loading_label, SW_SHOW);
         let _ = ShowWindow(self.retry, SW_SHOW);
         if GetForegroundWindow() == self.hwnd {
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.retry);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.retry));
         }
         self.layout();
-        let _ = RedrawWindow(self.hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
 
     fn post(&self, message: Value) {
@@ -1014,7 +1008,7 @@ impl SettingsWindow {
                 if editor.dirty() && !discard {
                     return Err("保存していない変更があります。".into());
                 }
-                let _ = PostMessageW(self.hwnd, WM_SETTINGS_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(self.hwnd), WM_SETTINGS_CLOSE, WPARAM(0), LPARAM(0));
                 Ok(Value::Null)
             }
             edit => editor.edit(edit, app),
@@ -1032,7 +1026,7 @@ fn file_error(error: windows::core::Error) -> String {
     format!("ファイル選択を開けませんでした。{error}")
 }
 
-fn guarded(hwnd: HWND, attempt: u32, f: impl FnOnce() -> webview_windows::core::Result<()>) {
+fn guarded(hwnd: HWND, attempt: u32, f: impl FnOnce() -> WinResult<()>) {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => return,
         Ok(Err(error)) => log_warn("settings", &format!("WebView2 callback failed: {error}")),
@@ -1040,7 +1034,7 @@ fn guarded(hwnd: HWND, attempt: u32, f: impl FnOnce() -> webview_windows::core::
     }
     unsafe {
         let _ = PostMessageW(
-            hwnd,
+            Some(hwnd),
             WM_SETTINGS_FAILED,
             WPARAM(attempt as usize),
             LPARAM(0),
@@ -1140,7 +1134,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let _ = DestroyWindow(hwnd);
             }
             WM_NCDESTROY => {
-                let _ = KillTimer(hwnd, TIMER_STARTUP);
+                let _ = KillTimer(Some(hwnd), TIMER_STARTUP);
                 ACTIVE.with(|active| active.set(HWND::default()));
                 REQUESTS.with_borrow_mut(|requests| requests.retain(|(sender, _)| *sender != hwnd));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

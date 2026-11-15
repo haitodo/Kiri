@@ -147,7 +147,7 @@ unsafe extern "system" fn win_event_proc(
             let target_raw = NOTIFY_HWND.load(Ordering::Acquire);
             if target_raw != 0 {
                 let target_hwnd = HWND(target_raw as *mut std::ffi::c_void);
-                let _ = PostMessageW(target_hwnd, WM_APP_WINEVENT, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(target_hwnd), WM_APP_WINEVENT, WPARAM(0), LPARAM(0));
             }
         }
     });

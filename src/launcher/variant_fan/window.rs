@@ -169,7 +169,7 @@ impl VariantFanWindow {
                 1,
                 None,
                 None,
-                hinstance,
+                Some(hinstance.into()),
                 None,
             )
             .map_err(|e| format!("Failed to create variant fan overlay: {e}"))?;
@@ -293,7 +293,7 @@ impl VariantFanWindow {
                 ..Default::default()
             };
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let dib: HBITMAP = match CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let dib: HBITMAP = match CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
                 Ok(bmp) if !bmp.is_invalid() => bmp,
                 _ => {
                     let _ = DeleteDC(mem_dc);
@@ -329,7 +329,7 @@ impl VariantFanWindow {
 
             let _ = SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                Some(HWND_TOPMOST),
                 layout.bounds.left,
                 layout.bounds.top,
                 w,
@@ -341,7 +341,7 @@ impl VariantFanWindow {
                 None,
                 Some(&dst_pt),
                 Some(&size),
-                mem_dc,
+                Some(mem_dc),
                 Some(&src_pt),
                 COLORREF(0),
                 Some(&blend),

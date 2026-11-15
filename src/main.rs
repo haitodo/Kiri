@@ -112,7 +112,7 @@ fn acquire_single_instance_or_notify_existing() -> Option<SingleInstanceMutex> {
                         let _ = AllowSetForegroundWindow(existing_pid);
                     }
                     let _ = PostMessageW(
-                        existing_hwnd,
+                        Some(existing_hwnd),
                         WM_APP_OPEN_SETTINGS,
                         WPARAM(0),
                         LPARAM(0),
@@ -130,14 +130,13 @@ fn acquire_single_instance_or_notify_existing() -> Option<SingleInstanceMutex> {
 /// Event-driven native Win32 message loop (`GetMessageW` blocks when idle, consuming 0% CPU).
 #[cfg(windows)]
 fn run_message_loop() {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage, MSG,
     };
 
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if msg.message == crate::settings::window::WM_SETTINGS_REQUEST {

@@ -111,11 +111,11 @@ pub fn show_context_menu(
             TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
             screen_x,
             screen_y,
-            0,
+            None,
             owner_hwnd,
             None,
         );
-        let _ = PostMessageW(owner_hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(owner_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(hmenu);
 
         match cmd_id.0 as usize {
