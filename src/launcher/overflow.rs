@@ -9,19 +9,21 @@
 //! - Closes automatically on item selection, clicking `⋯` again, or a short one-shot timer after pointer leave.
 
 use crate::config::{RectData, Scene};
-use crate::launcher::input::{CORNER_RADIUS_DIP, SCENE_VARIANT_BUTTON_DIP};
+use crate::launcher::input::CORNER_RADIUS_DIP;
 use crate::launcher::paint::{
-    colors, draw_rounded_rect_border_gdiplus, draw_scene_icon, draw_variant_arrow,
+    colors, draw_rounded_rect_border_gdiplus, draw_scene_icon, draw_variant_badge,
     fill_rounded_rect_gdiplus, GdiThemeCache, GdiplusContext,
 };
+use crate::launcher::variant_fan::{FanAxis, FanOutcome, VariantFanHost, HOLD_OPEN_DELAY_MS};
 use crate::platform::monitors::dip_to_px;
 
-/// Custom message sent to the main launcher HWND when an overflow scene item is clicked.
+/// Custom message sent to the main launcher HWND when an overflow scene item is selected.
 /// `WPARAM` contains the index into the current `overflow_scenes` list.
-/// `LPARAM` is 1 when the variant arrow was clicked.
+/// `LPARAM` is `0` for the preferred/default variant, or `variant_index + 1` for a specific variant.
 pub const WM_APP_OVERFLOW_SELECT: u32 = 0x8000 + 3; // WM_APP + 3
 
 const TIMER_OVERFLOW_MOUSE_CHECK: usize = 301;
+const TIMER_OVERFLOW_FAN_HOLD: usize = 302;
 const ROW_HEIGHT_DIP: i32 = 34;
 const POPUP_WIDTH_DIP: i32 = 176;
 const POPUP_PAD_DIP: i32 = 5;
@@ -71,13 +73,15 @@ pub struct OverflowPopup {
     scenes: Vec<Scene>,
     active_scene_id: Option<String>,
     hovered_idx: Option<usize>,
-    pressed: Option<(usize, bool)>,
+    pressed: Option<usize>,
     tracking_leave: bool,
     dpi: u32,
     font_dpi: u32,
     font: windows::Win32::Graphics::Gdi::HFONT,
     visible: bool,
+    work_area: RectData,
     theme: GdiThemeCache,
+    variant_fan: VariantFanHost,
 }
 
 #[cfg(windows)]
@@ -162,7 +166,9 @@ impl OverflowPopup {
                 font_dpi: 96,
                 font: create_popup_font(96),
                 visible: false,
-                theme: GdiThemeCache::with_context(96, gdiplus),
+                work_area: RectData::default(),
+                theme: GdiThemeCache::with_context(96, gdiplus.clone()),
+                variant_fan: VariantFanHost::new(gdiplus),
             });
 
             let hwnd = CreateWindowExW(
@@ -194,7 +200,14 @@ impl OverflowPopup {
     }
 
     pub fn hide(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
         use windows::Win32::UI::WindowsAndMessaging::{KillTimer, ShowWindow, SW_HIDE};
+        if self.variant_fan.is_active() {
+            self.variant_fan.cancel();
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
         if !self.visible {
             return;
         }
@@ -203,6 +216,7 @@ impl OverflowPopup {
         self.pressed = None;
         self.tracking_leave = false;
         unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_OVERFLOW_FAN_HOLD);
             let _ = KillTimer(self.hwnd, TIMER_OVERFLOW_MOUSE_CHECK);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -234,6 +248,7 @@ impl OverflowPopup {
         let rc = compute_overflow_popup_rect(anchor_screen_rect, scenes.len(), dpi, work_area);
         self.scenes = scenes;
         self.active_scene_id = active_scene_id;
+        self.work_area = work_area;
         self.dpi = dpi.max(96);
         self.theme.ensure_dpi(self.dpi);
         if self.font_dpi != self.dpi {
@@ -289,31 +304,35 @@ impl OverflowPopup {
         }
     }
 
-    fn variant_arrow_rect(&self, index: usize, width: i32) -> Option<RectData> {
-        if self.scenes[index].variants.len() < 2 {
+    fn row_screen_rect(&self, index: usize) -> Option<RectData> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        if index >= self.scenes.len() {
             return None;
         }
+        let mut win_rc = RECT::default();
+        unsafe { GetWindowRect(self.hwnd, &mut win_rc).ok()? };
         let pad = dip_to_px(POPUP_PAD_DIP, self.dpi);
-        let height = dip_to_px(ROW_HEIGHT_DIP, self.dpi);
-        let right = width - pad;
-        let top = pad + index as i32 * height;
+        let row_h = dip_to_px(ROW_HEIGHT_DIP, self.dpi);
+        let width = dip_to_px(POPUP_WIDTH_DIP, self.dpi);
+        let top = win_rc.top + pad + index as i32 * row_h;
         Some(RectData {
-            left: right - dip_to_px(SCENE_VARIANT_BUTTON_DIP, self.dpi),
+            left: win_rc.left + pad,
             top,
-            right,
-            bottom: top + height,
+            right: win_rc.left + width - pad,
+            bottom: top + row_h,
         })
     }
 
-    fn hit_test(&self, lparam: windows::Win32::Foundation::LPARAM) -> Option<(usize, bool)> {
+    fn hit_test(&self, lparam: windows::Win32::Foundation::LPARAM) -> Option<usize> {
         let x = lparam.0 as i16 as i32;
         let y = (lparam.0 >> 16) as i16 as i32;
-        let index = self.row_at_y(y)?;
         let width = dip_to_px(POPUP_WIDTH_DIP, self.dpi);
-        let arrow = self
-            .variant_arrow_rect(index, width)
-            .is_some_and(|rect| crate::launcher::input::point_in_rect(x, y, &rect));
-        Some((index, arrow))
+        let pad = dip_to_px(POPUP_PAD_DIP, self.dpi);
+        if x < pad || x >= width - pad {
+            return None;
+        }
+        self.row_at_y(y)
     }
 }
 
@@ -336,12 +355,13 @@ unsafe extern "system" fn overflow_wndproc(
         GpGraphics, InterpolationModeHighQualityBicubic, Ok as GpOk, SmoothingModeAntiAlias,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+        ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-        PostMessageW, GWLP_USERDATA, MA_NOACTIVATE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
+        KillTimer, PostMessageW, SetTimer, GWLP_USERDATA, MA_NOACTIVATE, WM_CAPTURECHANGED,
+        WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
     };
     const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -356,6 +376,15 @@ unsafe extern "system" fn overflow_wndproc(
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_DPICHANGED => LRESULT(0),
             WM_MOUSEMOVE => {
+                if popup.variant_fan.is_active() {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        if matches!(popup.variant_fan.on_move(pt.x, pt.y), FanOutcome::Opened) {
+                            let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 if !popup.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -375,6 +404,9 @@ unsafe extern "system" fn overflow_wndproc(
             }
             WM_MOUSELEAVE => {
                 popup.tracking_leave = false;
+                if popup.variant_fan.is_active() {
+                    return LRESULT(0);
+                }
                 let had_press = popup.pressed.take().is_some();
                 if popup.hovered_idx.take().is_some() || had_press {
                     let _ = InvalidateRect(hwnd, None, false);
@@ -382,22 +414,153 @@ unsafe extern "system" fn overflow_wndproc(
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                popup.pressed = popup.hit_test(lparam);
+                if popup.variant_fan.is_sticky() {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok()
+                        && matches!(popup.variant_fan.on_down(pt.x, pt.y), FanOutcome::Cancelled)
+                    {
+                        let _ = ReleaseCapture();
+                        popup.pressed = None;
+                        let mut win_rc = RECT::default();
+                        if GetWindowRect(hwnd, &mut win_rc).is_ok()
+                            && (pt.x < win_rc.left
+                                || pt.x >= win_rc.right
+                                || pt.y < win_rc.top
+                                || pt.y >= win_rc.bottom)
+                        {
+                            popup.hide();
+                        } else {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                let hit = popup.hit_test(lparam);
+                popup.pressed = hit;
+                if let Some(idx) = hit {
+                    if popup.scenes[idx].variants.len() > 1 {
+                        if let Some(anchor) = popup.row_screen_rect(idx) {
+                            let mut pt = POINT::default();
+                            if GetCursorPos(&mut pt).is_ok()
+                                && popup.variant_fan.begin_press(
+                                    &popup.scenes[idx],
+                                    anchor,
+                                    popup.work_area,
+                                    FanAxis::Horizontal,
+                                    popup.dpi,
+                                    pt.x,
+                                    pt.y,
+                                )
+                            {
+                                let _ = SetCapture(hwnd);
+                                let _ = SetTimer(
+                                    hwnd,
+                                    TIMER_OVERFLOW_FAN_HOLD,
+                                    HOLD_OPEN_DELAY_MS,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
+            WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = popup.variant_fan.cancel();
+                    let _ = ReleaseCapture();
+                    popup.pressed = None;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let _ = popup.variant_fan.cancel();
+                    popup.pressed = None;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    match popup.variant_fan.on_up(pt.x, pt.y) {
+                        FanOutcome::EnteredSticky => return LRESULT(0),
+                        FanOutcome::ClickDefault { .. } => {
+                            let _ = ReleaseCapture();
+                            let pressed = popup.pressed.take();
+                            if let Some(idx) =
+                                popup.hit_test(lparam).filter(|hit| Some(*hit) == pressed)
+                            {
+                                let parent = popup.parent_hwnd;
+                                popup.hide();
+                                let _ = PostMessageW(
+                                    parent,
+                                    WM_APP_OVERFLOW_SELECT,
+                                    WPARAM(idx),
+                                    windows::Win32::Foundation::LPARAM(0),
+                                );
+                                return LRESULT(0);
+                            }
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::CommitVariant {
+                            scene_id,
+                            variant_id,
+                        } => {
+                            let _ = ReleaseCapture();
+                            popup.pressed = None;
+                            if let Some((idx, scene)) = popup
+                                .scenes
+                                .iter()
+                                .enumerate()
+                                .find(|(_, s)| s.id == scene_id)
+                            {
+                                let v_param = scene
+                                    .variants
+                                    .iter()
+                                    .position(|v| v.id == variant_id)
+                                    .map_or(0, |vi| (vi + 1) as isize);
+                                let parent = popup.parent_hwnd;
+                                popup.hide();
+                                let _ = PostMessageW(
+                                    parent,
+                                    WM_APP_OVERFLOW_SELECT,
+                                    WPARAM(idx),
+                                    windows::Win32::Foundation::LPARAM(v_param),
+                                );
+                                return LRESULT(0);
+                            }
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::Cancelled => {
+                            let _ = ReleaseCapture();
+                            popup.pressed = None;
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::None | FanOutcome::Opened | FanOutcome::Updated => {
+                            return LRESULT(0);
+                        }
+                    }
+                }
                 let pressed = popup.pressed.take();
-                if let Some((idx, variants)) =
-                    popup.hit_test(lparam).filter(|hit| Some(*hit) == pressed)
-                {
+                if let Some(idx) = popup.hit_test(lparam).filter(|hit| Some(*hit) == pressed) {
                     let parent = popup.parent_hwnd;
                     popup.hide();
                     let _ = PostMessageW(
                         parent,
                         WM_APP_OVERFLOW_SELECT,
                         WPARAM(idx),
-                        windows::Win32::Foundation::LPARAM(isize::from(variants)),
+                        windows::Win32::Foundation::LPARAM(0),
                     );
                     return LRESULT(0);
                 }
@@ -405,7 +568,18 @@ unsafe extern "system" fn overflow_wndproc(
                 LRESULT(0)
             }
             WM_TIMER => {
-                if wparam.0 == TIMER_OVERFLOW_MOUSE_CHECK && popup.visible {
+                if wparam.0 == TIMER_OVERFLOW_FAN_HOLD {
+                    let _ = KillTimer(hwnd, TIMER_OVERFLOW_FAN_HOLD);
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        let _ = popup.variant_fan.on_hold_timer(pt.x, pt.y);
+                    }
+                    return LRESULT(0);
+                }
+                if wparam.0 == TIMER_OVERFLOW_MOUSE_CHECK
+                    && popup.visible
+                    && !popup.variant_fan.is_active()
+                {
                     let mut pt = POINT::default();
                     let mut win_rc = RECT::default();
                     if GetCursorPos(&mut pt).is_ok() && GetWindowRect(hwnd, &mut win_rc).is_ok() {
@@ -477,7 +651,7 @@ unsafe extern "system" fn overflow_wndproc(
                         let is_active =
                             popup.active_scene_id.as_deref() == Some(scene.id.as_str());
                         let is_hovered = popup.hovered_idx == Some(idx);
-                        let is_pressed = popup.pressed.is_some_and(|(index, _)| index == idx);
+                        let is_pressed = popup.pressed == Some(idx);
 
                         if is_active {
                             let fill = if is_pressed {
@@ -561,13 +735,19 @@ unsafe extern "system" fn overflow_wndproc(
                             is_active,
                             popup.dpi,
                         );
-                        if let Some(arrow) = popup.variant_arrow_rect(idx, w) {
-                            draw_variant_arrow(
-                                graphics,
-                                arrow,
-                                colors::TEXT_PRIMARY_ARGB,
-                                popup.dpi,
-                            );
+                        if scene.variants.len() > 1 {
+                            let badge_rc = RectData {
+                                left: row_right - dip_to_px(18, popup.dpi),
+                                top,
+                                right: row_right - dip_to_px(2, popup.dpi),
+                                bottom: top + row_h,
+                            };
+                            let badge_color = if is_active {
+                                0xDDEAF2FF
+                            } else {
+                                0xB88C96A8
+                            };
+                            draw_variant_badge(graphics, badge_rc, badge_color, popup.dpi);
                         }
                     }
 
@@ -585,14 +765,12 @@ unsafe extern "system" fn overflow_wndproc(
                     };
                     let _ = SetTextColor(mem_dc, text_rgb);
 
-                    let right_pad = if is_active {
+                    let right_pad = if is_active || scene.variants.len() > 1 {
                         dip_to_px(24, popup.dpi)
                     } else {
                         dip_to_px(8, popup.dpi)
                     };
-                    let content_right = popup
-                        .variant_arrow_rect(idx, w)
-                        .map_or(client_rc.right - pad, |arrow| arrow.left);
+                    let content_right = client_rc.right - pad;
                     let mut text_rc = RECT {
                         left: pad + dip_to_px(32, popup.dpi),
                         top,

@@ -20,6 +20,7 @@ pub const WM_APP_SHOW_CURSOR_POPUP: u32 = 0x8000 + 7;
 pub const WM_APP_DISMISS_CURSOR_POPUP: u32 = 0x8000 + 8;
 pub const WM_APP_CURSOR_POPUP_WHEEL: u32 = 0x8000 + 11;
 pub const WM_APP_CURSOR_POPUP_KEY: u32 = 0x8000 + 12;
+pub const WM_APP_CANCEL_VARIANT_FAN: u32 = 0x8000 + 13;
 const DOUBLE_TAP_MS: u32 = 450;
 const LEFT_CTRL: u8 = 1;
 const RIGHT_CTRL: u8 = 2;
@@ -118,7 +119,9 @@ struct InputState {
     ctrl_enabled: bool,
     taps: CtrlTaps,
     popup: Option<PopupInput>,
+    popup_fan_active: bool,
     bar_hovered: bool,
+    bar_fan_active: bool,
 }
 
 // Both low-level callbacks run on the UI thread that installed them.
@@ -143,7 +146,7 @@ impl CursorInput {
     }
 
     fn update_keyboard_hook(&mut self, state: InputState) -> windows::core::Result<()> {
-        let needed = state.ctrl_enabled || state.popup.is_some();
+        let needed = state.ctrl_enabled || state.popup.is_some() || state.bar_fan_active;
         if needed && self.keyboard_hook.is_none() {
             self.keyboard_hook = Some(unsafe {
                 SetWindowsHookExW(
@@ -188,9 +191,25 @@ impl CursorInput {
     pub fn set_popup(&mut self, popup: Option<PopupInput>) -> windows::core::Result<()> {
         let mut state = STATE.get();
         state.popup = popup;
+        if popup.is_none() {
+            state.popup_fan_active = false;
+        }
         STATE.set(state);
         self.update_keyboard_hook(state)?;
         update_mouse_hook(state)
+    }
+
+    pub fn set_popup_fan_active(&self, active: bool) {
+        let mut state = STATE.get();
+        state.popup_fan_active = active;
+        STATE.set(state);
+    }
+
+    pub fn set_bar_fan_active(&mut self, active: bool) -> windows::core::Result<()> {
+        let mut state = STATE.get();
+        state.bar_fan_active = active;
+        STATE.set(state);
+        self.update_keyboard_hook(state)
     }
 
     pub fn set_bar_hovered(&self, hovered: bool) -> windows::core::Result<()> {
@@ -246,6 +265,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     || v == VK_DOWN.0
                     || v == VK_LEFT.0
                     || v == VK_RIGHT.0
+                    || (state.popup_fan_active && (b'1'..=b'9').contains(&(v as u8)))
             )
         {
             state.taps.interrupt();
@@ -257,6 +277,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     WPARAM(vk as usize),
                     LPARAM(0),
                 );
+            }
+            return true;
+        }
+
+        if state.bar_fan_active && vk == VK_ESCAPE.0 {
+            if down {
+                let _ = PostMessageW(state.hwnd, WM_APP_CANCEL_VARIANT_FAN, WPARAM(0), LPARAM(0));
             }
             return true;
         }
@@ -346,7 +373,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             state.taps.interrupt();
             STATE.set(state);
             let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            if button && state.popup.is_some_and(|popup| !popup.contains(mouse.pt)) {
+            if button
+                && !state.popup_fan_active
+                && state.popup.is_some_and(|popup| !popup.contains(mouse.pt))
+            {
                 let _ = PostMessageW(
                     state.hwnd,
                     WM_APP_DISMISS_CURSOR_POPUP,
@@ -655,6 +685,98 @@ mod tests {
 
             input.set_popup(None).unwrap();
             assert_eq!(send_esc().0, 0);
+            drop(input);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn fan_hooks_suppress_outside_dismiss_and_route_cancel_keys() {
+        unsafe {
+            let (hwnd, mut input) = input_window();
+
+            // Bar fan active intercepts Escape without taking focus
+            input.set_bar_fan_active(true).unwrap();
+            let kb_esc = KBDLLHOOKSTRUCT {
+                vkCode: u32::from(VK_ESCAPE.0),
+                ..Default::default()
+            };
+            assert_eq!(
+                keyboard_proc(
+                    HC_ACTION as i32,
+                    WPARAM(0x0100),
+                    LPARAM(&kb_esc as *const _ as isize),
+                )
+                .0,
+                1
+            );
+            let mut msg = MSG::default();
+            assert!(PeekMessageW(
+                &mut msg,
+                hwnd,
+                WM_APP_CANCEL_VARIANT_FAN,
+                WM_APP_CANCEL_VARIANT_FAN,
+                PM_REMOVE,
+            )
+            .as_bool());
+            input.set_bar_fan_active(false).unwrap();
+
+            // Cursor popup fan active keeps outside clicks from prematurely dismissing the popup
+            let popup = PopupInput {
+                rect: RectData {
+                    left: 0,
+                    top: 0,
+                    right: 200,
+                    bottom: 200,
+                },
+                corner_radius: 10,
+                has_scenes: true,
+            };
+            input.set_popup(Some(popup)).unwrap();
+            input.set_popup_fan_active(true);
+
+            let outside = MSLLHOOKSTRUCT {
+                pt: POINT { x: 250, y: 50 },
+                ..Default::default()
+            };
+            let _ = mouse_proc(
+                HC_ACTION as i32,
+                WPARAM(WM_LBUTTONDOWN as usize),
+                LPARAM(&outside as *const _ as isize),
+            );
+            assert!(!PeekMessageW(
+                &mut msg,
+                hwnd,
+                WM_APP_DISMISS_CURSOR_POPUP,
+                WM_APP_DISMISS_CURSOR_POPUP,
+                PM_REMOVE,
+            )
+            .as_bool());
+
+            // Number keys route to popup while fan is active
+            let kb_two = KBDLLHOOKSTRUCT {
+                vkCode: usize::from(b'2') as u32,
+                ..Default::default()
+            };
+            assert_eq!(
+                keyboard_proc(
+                    HC_ACTION as i32,
+                    WPARAM(0x0100),
+                    LPARAM(&kb_two as *const _ as isize),
+                )
+                .0,
+                1
+            );
+            assert!(PeekMessageW(
+                &mut msg,
+                hwnd,
+                WM_APP_CURSOR_POPUP_KEY,
+                WM_APP_CURSOR_POPUP_KEY,
+                PM_REMOVE,
+            )
+            .as_bool());
+
+            input.set_popup(None).unwrap();
             drop(input);
             DestroyWindow(hwnd).unwrap();
         }

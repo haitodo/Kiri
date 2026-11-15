@@ -184,8 +184,7 @@ impl CursorPopup {
                 canvas.fill(rect, radius, palette.active_border);
                 canvas.fill(inset(rect, border), radius - border, palette.hover);
             } else {
-                let fill = if matches!(self.hover, Some(Hit::Scene(i) | Hit::SceneVariants(i)) if i == index)
-                {
+                let fill = if self.hover == Some(Hit::Scene(index)) {
                     palette.hover
                 } else {
                     palette.tile
@@ -193,17 +192,7 @@ impl CursorPopup {
                 canvas.fill(rect, radius, fill);
             }
 
-            let mut main = rect;
-            if scene.variants.len() > 1 {
-                let arrow = self.scene_variant_rect(rect);
-                if self.hover == Some(Hit::SceneVariants(index)) {
-                    canvas.fill(inset(arrow, px(2)), px(4), palette.hover);
-                }
-                let color = 0xFF00_0000 | if active { palette.accent } else { palette.text };
-                super::super::paint::draw_variant_arrow(canvas.graphics, arrow, color, self.dpi);
-                main.right = arrow.left;
-            }
-            let x = main.left + (main.width() - icon_size) / 2;
+            let x = rect.left + (rect.width() - icon_size) / 2;
             let y = rect.top + px(9);
             if let Some(image) = self.icon_cache.get_or_load_image(&scene.icon, self.dpi) {
                 let _ = GdipDrawImageRect(
@@ -224,6 +213,15 @@ impl CursorPopup {
                     self.dpi,
                     &scene.icon,
                     color,
+                );
+            }
+            if scene.variants.len() > 1 {
+                let badge_color = 0xB800_0000 | if active { palette.accent } else { palette.muted };
+                crate::launcher::paint::draw_variant_badge(
+                    canvas.graphics,
+                    rect,
+                    badge_color,
+                    self.dpi,
                 );
             }
         }
@@ -283,11 +281,7 @@ impl CursorPopup {
             };
             let active = self.active_scene_id.as_deref() == Some(scene.id.as_str());
             let color = if active { palette.accent } else { palette.text };
-            let right = if scene.variants.len() > 1 {
-                self.scene_variant_rect(rect).left
-            } else {
-                rect.right
-            };
+            let right = rect.right;
             select_font(hdc, self.fonts.body);
             draw_text(
                 hdc,

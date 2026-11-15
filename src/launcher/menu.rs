@@ -6,64 +6,7 @@
 //! - Because Win32 `TrackPopupMenu` requires the owner window to be foreground to close on outside click,
 //!   Section 2.1 explicitly permits temporary foreground acquisition for the right-click management menu.
 
-use crate::config::{Orientation, Scene};
-
-/// Show a native, keyboard-navigable list of variants. Restore the foreground before switching.
-#[cfg(windows)]
-pub fn show_scene_variants_menu(
-    owner: windows::Win32::Foundation::HWND,
-    point: windows::Win32::Foundation::POINT,
-    scene: &Scene,
-) -> Option<&str> {
-    use windows::core::HSTRING;
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetForegroundWindow, PostMessageW,
-        SetForegroundWindow, TrackPopupMenu, MF_CHECKED, MF_STRING, TPM_LEFTALIGN, TPM_NONOTIFY,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
-    };
-
-    if scene.variants.len() < 2 {
-        return None;
-    }
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let preferred = scene.preferred_variant();
-        for (index, variant) in scene.variants.iter().enumerate() {
-            let mut flags = MF_STRING;
-            if preferred == Some(variant) {
-                flags |= MF_CHECKED;
-            }
-            let label = HSTRING::from(variant.name.replace('&', "&&"));
-            if AppendMenuW(menu, flags, index + 1, &label).is_err() {
-                let _ = DestroyMenu(menu);
-                return None;
-            }
-        }
-
-        let foreground = GetForegroundWindow();
-        let _ = SetForegroundWindow(owner);
-        let command = TrackPopupMenu(
-            menu,
-            TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-            point.x,
-            point.y,
-            0,
-            owner,
-            None,
-        );
-        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        if !foreground.0.is_null() && foreground != owner {
-            let _ = SetForegroundWindow(foreground);
-        }
-
-        scene
-            .variants
-            .get((command.0 as usize).checked_sub(1)?)
-            .map(|variant| variant.id.as_str())
-    }
-}
+use crate::config::Orientation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {

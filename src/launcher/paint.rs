@@ -398,19 +398,6 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
                 is_last_hint,
                 dpi,
             );
-            if let Some(rect) = slot.variants_rect {
-                draw_button_bg_gdiplus(
-                    graphics,
-                    &rect,
-                    btn_radius,
-                    is_active,
-                    matches!(state.hovered, HitTarget::SceneVariants { index, .. } if *index == idx),
-                    matches!(state.pressed, HitTarget::SceneVariants { index, .. } if *index == idx),
-                    false,
-                    dpi,
-                );
-                draw_variant_arrow(graphics, rect, colors::TEXT_PRIMARY_ARGB, dpi);
-            }
         }
 
         // Overflow button background
@@ -433,7 +420,7 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
         // Grip dots (`⠿`, rotated cleanly according to bar orientation)
         draw_grip_dots_gdiplus(graphics, &state.layout.grip_rect, state.layout.orientation, dpi);
 
-        // Scene icons
+        // Scene icons & multi-variant corner badges
         for slot in &state.layout.scene_buttons {
             let is_active = matches!(state.scene_state, SceneState::Active { scene_id, .. } if scene_id == &slot.scene.id);
             draw_scene_icon(
@@ -445,6 +432,14 @@ pub unsafe fn paint_launcher(hdc: HDC, theme: &mut GdiThemeCache, state: &PaintS
                 is_active,
                 dpi,
             );
+            if slot.scene.variants.len() > 1 {
+                let badge_color = if is_active {
+                    0xDDEAF2FF
+                } else {
+                    0xB88C96A8
+                };
+                draw_variant_badge(graphics, slot.rect, badge_color, dpi);
+            }
         }
 
         // Overflow dots (`⋯`)
@@ -583,21 +578,32 @@ unsafe fn draw_button_bg_gdiplus(
     }
 }
 
+/// Draw a subtle two-dot indicator in the bottom-right corner of buttons/tiles with multiple variants.
 #[cfg(windows)]
-pub(super) unsafe fn draw_variant_arrow(
+pub(super) unsafe fn draw_variant_badge(
     graphics: *mut GpGraphics,
     rect: RectData,
     color: u32,
     dpi: u32,
 ) {
-    let x = (rect.left + rect.right) as f32 / 2.0;
-    let y = (rect.top + rect.bottom) as f32 / 2.0;
-    let size = dip_to_px(3, dpi) as f32;
-    let mut pen = std::ptr::null_mut();
-    if GdipCreatePen1(color, (size / 2.0).max(1.0), UnitPixel, &mut pen) == GpOk {
-        let _ = GdipDrawLine(graphics, pen, x - size, y - size / 2.0, x, y + size / 2.0);
-        let _ = GdipDrawLine(graphics, pen, x, y + size / 2.0, x + size, y - size / 2.0);
-        let _ = GdipDeletePen(pen);
+    let scale = dpi as f32 / 96.0;
+    let r = (1.15 * scale).max(1.0);
+    let step = (3.2 * scale).max(2.6);
+    let cy = rect.bottom as f32 - (4.5 * scale).max(3.5);
+    let right_cx = rect.right as f32 - (4.8 * scale).max(3.8);
+    let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+    if GdipCreateSolidFill(color, &mut brush) == GpOk && !brush.is_null() {
+        for cx in [right_cx - step, right_cx] {
+            let _ = GdipFillEllipse(
+                graphics,
+                brush as *mut GpBrush,
+                cx - r,
+                cy - r,
+                r * 2.0,
+                r * 2.0,
+            );
+        }
+        let _ = GdipDeleteBrush(brush as *mut GpBrush);
     }
 }
 

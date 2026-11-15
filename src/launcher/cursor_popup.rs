@@ -3,8 +3,9 @@
 mod paint;
 
 use self::paint::{PopupFonts, PopupPalette};
-use super::input::{point_in_rect, SceneWheel, SCENE_VARIANT_BUTTON_DIP};
+use super::input::{point_in_rect, SceneWheel};
 use super::paint::{GdiThemeCache, GdiplusContext};
+use super::variant_fan::{FanAxis, FanOutcome, VariantFanHost, HOLD_OPEN_DELAY_MS};
 use crate::config::{AppConfig, CursorPopupPosition, RectData, Scene, Shortcut};
 use crate::platform::cursor_input::{PopupInput, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP};
 use crate::platform::monitors::{clamp_and_snap_in_work_area, dip_to_px};
@@ -14,15 +15,19 @@ use std::sync::Once;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, InvalidateRect, ScreenToClient,
-    SetWindowRgn, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, CreateRoundRectRgn, DeleteObject, EndPaint, InvalidateRect,
+    ScreenToClient, SetWindowRgn, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::SetScrollInfo;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_APP_CURSOR_POPUP_ACTION: u32 = 0x8000 + 9;
+pub const WM_APP_CURSOR_POPUP_FAN_STATE: u32 = 0x8000 + 14;
+const TIMER_CURSOR_FAN_HOLD: usize = 401;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const SCENE_COLUMNS: usize = 3;
 const WIDTH_DIP: i32 = 309;
@@ -179,14 +184,13 @@ impl PopupLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Scene(usize),
-    SceneVariants(usize),
     Shortcut(usize),
     Settings,
 }
 
 pub enum PopupAction {
     SwitchScene(String),
-    ChooseVariant(String, POINT),
+    SwitchSceneVariant(String, String),
     OpenShortcut(Shortcut),
     OpenSettings,
 }
@@ -228,7 +232,7 @@ fn next_focus_hit(
     };
 
     match cur {
-        Hit::Scene(i) | Hit::SceneVariants(i) => {
+        Hit::Scene(i) => {
             if vk == VK_LEFT.0 {
                 if i > 0 {
                     Some(Hit::Scene(i - 1))
@@ -310,11 +314,13 @@ pub struct CursorPopup {
     icon_cache: GdiThemeCache,
     fonts: PopupFonts,
     palette: PopupPalette,
+    work_area: RectData,
+    variant_fan: VariantFanHost,
 }
 
 impl CursorPopup {
-    pub(super) fn hwnd(&self) -> HWND {
-        self.hwnd
+    pub fn is_fan_active(&self) -> bool {
+        self.variant_fan.is_active()
     }
 
     pub fn create(owner: HWND, gdiplus: GdiplusContext) -> windows::core::Result<Box<Self>> {
@@ -365,9 +371,11 @@ impl CursorPopup {
                 keyboard_focus: None,
                 tracking_leave: false,
                 pending_action: None,
-                icon_cache: GdiThemeCache::with_context(96, gdiplus),
+                icon_cache: GdiThemeCache::with_context(96, gdiplus.clone()),
                 fonts: PopupFonts::new(96),
                 palette: PopupPalette::system(),
+                work_area: RectData::default(),
+                variant_fan: VariantFanHost::new(gdiplus),
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *popup as *mut Self) as isize);
             Ok(popup)
@@ -384,6 +392,7 @@ impl CursorPopup {
         self.scenes = config.ordered_scenes().into_iter().cloned().collect();
         self.shortcuts.clone_from(&config.shortcuts);
         self.active_scene_id = active_scene_id.map(str::to_owned);
+        self.work_area = monitor.work_area;
         self.palette = PopupPalette::system();
         if self.dpi != monitor.dpi {
             self.dpi = monitor.dpi;
@@ -462,6 +471,14 @@ impl CursorPopup {
     }
 
     pub fn hide(&mut self) {
+        if self.variant_fan.is_active() {
+            let _ = self.variant_fan.cancel();
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                let _ = ReleaseCapture();
+            }
+            self.notify_fan_state(false);
+        }
         self.pending_action = None;
         self.keyboard_focus = None;
         if self.visible {
@@ -472,20 +489,45 @@ impl CursorPopup {
         }
     }
 
+    fn notify_fan_state(&self, active: bool) {
+        unsafe {
+            let _ = PostMessageW(
+                self.owner,
+                WM_APP_CURSOR_POPUP_FAN_STATE,
+                WPARAM(usize::from(active)),
+                LPARAM(0),
+            );
+        }
+    }
+
+    fn scene_screen_rect(&self, index: usize) -> Option<RectData> {
+        let rect = self.viewport_rect(self.layout.scene(index, self.width))?;
+        let mut tl = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut br = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        unsafe {
+            if !ClientToScreen(self.hwnd, &mut tl).as_bool()
+                || !ClientToScreen(self.hwnd, &mut br).as_bool()
+            {
+                return None;
+            }
+        }
+        Some(RectData {
+            left: tl.x,
+            top: tl.y,
+            right: br.x,
+            bottom: br.y,
+        })
+    }
+
     fn action_for_hit(&self, hit: Hit) -> PopupAction {
         match hit {
             Hit::Scene(index) => PopupAction::SwitchScene(self.scenes[index].id.clone()),
-            Hit::SceneVariants(index) => {
-                let rect = self.scene_variant_rect(self.layout.scene(index, self.width));
-                let mut point = POINT {
-                    x: rect.left,
-                    y: rect.bottom - self.scroll,
-                };
-                unsafe {
-                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut point);
-                }
-                PopupAction::ChooseVariant(self.scenes[index].id.clone(), point)
-            }
             Hit::Shortcut(index) => PopupAction::OpenShortcut(self.shortcuts[index].clone()),
             Hit::Settings => PopupAction::OpenSettings,
         }
@@ -493,7 +535,7 @@ impl CursorPopup {
 
     fn ensure_hit_visible(&mut self, hit: Hit) {
         let rect = match hit {
-            Hit::Scene(index) | Hit::SceneVariants(index) => self.layout.scene(index, self.width),
+            Hit::Scene(index) => self.layout.scene(index, self.width),
             Hit::Shortcut(index) => self.layout.shortcut(index, self.width),
             Hit::Settings => self.layout.shortcut(0, self.width),
         };
@@ -511,6 +553,33 @@ impl CursorPopup {
         if !self.visible {
             return CursorKeyOutcome::Ignored;
         }
+        if self.variant_fan.is_active() {
+            return match self.variant_fan.on_key(vk) {
+                FanOutcome::CommitVariant {
+                    scene_id,
+                    variant_id,
+                } => {
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                        let _ = ReleaseCapture();
+                    }
+                    self.notify_fan_state(false);
+                    self.pending_action =
+                        Some(PopupAction::SwitchSceneVariant(scene_id, variant_id));
+                    CursorKeyOutcome::Execute
+                }
+                FanOutcome::Cancelled => {
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, TIMER_CURSOR_FAN_HOLD);
+                        let _ = ReleaseCapture();
+                    }
+                    self.notify_fan_state(false);
+                    CursorKeyOutcome::Redrawn
+                }
+                FanOutcome::Updated => CursorKeyOutcome::Redrawn,
+                _ => CursorKeyOutcome::Ignored,
+            };
+        }
         if vk == VK_ESCAPE.0 {
             return CursorKeyOutcome::Dismiss;
         }
@@ -522,12 +591,21 @@ impl CursorPopup {
             return CursorKeyOutcome::Dismiss;
         }
         if vk == VK_SPACE.0 {
-            if let Some(Hit::Scene(index) | Hit::SceneVariants(index)) =
-                self.keyboard_focus.or(self.hover)
-            {
+            if let Some(Hit::Scene(index)) = self.keyboard_focus.or(self.hover) {
                 if self.scenes[index].variants.len() > 1 {
-                    self.pending_action = Some(self.action_for_hit(Hit::SceneVariants(index)));
-                    return CursorKeyOutcome::Execute;
+                    self.ensure_hit_visible(Hit::Scene(index));
+                    if let Some(anchor) = self.scene_screen_rect(index) {
+                        if self.variant_fan.open_sticky_keyboard(
+                            &self.scenes[index],
+                            anchor,
+                            self.work_area,
+                            FanAxis::Vertical,
+                            self.dpi,
+                        ) {
+                            self.notify_fan_state(true);
+                            return CursorKeyOutcome::Redrawn;
+                        }
+                    }
                 }
             }
             return CursorKeyOutcome::Ignored;
@@ -624,16 +702,10 @@ impl CursorPopup {
     fn hit_test(&self, lparam: LPARAM) -> Option<Hit> {
         let x = lparam.0 as i16 as i32;
         let y = ((lparam.0 >> 16) as i16 as i32) + self.scroll;
-        for (index, scene) in self.scenes.iter().enumerate() {
+        for index in 0..self.scenes.len() {
             let rect = self.layout.scene(index, self.width);
             if point_in_rect(x, y, &rect) {
-                let arrow =
-                    scene.variants.len() > 1 && point_in_rect(x, y, &self.scene_variant_rect(rect));
-                return Some(if arrow {
-                    Hit::SceneVariants(index)
-                } else {
-                    Hit::Scene(index)
-                });
+                return Some(Hit::Scene(index));
             }
         }
         let index = (0..self.shortcuts.len().max(1))
@@ -643,13 +715,6 @@ impl CursorPopup {
         } else {
             Hit::Shortcut(index)
         })
-    }
-
-    fn scene_variant_rect(&self, rect: RectData) -> RectData {
-        RectData {
-            left: rect.right - dip_to_px(SCENE_VARIANT_BUTTON_DIP, self.dpi),
-            ..rect
-        }
     }
 
     fn scroll_to(&mut self, requested: i32) {
@@ -712,8 +777,9 @@ unsafe extern "system" fn window_proc(
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             WM_DPICHANGED => return LRESULT(0),
-            WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP
-            | WM_MOUSEWHEEL | WM_VSCROLL | WM_PAINT | WM_SETTINGCHANGE => {}
+            WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
+            | WM_RBUTTONUP | WM_CAPTURECHANGED | WM_TIMER | WM_MOUSEWHEEL | WM_VSCROLL
+            | WM_PAINT | WM_SETTINGCHANGE => {}
             _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CursorPopup;
@@ -731,6 +797,16 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_MOUSEMOVE => {
+                if popup.variant_fan.is_active() {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok()
+                        && matches!(popup.variant_fan.on_move(pt.x, pt.y), FanOutcome::Opened)
+                    {
+                        let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                        popup.notify_fan_state(true);
+                    }
+                    return LRESULT(0);
+                }
                 if !popup.tracking_leave {
                     let mut track = TRACKMOUSEEVENT {
                         cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -749,13 +825,148 @@ unsafe extern "system" fn window_proc(
             }
             WM_MOUSELEAVE => {
                 popup.tracking_leave = false;
+                if popup.variant_fan.is_active() {
+                    return LRESULT(0);
+                }
                 popup.pressed = None;
                 if popup.hover.take().is_some() {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
-            WM_LBUTTONDOWN => popup.pressed = popup.hit_test(lparam),
+            WM_LBUTTONDOWN => {
+                if popup.variant_fan.is_sticky() {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok()
+                        && matches!(popup.variant_fan.on_down(pt.x, pt.y), FanOutcome::Cancelled)
+                    {
+                        let _ = ReleaseCapture();
+                        popup.notify_fan_state(false);
+                        popup.pressed = None;
+                        let mut win_rc = RECT::default();
+                        if GetWindowRect(hwnd, &mut win_rc).is_ok()
+                            && (pt.x < win_rc.left
+                                || pt.x >= win_rc.right
+                                || pt.y < win_rc.top
+                                || pt.y >= win_rc.bottom)
+                        {
+                            let _ = PostMessageW(
+                                popup.owner,
+                                WM_APP_DISMISS_CURSOR_POPUP,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                let hit = popup.hit_test(lparam);
+                popup.pressed = hit;
+                if let Some(Hit::Scene(index)) = hit {
+                    if popup.scenes[index].variants.len() > 1 {
+                        if let Some(anchor) = popup.scene_screen_rect(index) {
+                            let mut pt = POINT::default();
+                            if GetCursorPos(&mut pt).is_ok()
+                                && popup.variant_fan.begin_press(
+                                    &popup.scenes[index],
+                                    anchor,
+                                    popup.work_area,
+                                    FanAxis::Vertical,
+                                    popup.dpi,
+                                    pt.x,
+                                    pt.y,
+                                )
+                            {
+                                let _ = SetCapture(hwnd);
+                                let _ = SetTimer(
+                                    hwnd,
+                                    TIMER_CURSOR_FAN_HOLD,
+                                    HOLD_OPEN_DELAY_MS,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            WM_TIMER => {
+                if wparam.0 == TIMER_CURSOR_FAN_HOLD {
+                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok()
+                        && matches!(popup.variant_fan.on_hold_timer(pt.x, pt.y), FanOutcome::Opened)
+                    {
+                        popup.notify_fan_state(true);
+                    }
+                }
+            }
             WM_LBUTTONUP => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    match popup.variant_fan.on_up(pt.x, pt.y) {
+                        FanOutcome::EnteredSticky => {
+                            popup.notify_fan_state(true);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::ClickDefault { .. } => {
+                            let _ = ReleaseCapture();
+                            popup.notify_fan_state(false);
+                            let Some(hit) = popup.pressed.take() else {
+                                return LRESULT(0);
+                            };
+                            if popup.visible
+                                && popup.hit_test(lparam) == Some(hit)
+                                && popup.pending_action.is_none()
+                            {
+                                popup.pending_action = Some(popup.action_for_hit(hit));
+                                if PostMessageW(
+                                    popup.owner,
+                                    WM_APP_CURSOR_POPUP_ACTION,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                )
+                                .is_err()
+                                {
+                                    popup.pending_action = None;
+                                }
+                            }
+                            return LRESULT(0);
+                        }
+                        FanOutcome::CommitVariant {
+                            scene_id,
+                            variant_id,
+                        } => {
+                            let _ = ReleaseCapture();
+                            popup.notify_fan_state(false);
+                            popup.pressed = None;
+                            if popup.visible && popup.pending_action.is_none() {
+                                popup.pending_action =
+                                    Some(PopupAction::SwitchSceneVariant(scene_id, variant_id));
+                                if PostMessageW(
+                                    popup.owner,
+                                    WM_APP_CURSOR_POPUP_ACTION,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                )
+                                .is_err()
+                                {
+                                    popup.pending_action = None;
+                                }
+                            }
+                            return LRESULT(0);
+                        }
+                        FanOutcome::Cancelled => {
+                            let _ = ReleaseCapture();
+                            popup.notify_fan_state(false);
+                            popup.pressed = None;
+                            return LRESULT(0);
+                        }
+                        FanOutcome::None | FanOutcome::Opened | FanOutcome::Updated => {
+                            return LRESULT(0);
+                        }
+                    }
+                }
                 let Some(hit) = popup.pressed.take() else {
                     return LRESULT(0);
                 };
@@ -776,7 +987,32 @@ unsafe extern "system" fn window_proc(
                     }
                 }
             }
+            WM_RBUTTONDOWN => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = popup.variant_fan.cancel();
+                    let _ = ReleaseCapture();
+                    popup.notify_fan_state(false);
+                    popup.pressed = None;
+                }
+            }
+            WM_CAPTURECHANGED => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = popup.variant_fan.cancel();
+                    popup.notify_fan_state(false);
+                    popup.pressed = None;
+                }
+            }
             WM_RBUTTONUP => {
+                if popup.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_CURSOR_FAN_HOLD);
+                    let _ = popup.variant_fan.cancel();
+                    let _ = ReleaseCapture();
+                    popup.notify_fan_state(false);
+                    popup.pressed = None;
+                    return LRESULT(0);
+                }
                 let _ = PostMessageW(
                     popup.owner,
                     WM_APP_DISMISS_CURSOR_POPUP,
@@ -964,14 +1200,13 @@ mod tests {
             assert!(popup.hit_test(hit) == Some(Hit::Scene(1)));
 
             let tile = popup.layout.scene(1, popup.width);
-            let arrow = popup.scene_variant_rect(tile);
-            let x = arrow.left + 2;
+            let x = tile.left + 6;
             let y = tile.top + 4 - popup.scroll;
             let hit = LPARAM(((y as isize) << 16) | x as isize);
             let _ = SendMessageW(popup.hwnd, WM_LBUTTONDOWN, WPARAM(0), hit);
             let _ = SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), hit);
             assert!(
-                matches!(popup.pending_action.take(), Some(PopupAction::ChooseVariant(scene, _)) if scene == "code")
+                matches!(popup.pending_action.take(), Some(PopupAction::SwitchScene(scene)) if scene == "code")
             );
             let mut message = MSG::default();
             assert!(PeekMessageW(
@@ -982,6 +1217,19 @@ mod tests {
                 PM_REMOVE
             )
             .as_bool());
+
+            // Space on a multi-variant tile opens the non-activating fan and number key selects a variant.
+            popup.keyboard_focus = Some(Hit::Scene(1));
+            assert_eq!(popup.handle_key(b' ' as u16), CursorKeyOutcome::Redrawn);
+            assert!(popup.is_fan_active());
+            assert_ne!(GetForegroundWindow(), popup.hwnd);
+            assert_eq!(popup.handle_key(b'2' as u16), CursorKeyOutcome::Execute);
+            assert!(!popup.is_fan_active());
+            assert!(matches!(
+                popup.pending_action.take(),
+                Some(PopupAction::SwitchSceneVariant(scene, variant))
+                if scene == "code" && variant == "Codex"
+            ));
             let _ = SendMessageW(popup.hwnd, WM_VSCROLL, WPARAM(SB_TOP.0 as usize), LPARAM(0));
             assert_eq!(popup.scroll, 0);
             let row = popup

@@ -13,19 +13,22 @@
 //! - `std::panic::catch_unwind` at the `extern "system" fn` boundary to prevent FFI abort.
 
 use crate::app::AppController;
+use crate::config::{Orientation, RectData};
 use crate::diagnostics::{log_error, log_info, log_warn};
 use crate::launcher::cursor_popup::{
     CursorKeyOutcome, CursorPopup, PopupAction, WM_APP_CURSOR_POPUP_ACTION,
+    WM_APP_CURSOR_POPUP_FAN_STATE,
 };
 use crate::launcher::input::{
     wheel_scene_index, HitTarget, LauncherLayout, SceneWheel, CORNER_RADIUS_DIP,
 };
-use crate::launcher::menu::{show_context_menu, show_scene_variants_menu, MenuCommand};
+use crate::launcher::menu::{show_context_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
+use crate::launcher::variant_fan::{FanAxis, FanOutcome, VariantFanHost, HOLD_OPEN_DELAY_MS};
 use crate::platform::cursor_input::{
-    CursorInput, WM_APP_CURSOR_POPUP_KEY, WM_APP_CURSOR_POPUP_WHEEL, WM_APP_DISMISS_CURSOR_POPUP,
-    WM_APP_SHOW_CURSOR_POPUP,
+    CursorInput, WM_APP_CANCEL_VARIANT_FAN, WM_APP_CURSOR_POPUP_KEY, WM_APP_CURSOR_POPUP_WHEEL,
+    WM_APP_DISMISS_CURSOR_POPUP, WM_APP_SHOW_CURSOR_POPUP,
 };
 use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
 use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
@@ -33,7 +36,7 @@ use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
 use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
 use crate::settings::{window::{SettingsWindow, WM_SETTINGS_REQUEST}, SettingsPage};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
     TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
@@ -48,9 +51,9 @@ pub const WM_APP_OPEN_SETTINGS: u32 = 0x8000 + 4; // WM_APP + 4
 
 const TIMER_VERIFY_SWITCH: usize = 101;
 const TIMER_DISPLAY_DEBOUNCE: usize = 102;
+const TIMER_VARIANT_HOLD: usize = 103;
 const HOTKEY_BASE_ID: i32 = 4000;
 const WM_MOUSELEAVE: u32 = 0x02A3;
-const WM_APP_VARIANT_MENU: u32 = 0x8000 + 13;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LauncherDragState {
@@ -59,13 +62,6 @@ pub struct LauncherDragState {
     pub start_cursor_x: i32,
     pub start_cursor_y: i32,
     pub moved: bool,
-}
-
-struct VariantMenuRequest {
-    scene_id: String,
-    point: POINT,
-    source: SwitchSource,
-    owner: HWND,
 }
 
 #[cfg(windows)]
@@ -84,7 +80,7 @@ pub struct LauncherWindowHost {
     pub overflow_popup: Option<Box<OverflowPopup>>,
     cursor_input: CursorInput,
     cursor_popup: Option<Box<CursorPopup>>,
-    pending_variant_menu: Option<VariantMenuRequest>,
+    variant_fan: VariantFanHost,
     bar_wheel: SceneWheel,
     pub tray: Option<TrayIcon>,
     pub win_event_hook: Option<WinEventHookGuard>,
@@ -155,6 +151,7 @@ impl LauncherWindowHost {
 
             let theme = GdiThemeCache::new(dpi);
             let overflow_popup = OverflowPopup::create(hwnd, theme.gdiplus.clone()).ok();
+            let variant_fan = VariantFanHost::new(theme.gdiplus.clone());
             let tray = Some(TrayIcon::new(hwnd));
             let win_event_hook = WinEventHookGuard::install(hwnd);
 
@@ -211,7 +208,7 @@ impl LauncherWindowHost {
                 overflow_popup,
                 cursor_input: CursorInput::new(hwnd),
                 cursor_popup: None,
-                pending_variant_menu: None,
+                variant_fan,
                 bar_wheel: SceneWheel::default(),
                 tray,
                 win_event_hook,
@@ -340,6 +337,7 @@ impl LauncherWindowHost {
             self.tracking_mouse_leave = false;
             self.bar_wheel = SceneWheel::default();
             self.hide_tooltip();
+            self.cancel_bar_variant_fan();
             if let Some(overflow) = &mut self.overflow_popup {
                 overflow.hide();
             }
@@ -498,19 +496,18 @@ impl LauncherWindowHost {
 
         let text_opt = match target {
             HitTarget::SceneButton { scene_id, .. } => {
-                self.app
-                    .config
-                    .scene(scene_id)
-                    .map(|scene| match scene.preferred_variant() {
+                self.app.config.scene(scene_id).map(|scene| {
+                    let base = match scene.preferred_variant() {
                         Some(variant) => format!("{} / {}", scene.name, variant.name),
                         None => scene.name.clone(),
-                    })
+                    };
+                    if scene.variants.len() > 1 {
+                        format!("{base}（長押し・ドラッグで構成選択）")
+                    } else {
+                        base
+                    }
+                })
             }
-            HitTarget::SceneVariants { scene_id, .. } => self
-                .app
-                .config
-                .scene(scene_id)
-                .map(|scene| format!("{}の構成を選ぶ", scene.name)),
             HitTarget::OverflowButton => {
                 if self.app.is_active_scene_in_overflow() {
                     let active_name = self
@@ -582,46 +579,43 @@ impl LauncherWindowHost {
         }
     }
 
+    fn launcher_work_area(&self) -> RectData {
+        let monitors = self.app.sys.monitors();
+        monitors
+            .iter()
+            .find(|m| m.monitor_id == self.app.launcher_monitor_id)
+            .or_else(|| monitors.first())
+            .map(|m| m.work_area)
+            .unwrap_or(RectData {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            })
+    }
+
+    fn cancel_bar_variant_fan(&mut self) {
+        use windows::Win32::Graphics::Gdi::InvalidateRect;
+        use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+
+        if self.variant_fan.is_active() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_VARIANT_HOLD);
+                let _ = ReleaseCapture();
+            }
+            let _ = self.variant_fan.cancel();
+            let _ = self.cursor_input.set_bar_fan_active(false);
+            self.pressed = HitTarget::None;
+            unsafe {
+                let _ = InvalidateRect(self.hwnd, None, false);
+            }
+        }
+    }
+
     fn trigger_scene_switch(&mut self, scene_id: &str, source: SwitchSource) {
         self.hide_cursor_popup();
         self.switch_scene(scene_id, None, source);
-    }
-
-    fn choose_scene_variant(&mut self, scene_id: &str, point: POINT, source: SwitchSource) {
-        self.hide_tooltip();
-        if let Some(overflow) = &mut self.overflow_popup {
-            overflow.hide();
-        }
-        let mut owner = self.hwnd;
-        if matches!(source, SwitchSource::PopupClick) {
-            if let Some(popup) = self.cursor_popup.as_ref().filter(|popup| popup.visible) {
-                // The fixed bar may be hidden. Keep the visible popup as the menu owner and
-                // release its input hook so the native menu gets keyboard and mouse messages.
-                owner = popup.hwnd();
-                let _ = self.cursor_input.set_popup(None);
-            }
-        } else {
-            self.hide_cursor_popup();
-        }
-        self.pending_variant_menu = Some(VariantMenuRequest {
-            scene_id: scene_id.to_owned(),
-            point,
-            source,
-            owner,
-        });
-        if unsafe {
-            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                self.hwnd,
-                WM_APP_VARIANT_MENU,
-                WPARAM(0),
-                LPARAM(0),
-            )
-        }
-        .is_err()
-        {
-            self.pending_variant_menu = None;
-            self.hide_cursor_popup();
-        }
     }
 
     fn cycle_scene(&mut self, steps: i32, source: SwitchSource) {
@@ -887,8 +881,9 @@ impl LauncherWindowHost {
             PopupAction::SwitchScene(scene_id) => {
                 self.trigger_scene_switch(&scene_id, SwitchSource::PopupClick)
             }
-            PopupAction::ChooseVariant(scene_id, point) => {
-                self.choose_scene_variant(&scene_id, point, SwitchSource::PopupClick)
+            PopupAction::SwitchSceneVariant(scene_id, variant_id) => {
+                self.hide_cursor_popup();
+                self.switch_scene(&scene_id, Some(&variant_id), SwitchSource::PopupClick);
             }
             PopupAction::OpenShortcut(shortcut) => {
                 self.hide_cursor_popup();
@@ -921,20 +916,19 @@ unsafe extern "system" fn launcher_wndproc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use crate::config::RectData;
     use windows::Win32::Foundation::{HWND, LRESULT, RECT};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
+        BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW,
+        DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
         SetCursor, SetTimer, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_SIZEALL, MA_NOACTIVATE,
         WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
         WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP,
-        WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP,
-        WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE,
+        WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONDOWN,
+        WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE,
     };
 
     // Per Section 7.1: Catch any Rust panic at the FFI boundary to prevent immediate process abort
@@ -946,22 +940,6 @@ unsafe extern "system" fn launcher_wndproc(
         // WindowFromPoint in the wheel hook can request a hit test synchronously.
         if msg == WM_NCHITTEST {
             return LRESULT(HTCLIENT as isize);
-        }
-        if msg == WM_APP_VARIANT_MENU {
-            if let Some(request) = (*ptr).pending_variant_menu.take() {
-                let scene = (*ptr).app.config.scene(&request.scene_id).cloned();
-                // The native menu pumps messages. Release all launcher borrows while it is open.
-                let variant = scene
-                    .as_ref()
-                    .filter(|_| IsWindowVisible(request.owner).as_bool())
-                    .and_then(|scene| show_scene_variants_menu(request.owner, request.point, scene));
-                let host = &mut *ptr;
-                host.hide_cursor_popup();
-                if let Some(variant) = variant {
-                    host.switch_scene(&request.scene_id, Some(variant), request.source);
-                }
-            }
-            return LRESULT(0);
         }
         let host = &mut *ptr;
 
@@ -1033,7 +1011,18 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
+            WM_RBUTTONDOWN => {
+                if host.variant_fan.is_active() {
+                    host.cancel_bar_variant_fan();
+                }
+                LRESULT(0)
+            }
+
             WM_CONTEXTMENU | WM_RBUTTONUP => {
+                if host.variant_fan.is_active() {
+                    host.cancel_bar_variant_fan();
+                    return LRESULT(0);
+                }
                 if host.drag_state.take().is_some() {
                     let _ = ReleaseCapture();
                 }
@@ -1059,6 +1048,21 @@ unsafe extern "system" fn launcher_wndproc(
             // Section 2.2: Start custom drag only when clicking on the dedicated grip area
             WM_LBUTTONDOWN => {
                 host.hide_tooltip();
+                if host.variant_fan.is_sticky() {
+                    let mut cursor_pt = POINT::default();
+                    if GetCursorPos(&mut cursor_pt).is_ok()
+                        && matches!(
+                            host.variant_fan.on_down(cursor_pt.x, cursor_pt.y),
+                            FanOutcome::Cancelled
+                        )
+                    {
+                        let _ = ReleaseCapture();
+                        let _ = host.cursor_input.set_bar_fan_active(false);
+                        host.pressed = HitTarget::None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    return LRESULT(0);
+                }
                 let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 let hit = host.layout.hit_test(client_x, client_y);
@@ -1087,9 +1091,50 @@ unsafe extern "system" fn launcher_wndproc(
                             let _ = SetCapture(hwnd);
                         }
                     }
-                    HitTarget::SceneButton { .. }
-                    | HitTarget::SceneVariants { .. }
-                    | HitTarget::OverflowButton => {
+                    HitTarget::SceneButton { index, .. } => {
+                        host.pressed = hit;
+                        if let Some(slot) = host.layout.scene_buttons.get(index) {
+                            if slot.scene.variants.len() > 1 {
+                                let mut cursor_pt = POINT::default();
+                                let mut win_rc = RECT::default();
+                                if GetCursorPos(&mut cursor_pt).is_ok()
+                                    && GetWindowRect(hwnd, &mut win_rc).is_ok()
+                                {
+                                    let anchor = RectData {
+                                        left: win_rc.left + slot.rect.left,
+                                        top: win_rc.top + slot.rect.top,
+                                        right: win_rc.left + slot.rect.right,
+                                        bottom: win_rc.top + slot.rect.bottom,
+                                    };
+                                    let axis = match host.app.config.launcher.orientation {
+                                        Orientation::Horizontal => FanAxis::Vertical,
+                                        Orientation::Vertical => FanAxis::Horizontal,
+                                    };
+                                    let work_area = host.launcher_work_area();
+                                    let scene = slot.scene.clone();
+                                    if host.variant_fan.begin_press(
+                                        &scene,
+                                        anchor,
+                                        work_area,
+                                        axis,
+                                        host.app.launcher_dpi,
+                                        cursor_pt.x,
+                                        cursor_pt.y,
+                                    ) {
+                                        let _ = SetCapture(hwnd);
+                                        let _ = SetTimer(
+                                            hwnd,
+                                            TIMER_VARIANT_HOLD,
+                                            HOLD_OPEN_DELAY_MS,
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                    HitTarget::OverflowButton => {
                         host.pressed = hit;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -1111,6 +1156,19 @@ unsafe extern "system" fn launcher_wndproc(
             }
 
             WM_MOUSEMOVE => {
+                if host.variant_fan.is_active() {
+                    let mut cursor_pt = POINT::default();
+                    if GetCursorPos(&mut cursor_pt).is_ok()
+                        && matches!(
+                            host.variant_fan.on_move(cursor_pt.x, cursor_pt.y),
+                            FanOutcome::Opened
+                        )
+                    {
+                        let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                        let _ = host.cursor_input.set_bar_fan_active(true);
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(mut drag) = host.drag_state {
                     let mut cursor_pt = POINT::default();
                     if GetCursorPos(&mut cursor_pt).is_ok() {
@@ -1167,7 +1225,7 @@ unsafe extern "system" fn launcher_wndproc(
                 host.tracking_mouse_leave = false;
                 let _ = host.cursor_input.set_bar_hovered(false);
                 host.bar_wheel = SceneWheel::default();
-                if host.drag_state.is_none() {
+                if host.drag_state.is_none() && !host.variant_fan.is_active() {
                     host.hovered = HitTarget::None;
                     host.pressed = HitTarget::None;
                     host.hide_tooltip();
@@ -1207,6 +1265,13 @@ unsafe extern "system" fn launcher_wndproc(
             }
 
             WM_CAPTURECHANGED => {
+                if host.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                    let _ = host.variant_fan.cancel();
+                    let _ = host.cursor_input.set_bar_fan_active(false);
+                    host.pressed = HitTarget::None;
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 if let Some(drag) = host.drag_state.take() {
                     if drag.moved {
                         let mut rc = RECT::default();
@@ -1226,6 +1291,57 @@ unsafe extern "system" fn launcher_wndproc(
 
             WM_LBUTTONUP => {
                 host.hide_tooltip();
+                if host.variant_fan.is_active() {
+                    let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                    let mut cursor_pt = POINT::default();
+                    let _ = GetCursorPos(&mut cursor_pt);
+                    match host.variant_fan.on_up(cursor_pt.x, cursor_pt.y) {
+                        FanOutcome::EnteredSticky => {
+                            let _ = host.cursor_input.set_bar_fan_active(true);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::ClickDefault { scene_id } => {
+                            let _ = ReleaseCapture();
+                            let _ = host.cursor_input.set_bar_fan_active(false);
+                            let pressed = std::mem::replace(&mut host.pressed, HitTarget::None);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+                            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                            if host.layout.hit_test(client_x, client_y) == pressed {
+                                if let Some(ref mut ov) = host.overflow_popup {
+                                    ov.hide();
+                                }
+                                host.trigger_scene_switch(&scene_id, SwitchSource::BarClick);
+                            }
+                            return LRESULT(0);
+                        }
+                        FanOutcome::CommitVariant {
+                            scene_id,
+                            variant_id,
+                        } => {
+                            let _ = ReleaseCapture();
+                            let _ = host.cursor_input.set_bar_fan_active(false);
+                            host.pressed = HitTarget::None;
+                            let _ = InvalidateRect(hwnd, None, false);
+                            if let Some(ref mut ov) = host.overflow_popup {
+                                ov.hide();
+                            }
+                            host.hide_cursor_popup();
+                            host.switch_scene(&scene_id, Some(&variant_id), SwitchSource::BarClick);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::Cancelled => {
+                            let _ = ReleaseCapture();
+                            let _ = host.cursor_input.set_bar_fan_active(false);
+                            host.pressed = HitTarget::None;
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        FanOutcome::None | FanOutcome::Opened | FanOutcome::Updated => {
+                            return LRESULT(0);
+                        }
+                    }
+                }
                 let pressed = std::mem::replace(&mut host.pressed, HitTarget::None);
                 if let Some(drag) = host.drag_state.take() {
                     let _ = ReleaseCapture();
@@ -1260,17 +1376,6 @@ unsafe extern "system" fn launcher_wndproc(
                         }
                         host.trigger_scene_switch(&scene_id, SwitchSource::BarClick);
                     }
-                    HitTarget::SceneVariants { scene_id, index } => {
-                        if let Some(rect) = host.layout.scene_buttons[index].variants_rect {
-                            let mut point = POINT {
-                                x: rect.left,
-                                y: rect.bottom,
-                            };
-                            let _ = ClientToScreen(hwnd, &mut point);
-                            host.choose_scene_variant(&scene_id, point, SwitchSource::BarClick);
-                        }
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
                     HitTarget::OverflowButton => {
                         let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
                         if let Some(ref ov_btn_rc) = host.layout.overflow_button_rect {
@@ -1282,18 +1387,7 @@ unsafe extern "system" fn launcher_wndproc(
                                 right: win_rc.left + ov_btn_rc.right,
                                 bottom: win_rc.top + ov_btn_rc.bottom,
                             };
-                            let monitors = host.app.sys.monitors();
-                            let work_area = monitors
-                                .iter()
-                                .find(|m| m.monitor_id == host.app.launcher_monitor_id)
-                                .or_else(|| monitors.first())
-                                .map(|m| m.work_area)
-                                .unwrap_or(RectData {
-                                    left: 0,
-                                    top: 0,
-                                    right: 1920,
-                                    bottom: 1040,
-                                });
+                            let work_area = host.launcher_work_area();
                             let active_id =
                                 host.app.state_mgr.active_scene_id().map(|s| s.to_string());
                             let dpi = host.app.launcher_dpi;
@@ -1318,10 +1412,14 @@ unsafe extern "system" fn launcher_wndproc(
                 let (_, overflow_scenes) = host.app.config.split_visible_and_overflow();
                 if let Some(scene) = overflow_scenes.get(idx) {
                     let scene_id = scene.id.clone();
-                    if lparam.0 == 1 {
-                        let mut point = POINT::default();
-                        let _ = GetCursorPos(&mut point);
-                        host.choose_scene_variant(&scene_id, point, SwitchSource::Overflow);
+                    let variant_id = usize::try_from(lparam.0)
+                        .ok()
+                        .and_then(|v| v.checked_sub(1))
+                        .and_then(|v_idx| scene.variants.get(v_idx))
+                        .map(|v| v.id.clone());
+                    if let Some(variant_id) = variant_id {
+                        host.hide_cursor_popup();
+                        host.switch_scene(&scene_id, Some(&variant_id), SwitchSource::Overflow);
                     } else {
                         host.trigger_scene_switch(&scene_id, SwitchSource::Overflow);
                     }
@@ -1378,6 +1476,11 @@ unsafe extern "system" fn launcher_wndproc(
                     .cursor_popup
                     .as_mut()
                     .map_or(CursorKeyOutcome::Ignored, |p| p.handle_key(vk));
+                let fan_active = host
+                    .cursor_popup
+                    .as_ref()
+                    .is_some_and(|p| p.is_fan_active());
+                host.cursor_input.set_popup_fan_active(fan_active);
                 match outcome {
                     CursorKeyOutcome::Dismiss => host.hide_cursor_popup(),
                     CursorKeyOutcome::Execute => {
@@ -1389,6 +1492,16 @@ unsafe extern "system" fn launcher_wndproc(
                     }
                     CursorKeyOutcome::Redrawn | CursorKeyOutcome::Ignored => {}
                 }
+                LRESULT(0)
+            }
+
+            WM_APP_CURSOR_POPUP_FAN_STATE => {
+                host.cursor_input.set_popup_fan_active(wparam.0 != 0);
+                LRESULT(0)
+            }
+
+            WM_APP_CANCEL_VARIANT_FAN => {
+                host.cancel_bar_variant_fan();
                 LRESULT(0)
             }
 
@@ -1435,6 +1548,7 @@ unsafe extern "system" fn launcher_wndproc(
             // Section 7.2: Aggregate rapid DPI / display / power / session change notifications via one-shot timer
             // when not actively dragging or programmatically applying bounds.
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
+                host.cancel_bar_variant_fan();
                 host.hide_cursor_popup();
                 if msg == WM_WTSSESSION_CHANGE || msg == WM_POWERBROADCAST {
                     host.cursor_input.reset_gesture();
@@ -1459,6 +1573,18 @@ unsafe extern "system" fn launcher_wndproc(
                         let _ = KillTimer(hwnd, TIMER_DISPLAY_DEBOUNCE);
                         let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                         host.apply_window_bounds(x, y, w, h);
+                    }
+                    TIMER_VARIANT_HOLD => {
+                        let _ = KillTimer(hwnd, TIMER_VARIANT_HOLD);
+                        let mut cursor_pt = POINT::default();
+                        if GetCursorPos(&mut cursor_pt).is_ok()
+                            && matches!(
+                                host.variant_fan.on_hold_timer(cursor_pt.x, cursor_pt.y),
+                                FanOutcome::Opened
+                            )
+                        {
+                            let _ = host.cursor_input.set_bar_fan_active(true);
+                        }
                     }
                     _ => {}
                 }
