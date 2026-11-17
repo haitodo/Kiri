@@ -1330,7 +1330,7 @@ impl LauncherWindowHost {
                 );
                 self.refresh_all_bars_snapshot();
             }
-            MenuCommand::ExitAndRestore => {
+            MenuCommand::Exit => {
                 self.app.on_normal_shutdown();
                 if let Some(ref mut tray) = self.tray {
                     tray.remove();

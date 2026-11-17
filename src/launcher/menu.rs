@@ -20,7 +20,7 @@ pub enum MenuCommand {
     RestoreSavedLayout,
     LaunchMissingSceneApps,
     RestoreAllMinimized,
-    ExitAndRestore,
+    Exit,
 }
 
 const IDM_SETTINGS: usize = 2001;
@@ -140,7 +140,7 @@ pub fn show_context_menu(
             IDM_RESTORE_LAYOUT => Some(MenuCommand::RestoreSavedLayout),
             IDM_LAUNCH_MISSING_APPS => Some(MenuCommand::LaunchMissingSceneApps),
             IDM_RESTORE_ALL_MINIMIZED => Some(MenuCommand::RestoreAllMinimized),
-            IDM_EXIT => Some(MenuCommand::ExitAndRestore),
+            IDM_EXIT => Some(MenuCommand::Exit),
             _ => None,
         }
     }

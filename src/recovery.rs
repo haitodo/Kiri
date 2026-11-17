@@ -8,7 +8,7 @@
 //! - If a user manually restores a window (`EVENT_SYSTEM_MINIMIZEEND` while not being restored by us),
 //!   its `ManagedAction` is marked `Invalidated` so subsequent manual re-minimization is never
 //!   mistaken for a Kiri minimization (FR-08, AT-23).
-//! - On normal exit, all `MinimizedByUs` windows are restored and `runtime-state.json` is cleared.
+//! - On normal exit, minimized windows are left as-is and `runtime-state.json` is cleared.
 //! - On logoff/shutdown (`WM_ENDSESSION`), windows are NOT restored and the journal is flushed as-is.
 //! - On startup after a crash, surviving windows matching `(hwnd, pid, process_start_time)` that are
 //!   still `is_iconic` and in `Pending` or `MinimizedByUs` state are identified and can be restored.
@@ -361,7 +361,7 @@ impl RecoveryManager {
         atomic_replace_file(&tmp_path, &self.journal_path, None)
     }
 
-    /// Clear `runtime-state.json` on normal exit after restoring windows (Section 6).
+    /// Clear `runtime-state.json` on normal exit without restoring windows.
     pub fn clear_journal(&mut self) -> Result<(), String> {
         self.actions.clear();
         self.restoring_by_us.clear();

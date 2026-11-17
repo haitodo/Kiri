@@ -694,16 +694,12 @@ impl AppController {
         overflow.iter().any(|s| s.id == active_id)
     }
 
-    /// Normal application shutdown: restore all windows minimized by Kiri and clear journal (Section 8.1, AT-16).
+    /// Normal application shutdown: clear journal without restoring minimized windows.
     pub fn on_normal_shutdown(&mut self) {
-        let restored = self.recovery.restore_all_minimized_by_us(&mut *self.sys);
         let _ = self.recovery.clear_journal();
         log_info(
             "app",
-            &format!(
-                "Normal shutdown completed; restored {} window(s) and cleared journal",
-                restored
-            ),
+            "Normal shutdown completed; cleared journal without restoring windows",
         );
     }
 
@@ -835,6 +831,76 @@ mod tests {
             Some("MON-2-TARGET"),
         );
         assert_eq!(app.launcher_monitor_id, "MON-2-TARGET");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn normal_shutdown_leaves_minimized_windows_minimized_and_clears_journal() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiri-app-test-{}-{}-normal-shutdown",
+            std::process::id(),
+            crate::diagnostics::current_unix_ms()
+        ));
+        let journal_path = dir.join("runtime-state.json");
+
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        let win = crate::platform::WindowInstance {
+            hwnd: 42,
+            pid: 4200,
+            process_start_time: 1000,
+            exe_path: r"C:\Apps\Test\app.exe".to_string(),
+            window_class: "TestWindow".to_string(),
+            title: "Test App".to_string(),
+            aumid: None,
+            monitor_id: "MON-2-TARGET".to_string(),
+            is_visible: true,
+            is_iconic: false,
+            is_topmost: false,
+            is_enabled: true,
+            is_hung: false,
+            is_maximized: false,
+            has_taskbar_button: true,
+            is_elevated: false,
+            normal_rect: crate::config::RectData {
+                left: 1920,
+                top: 0,
+                right: 2920,
+                bottom: 800,
+            },
+            window_rect: crate::config::RectData {
+                left: 1920,
+                top: 0,
+                right: 2920,
+                bottom: 800,
+            },
+            z_order: 0,
+        };
+        sys.add_window(win.clone());
+
+        let mut app = AppController::new(
+            ConfigManager::new(dir.join("config.json")),
+            RecoveryManager::new(journal_path.clone()),
+            Box::new(sys),
+        );
+
+        app.recovery
+            .record_pending_minimizes(&[("binding-1".to_string(), win)]);
+        app.sys
+            .show_window_async(42, crate::platform::ShowCmd::MinimizeNoActivate)
+            .unwrap();
+        app.recovery.mark_minimize_issued(42);
+        app.recovery.persist_journal().unwrap();
+
+        assert!(app.sys.query_window(42).unwrap().is_iconic);
+        assert!(journal_path.exists());
+
+        app.on_normal_shutdown();
+
+        assert!(app.sys.query_window(42).unwrap().is_iconic);
+        assert!(!journal_path.exists());
+        assert!(app.recovery.actions().is_empty());
+        assert!(app.check_startup_crash_recovery().is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }
