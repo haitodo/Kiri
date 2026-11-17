@@ -4,12 +4,17 @@
 //! and `WindowSystem` without coupling the core logic to Win32 `HWND` callbacks.
 
 use crate::config::{
-    AppConfig, ConfigManager, MonitorPolicy, MonitorProfile, Orientation, TargetConfig,
+    AppConfig, BarDisplayMode, ConfigManager, MonitorPolicy, MonitorProfile, Orientation,
+    TargetConfig,
 };
 use crate::diagnostics::{log_info, log_warn};
 use crate::launcher::input::LauncherLayout;
 use crate::platform::hooks::drain_minimize_events;
-use crate::platform::monitors::{compute_saved_position_with_dpi, resolve_launcher_position};
+use crate::platform::monitors::{
+    compute_saved_position_on_monitor, compute_saved_position_with_dpi,
+    default_launcher_position_on_monitor, resolve_launcher_bars, resolve_launcher_position,
+    ResolvedLauncherBar,
+};
 use crate::platform::WindowSystem;
 use crate::recovery::{ManagedAction, RecoveryManager};
 use crate::scenes::bindings::BindingResolver;
@@ -114,6 +119,42 @@ impl AppController {
         LauncherLayout::compute(&self.config.launcher, &visible, !overflow.is_empty(), dpi)
     }
 
+    /// Resolve all active launcher bar rectangles according to `bar_display_mode`.
+    pub fn resolve_launcher_bars(&mut self) -> Vec<ResolvedLauncherBar> {
+        let monitors = self.sys.monitors();
+        let (visible, overflow) = self.config.split_visible_and_overflow();
+        let has_overflow = !overflow.is_empty();
+        let launcher_cfg = self.config.launcher.clone();
+
+        let bars = resolve_launcher_bars(&launcher_cfg, &monitors, |d| {
+            let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+            (l.width_px, l.height_px)
+        });
+
+        if let Some(current) = bars
+            .iter()
+            .find(|bar| bar.monitor_id == self.launcher_monitor_id)
+            .or_else(|| bars.first())
+        {
+            self.launcher_monitor_id = current.monitor_id.clone();
+            self.launcher_dpi = current.dpi;
+        } else {
+            let (_, _, mon_id, dpi) = resolve_launcher_position(
+                self.config.launcher.position.as_ref(),
+                &monitors,
+                |d| {
+                    let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+                    (l.width_px, l.height_px)
+                },
+                self.config.launcher.snap_to_edges,
+            );
+            self.launcher_monitor_id = mon_id;
+            self.launcher_dpi = dpi;
+        }
+
+        bars
+    }
+
     /// Resolve the launcher's screen `(x, y, monitor_id, dpi)` based on saved position and connected monitors.
     pub fn resolve_initial_or_updated_launcher_rect(&mut self) -> (i32, i32, i32, i32) {
         let monitors = self.sys.monitors();
@@ -171,6 +212,10 @@ impl AppController {
         ) {
             self.launcher_monitor_id = saved.monitor_id.clone();
             self.launcher_dpi = saved.dpi;
+            self.config
+                .launcher
+                .positions_by_monitor
+                .insert(saved.monitor_id.clone(), saved.clone());
             self.config.launcher.position = Some(saved);
             let _ = self.config_mgr.save(&self.config);
             return (clamped_x, clamped_y, w_px, h_px);
@@ -179,11 +224,184 @@ impl AppController {
         self.resolve_initial_or_updated_launcher_rect()
     }
 
+    /// Persist a specific bar's position when drag finishes.
+    /// In `Single` mode, allows dragging across monitors; in multi-bar modes, keeps the bar on `bar_monitor_id`.
+    pub fn on_bar_drag_end(
+        &mut self,
+        bar_monitor_id: &str,
+        screen_x: i32,
+        screen_y: i32,
+        bar_dpi: u32,
+        cursor_anchor: Option<(i32, i32)>,
+    ) -> Option<ResolvedLauncherBar> {
+        let monitors = self.sys.monitors();
+        let cur_layout = self.compute_layout(bar_dpi);
+        let (visible, overflow) = self.config.split_visible_and_overflow();
+        let has_overflow = !overflow.is_empty();
+        let launcher_cfg = self.config.launcher.clone();
+        let size_fn = |d| {
+            let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+            (l.width_px, l.height_px)
+        };
+
+        let result = if self.config.launcher.bar_display_mode == BarDisplayMode::Single {
+            compute_saved_position_with_dpi(
+                screen_x,
+                screen_y,
+                cur_layout.width_px,
+                cur_layout.height_px,
+                cursor_anchor,
+                &monitors,
+                size_fn,
+                self.config.launcher.snap_to_edges,
+            )
+        } else {
+            let mon = monitors
+                .iter()
+                .find(|m| m.monitor_id == bar_monitor_id)
+                .or_else(|| monitors.first())?;
+            Some(compute_saved_position_on_monitor(
+                screen_x,
+                screen_y,
+                mon,
+                &size_fn,
+                self.config.launcher.snap_to_edges,
+            ))
+        };
+
+        if let Some((clamped_x, clamped_y, w_px, h_px, saved)) = result {
+            self.launcher_monitor_id = saved.monitor_id.clone();
+            self.launcher_dpi = saved.dpi;
+            self.config
+                .launcher
+                .positions_by_monitor
+                .insert(saved.monitor_id.clone(), saved.clone());
+            if self.config.launcher.bar_display_mode == BarDisplayMode::Single
+                || self
+                    .config
+                    .launcher
+                    .position
+                    .as_ref()
+                    .is_none_or(|p| p.monitor_id == saved.monitor_id)
+            {
+                self.config.launcher.position = Some(saved.clone());
+            }
+            let _ = self.config_mgr.save(&self.config);
+            return Some(ResolvedLauncherBar {
+                monitor_id: saved.monitor_id,
+                x: clamped_x,
+                y: clamped_y,
+                width_px: w_px,
+                height_px: h_px,
+                dpi: saved.dpi,
+            });
+        }
+
+        None
+    }
+
     /// Reset launcher position to default on its current or primary monitor (Section 2.2).
     pub fn reset_launcher_position(&mut self) -> (i32, i32, i32, i32) {
         self.config.launcher.position = None;
+        self.config.launcher.positions_by_monitor.clear();
         let _ = self.config_mgr.save(&self.config);
         self.resolve_initial_or_updated_launcher_rect()
+    }
+
+    /// Reset a specific bar's position (or all bars in `Single` mode / when `monitor_id` is `None`).
+    pub fn reset_bar_position(&mut self, monitor_id: Option<&str>) {
+        if self.config.launcher.bar_display_mode == BarDisplayMode::Single || monitor_id.is_none() {
+            self.config.launcher.position = None;
+            self.config.launcher.positions_by_monitor.clear();
+            let _ = self.config_mgr.save(&self.config);
+            return;
+        }
+        let Some(mon_id) = monitor_id else {
+            return;
+        };
+        let monitors = self.sys.monitors();
+        let Some(mon) = monitors.iter().find(|m| m.monitor_id == mon_id) else {
+            self.config.launcher.positions_by_monitor.remove(mon_id);
+            let _ = self.config_mgr.save(&self.config);
+            return;
+        };
+        let (visible, overflow) = self.config.split_visible_and_overflow();
+        let has_overflow = !overflow.is_empty();
+        let launcher_cfg = self.config.launcher.clone();
+        let size_fn = |d| {
+            let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+            (l.width_px, l.height_px)
+        };
+        let (w_px, h_px) = size_fn(mon.dpi);
+        let (def_x, def_y) =
+            default_launcher_position_on_monitor(mon.work_area, mon.dpi, w_px, h_px);
+        let (_, _, _, _, saved) = compute_saved_position_on_monitor(
+            def_x,
+            def_y,
+            mon,
+            &size_fn,
+            self.config.launcher.snap_to_edges,
+        );
+        self.config
+            .launcher
+            .positions_by_monitor
+            .insert(mon_id.to_owned(), saved.clone());
+        if self
+            .config
+            .launcher
+            .position
+            .as_ref()
+            .is_some_and(|p| p.monitor_id == mon_id)
+        {
+            self.config.launcher.position = Some(saved);
+        }
+        let _ = self.config_mgr.save(&self.config);
+    }
+
+    /// Hide a bar from `monitor_id` when multiple bars are displayed. Returns `true` if updated.
+    pub fn hide_bar_on_monitor(&mut self, monitor_id: &str) -> bool {
+        if !self.config.launcher.show_bar {
+            return false;
+        }
+        let monitors = self.sys.monitors();
+        match self.config.launcher.bar_display_mode {
+            BarDisplayMode::Single => return false,
+            BarDisplayMode::AllMonitors => {
+                let remaining: Vec<String> = monitors
+                    .into_iter()
+                    .map(|m| m.monitor_id)
+                    .filter(|id| id != monitor_id)
+                    .collect();
+                if remaining.is_empty() {
+                    return false;
+                }
+                self.config.launcher.bar_display_mode = BarDisplayMode::SelectedMonitors;
+                self.config.launcher.bar_monitor_ids = remaining;
+            }
+            BarDisplayMode::SelectedMonitors => {
+                let connected_remaining = monitors
+                    .iter()
+                    .filter(|m| {
+                        m.monitor_id != monitor_id
+                            && self
+                                .config
+                                .launcher
+                                .bar_monitor_ids
+                                .iter()
+                                .any(|id| id == &m.monitor_id)
+                    })
+                    .count();
+                if connected_remaining == 0 {
+                    return false;
+                }
+                self.config
+                    .launcher
+                    .bar_monitor_ids
+                    .retain(|id| id != monitor_id);
+            }
+        }
+        let _ = self.config_mgr.save(&self.config);
+        true
     }
 
     /// Toggle Horizontal <-> Vertical orientation and persist (FR-03, AT-05).
@@ -194,6 +412,15 @@ impl AppController {
         };
         let _ = self.config_mgr.save(&self.config);
         self.resolve_initial_or_updated_launcher_rect()
+    }
+
+    /// Toggle Horizontal <-> Vertical orientation and persist, without assuming a single bar.
+    pub fn toggle_orientation_and_save(&mut self) {
+        self.config.launcher.orientation = match self.config.launcher.orientation {
+            Orientation::Horizontal => Orientation::Vertical,
+            Orientation::Vertical => Orientation::Horizontal,
+        };
+        let _ = self.config_mgr.save(&self.config);
     }
 
     /// Drain and process any queued `EVENT_SYSTEM_MINIMIZESTART` / `MINIMIZEEND` events.
@@ -211,13 +438,39 @@ impl AppController {
         variant_id: Option<&str>,
         source: SwitchSource,
     ) -> SwitchOutcome {
+        self.switch_to_scene_from_monitor(scene_id, variant_id, source, None)
+    }
+
+    /// Switch to the requested scene/variant, attributing `MonitorPolicy::LauncherMonitor`
+    /// to `source_monitor_id` when triggered from a specific launcher bar.
+    pub fn switch_to_scene_from_monitor(
+        &mut self,
+        scene_id: &str,
+        variant_id: Option<&str>,
+        source: SwitchSource,
+        source_monitor_id: Option<&str>,
+    ) -> SwitchOutcome {
         self.process_queued_win_events();
 
-        let launcher_mon = if self.launcher_monitor_id.is_empty() {
-            None
-        } else {
-            Some(self.launcher_monitor_id.as_str())
-        };
+        if let Some(mon_id) = source_monitor_id {
+            if !mon_id.is_empty() {
+                self.launcher_monitor_id = mon_id.to_owned();
+                if let Some(mon) = self
+                    .sys
+                    .monitors()
+                    .into_iter()
+                    .find(|m| m.monitor_id == mon_id)
+                {
+                    self.launcher_dpi = mon.dpi;
+                }
+            }
+        }
+
+        let launcher_mon = source_monitor_id
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                (!self.launcher_monitor_id.is_empty()).then_some(self.launcher_monitor_id.as_str())
+            });
 
         let outcome = execute_scene_switch_from(
             scene_id,
@@ -511,5 +764,78 @@ impl AppController {
                 last_active_scene_id: Some(scene_id.to_string()),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::fake::FakeWindowSystem;
+    use std::fs;
+
+    fn test_app(name: &str) -> (AppController, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kiri-app-test-{}-{}-{name}",
+            std::process::id(),
+            crate::diagnostics::current_unix_ms()
+        ));
+        let app = AppController::new(
+            ConfigManager::new(dir.join("config.json")),
+            RecoveryManager::new(dir.join("runtime-state.json")),
+            Box::new(FakeWindowSystem::new_dual_monitor()),
+        );
+        (app, dir)
+    }
+
+    #[test]
+    fn multi_bar_drag_reset_hide_and_switch_attribution() {
+        let (mut app, dir) = test_app("multi-bar");
+        app.config.launcher.bar_display_mode = BarDisplayMode::AllMonitors;
+
+        let bars = app.resolve_launcher_bars();
+        assert_eq!(bars.len(), 2);
+
+        // Dragging right bar past left edge of right monitor stays clamped to MON-2-TARGET
+        let dragged = app
+            .on_bar_drag_end("MON-2-TARGET", 1800, 1002, 96, Some((1850, 1015)))
+            .unwrap();
+        assert_eq!(dragged.monitor_id, "MON-2-TARGET");
+        assert_eq!(dragged.x, 1920);
+        assert_eq!(dragged.y, 1002);
+        assert!(app
+            .config
+            .launcher
+            .positions_by_monitor
+            .contains_key("MON-2-TARGET"));
+
+        // Resetting only MON-2-TARGET puts it at default top-right without overwriting MON-1-PRIMARY
+        app.on_bar_drag_end("MON-1-PRIMARY", 500, 1002, 96, Some((520, 1015)))
+            .unwrap();
+        app.reset_bar_position(Some("MON-2-TARGET"));
+        let bars_after_reset = app.resolve_launcher_bars();
+        assert_eq!(bars_after_reset[0].y, 1002);
+        assert!(bars_after_reset[1].y < 100);
+
+        // Hiding MON-1-PRIMARY converts AllMonitors -> SelectedMonitors([MON-2-TARGET])
+        assert!(app.hide_bar_on_monitor("MON-1-PRIMARY"));
+        assert_eq!(
+            app.config.launcher.bar_display_mode,
+            BarDisplayMode::SelectedMonitors
+        );
+        assert_eq!(app.config.launcher.bar_monitor_ids, vec!["MON-2-TARGET"]);
+        // Cannot hide the last remaining bar
+        assert!(!app.hide_bar_on_monitor("MON-2-TARGET"));
+
+        // Switching from a bar attributes MonitorPolicy::LauncherMonitor to that bar's monitor
+        app.config.target.monitor_policy = MonitorPolicy::LauncherMonitor;
+        let _ = app.switch_to_scene_from_monitor(
+            "code",
+            None,
+            SwitchSource::BarClick,
+            Some("MON-2-TARGET"),
+        );
+        assert_eq!(app.launcher_monitor_id, "MON-2-TARGET");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

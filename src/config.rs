@@ -31,6 +31,15 @@ pub enum CursorPopupPosition {
     BesideCursor,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarDisplayMode {
+    #[default]
+    Single,
+    AllMonitors,
+    SelectedMonitors,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedPosition {
     /// Stable monitor identifier (from QueryDisplayConfig target path or fallback key)
@@ -77,7 +86,13 @@ pub struct LauncherConfig {
     #[serde(default = "default_true")]
     pub restore_all_on_switch: bool,
     #[serde(default)]
+    pub bar_display_mode: BarDisplayMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bar_monitor_ids: Vec<String>,
+    #[serde(default)]
     pub position: Option<SavedPosition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub positions_by_monitor: BTreeMap<String, SavedPosition>,
 }
 
 fn default_button_size_dip() -> i32 {
@@ -108,7 +123,10 @@ impl Default for LauncherConfig {
             focus_on_switch: true,
             wheel_wrap: false,
             restore_all_on_switch: true,
+            bar_display_mode: BarDisplayMode::Single,
+            bar_monitor_ids: Vec::new(),
             position: None,
+            positions_by_monitor: BTreeMap::new(),
         }
     }
 }
@@ -565,6 +583,10 @@ impl AppConfig {
         self.launcher.button_size_dip = self.launcher.button_size_dip.clamp(20, 96);
         self.launcher.grip_size_dip = self.launcher.grip_size_dip.clamp(8, 48);
         self.launcher.visible_slots = self.launcher.visible_slots.clamp(1, 12);
+        let mut seen = std::collections::HashSet::new();
+        self.launcher
+            .bar_monitor_ids
+            .retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
     }
 
     fn validate_variants(&self) -> Result<(), String> {
@@ -1155,5 +1177,39 @@ mod tests {
         assert!(mgr.import_config_from_path(&future_path).is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_bar_launcher_fields_roundtrip_and_deduplicate() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.launcher.bar_display_mode, BarDisplayMode::Single);
+        assert!(cfg.launcher.bar_monitor_ids.is_empty());
+        assert!(cfg.launcher.positions_by_monitor.is_empty());
+
+        cfg.launcher.bar_display_mode = BarDisplayMode::SelectedMonitors;
+        cfg.launcher.bar_monitor_ids = vec![
+            "MON-LEFT".into(),
+            "  ".into(),
+            "MON-RIGHT".into(),
+            "MON-LEFT".into(),
+        ];
+        cfg.launcher.positions_by_monitor.insert(
+            "MON-RIGHT".into(),
+            SavedPosition {
+                monitor_id: "MON-RIGHT".into(),
+                rel_x: 0.5,
+                rel_y: 1.0,
+                dpi: 96,
+            },
+        );
+        cfg.validate_and_clamp();
+        assert_eq!(
+            cfg.launcher.bar_monitor_ids,
+            vec!["MON-LEFT".to_string(), "MON-RIGHT".to_string()]
+        );
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cfg);
     }
 }

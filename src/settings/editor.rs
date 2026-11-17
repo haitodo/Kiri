@@ -1,8 +1,8 @@
 use super::{is_autostart_enabled, RegistrationWarning, SettingsViewModel};
 use crate::app::AppController;
 use crate::config::{
-    AppConfig, CursorPopupPosition, LauncherConfig, MonitorPolicy, Orientation, Scene,
-    SceneVariant, Shortcut, TargetConfig, TitleRule, TitleRuleType, WindowBinding,
+    AppConfig, BarDisplayMode, CursorPopupPosition, LauncherConfig, MonitorPolicy, Orientation,
+    Scene, SceneVariant, Shortcut, TargetConfig, TitleRule, TitleRuleType, WindowBinding,
 };
 use crate::diagnostics::executable_name;
 use crate::launcher::paint::{is_builtin_icon, BUILTIN_ICONS};
@@ -181,6 +181,10 @@ pub(super) struct LauncherOptions {
     always_on_top: bool,
     snap_to_edges: bool,
     wheel_wrap: bool,
+    #[serde(default)]
+    bar_display_mode: BarDisplayMode,
+    #[serde(default)]
+    bar_monitor_ids: Vec<String>,
 }
 
 impl LauncherOptions {
@@ -204,6 +208,13 @@ impl LauncherOptions {
         launcher.always_on_top = self.always_on_top;
         launcher.snap_to_edges = self.snap_to_edges;
         launcher.wheel_wrap = self.wheel_wrap;
+        launcher.bar_display_mode = self.bar_display_mode;
+        let mut seen = HashSet::new();
+        launcher.bar_monitor_ids = self
+            .bar_monitor_ids
+            .into_iter()
+            .filter(|id| !id.trim().is_empty() && seen.insert(id.clone()))
+            .collect();
         Ok(())
     }
 }
@@ -267,9 +278,16 @@ impl Editor {
             // The launcher can move, switch scenes, or save layouts while settings are open.
             if !self.reset_position {
                 config.launcher.position = live.launcher.position.clone();
+                config.launcher.positions_by_monitor = live.launcher.positions_by_monitor.clone();
             }
             if config.launcher.orientation == self.baseline.launcher.orientation {
                 config.launcher.orientation = live.launcher.orientation;
+            }
+            if config.launcher.bar_display_mode == self.baseline.launcher.bar_display_mode
+                && config.launcher.bar_monitor_ids == self.baseline.launcher.bar_monitor_ids
+            {
+                config.launcher.bar_display_mode = live.launcher.bar_display_mode;
+                config.launcher.bar_monitor_ids = live.launcher.bar_monitor_ids.clone();
             }
             config.monitors = live.monitors.clone();
             for scene in &mut config.scenes {
@@ -562,6 +580,7 @@ impl Editor {
             Launcher { values } => values.apply(&mut self.vm.config_draft.launcher)?,
             ResetPosition => {
                 self.vm.config_draft.launcher.position = None;
+                self.vm.config_draft.launcher.positions_by_monitor.clear();
                 self.reset_position = true;
             }
             Target { policy, monitor } => {
@@ -721,6 +740,12 @@ impl Editor {
             return Err("この設定は読み取り専用です。".into());
         }
         let config = self.config_to_save(&app.config);
+        if config.launcher.show_bar
+            && config.launcher.bar_display_mode == BarDisplayMode::SelectedMonitors
+            && config.launcher.bar_monitor_ids.is_empty()
+        {
+            return Err("固定バーを表示する画面を1つ以上選んでください。".into());
+        }
         if !config.launcher.show_bar && !config.launcher.ctrl_double_tap && !tray_only_confirmed {
             return Err(
                 "固定バーと Ctrl の二度押しを両方無効にする場合は、確認してください。".into(),
@@ -977,6 +1002,7 @@ impl Editor {
         json!({
             "scenes": scenes, "bindings": bindings, "candidates": candidates,
             "monitors": monitors, "target": config.target, "effective_monitor": self.vm.target_monitor(&config.target),
+            "launcher_monitor": self.vm.target_monitor(&TargetConfig { monitor_policy: MonitorPolicy::LauncherMonitor, monitor_id: None }),
             "launcher": config.launcher, "shortcuts": config.shortcuts,
             "autostart": self.autostart, "verbose": config.verbose_title_logging,
             "read_only": self.read_only, "dirty": self.dirty(),
@@ -1326,6 +1352,62 @@ mod tests {
             .all(|binding| binding.belongs_to_selection(&scene, None)));
         assert!(app.config.bindings[0].belongs_to_selection("trade", None));
         assert!(app.state_mgr.active_scene_id().is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn selected_monitors_requires_at_least_one_monitor_when_show_bar_is_on() {
+        let (mut app, folder) = sample_app("selected-monitors");
+        let mut editor = Editor::new(&app);
+        editor
+            .edit(
+                Command::Launcher {
+                    values: LauncherOptions {
+                        show_bar: true,
+                        ctrl_double_tap: true,
+                        cursor_popup_position: CursorPopupPosition::SceneCentered,
+                        orientation: Orientation::Horizontal,
+                        button_size_dip: 32,
+                        grip_size_dip: 18,
+                        visible_slots: 3,
+                        always_on_top: true,
+                        snap_to_edges: false,
+                        wheel_wrap: false,
+                        bar_display_mode: BarDisplayMode::SelectedMonitors,
+                        bar_monitor_ids: Vec::new(),
+                    },
+                },
+                &app,
+            )
+            .unwrap();
+        assert!(editor.save(&mut app, false).is_err());
+
+        editor
+            .edit(
+                Command::Launcher {
+                    values: LauncherOptions {
+                        show_bar: true,
+                        ctrl_double_tap: true,
+                        cursor_popup_position: CursorPopupPosition::SceneCentered,
+                        orientation: Orientation::Horizontal,
+                        button_size_dip: 32,
+                        grip_size_dip: 18,
+                        visible_slots: 3,
+                        always_on_top: true,
+                        snap_to_edges: false,
+                        wheel_wrap: false,
+                        bar_display_mode: BarDisplayMode::SelectedMonitors,
+                        bar_monitor_ids: vec!["MON-1-PRIMARY".into(), "MON-2-TARGET".into()],
+                    },
+                },
+                &app,
+            )
+            .unwrap();
+        assert_eq!(editor.save(&mut app, false).unwrap(), (true, None));
+        assert_eq!(
+            app.config.launcher.bar_monitor_ids,
+            vec!["MON-1-PRIMARY", "MON-2-TARGET"]
+        );
         fs::remove_dir_all(folder).unwrap();
     }
 }

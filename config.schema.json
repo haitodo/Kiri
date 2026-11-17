@@ -82,6 +82,15 @@
           "type": "boolean",
           "default": true
         },
+        "bar_display_mode": {
+          "type": "string",
+          "enum": ["single", "all_monitors", "selected_monitors"],
+          "default": "single"
+        },
+        "bar_monitor_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "position": {
           "oneOf": [
             { "type": "null" },
@@ -96,6 +105,19 @@
               }
             }
           ]
+        },
+        "positions_by_monitor": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["monitor_id", "rel_x", "rel_y"],
+            "properties": {
+              "monitor_id": { "type": "string" },
+              "rel_x": { "type": "number" },
+              "rel_y": { "type": "number" },
+              "dpi": { "type": "integer" }
+            }
+          }
         }
       }
     },

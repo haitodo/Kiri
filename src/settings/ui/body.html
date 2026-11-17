@@ -71,6 +71,21 @@
         <label class="setting"><span><strong>Ctrl を 2 回押して開く</strong><small>カーソルの近くに開きます。表示中は Ctrl を短く 1 回押して離すと閉じます。</small></span><input data-edit type="checkbox" id="ctrl_double_tap"></label>
         <p class="notice" id="tray-hint" hidden>どちらもオフの場合は、タスクトレイの Kiri アイコンから開けます。</p>
       </div>
+      <div class="band stack" id="bar-monitors-band">
+        <div class="columns monitor-options">
+          <div class="stack">
+            <label class="field">固定バーを表示する画面
+              <select data-edit id="bar_display_mode">
+                <option value="single">1つの画面だけ（ドラッグで移動）</option>
+                <option value="selected_monitors">選んだ画面に表示</option>
+                <option value="all_monitors">すべての画面に表示</option>
+              </select>
+            </label>
+            <p class="muted" id="bar-display-hint"></p>
+          </div>
+          <div class="monitor-map" id="launcher-monitor-map" role="group" aria-label="固定バーを表示する画面"></div>
+        </div>
+      </div>
       <div class="columns band">
         <div class="stack">
           <label class="field">固定バーの向き<select data-edit id="orientation"><option value="horizontal">横向き</option><option value="vertical">縦向き</option></select></label>

@@ -120,7 +120,7 @@ struct InputState {
     taps: CtrlTaps,
     popup: Option<PopupInput>,
     popup_fan_active: bool,
-    bar_hovered: bool,
+    hovered_bar_hwnd: Option<HWND>,
     bar_fan_active: bool,
 }
 
@@ -229,9 +229,20 @@ impl CursorInput {
         self.update_keyboard_hook(state)
     }
 
-    pub fn set_bar_hovered(&self, hovered: bool) -> windows::core::Result<()> {
+    pub fn set_bar_hovered_hwnd(&self, bar_hwnd: HWND, hovered: bool) -> windows::core::Result<()> {
         let mut state = STATE.get();
-        state.bar_hovered = hovered;
+        if hovered {
+            state.hovered_bar_hwnd = Some(bar_hwnd);
+        } else if state.hovered_bar_hwnd == Some(bar_hwnd) {
+            state.hovered_bar_hwnd = None;
+        }
+        STATE.set(state);
+        update_mouse_hook(state)
+    }
+
+    pub fn clear_bar_hover(&self) -> windows::core::Result<()> {
+        let mut state = STATE.get();
+        state.hovered_bar_hwnd = None;
         STATE.set(state);
         update_mouse_hook(state)
     }
@@ -248,7 +259,7 @@ impl Drop for CursorInput {
 
 fn update_mouse_hook(state: InputState) -> windows::core::Result<()> {
     let hook = MOUSE_HOOK.get();
-    if state.taps.held != 0 || state.popup.is_some() || state.bar_hovered {
+    if state.taps.held != 0 || state.popup.is_some() || state.hovered_bar_hwnd.is_some() {
         if hook.0.is_null() {
             MOUSE_HOOK.set(unsafe {
                 SetWindowsHookExW(
@@ -414,13 +425,14 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 return false;
             }
 
-            let target_message = match state.popup {
+            let (target_hwnd, target_message) = match state.popup {
                 Some(popup) if popup.has_scenes || popup.contains(mouse.pt) => {
-                    WM_APP_CURSOR_POPUP_WHEEL
+                    (state.hwnd, WM_APP_CURSOR_POPUP_WHEEL)
                 }
-                None if state.bar_hovered && WindowFromPoint(mouse.pt) == state.hwnd => {
-                    WM_MOUSEWHEEL
-                }
+                None => match state.hovered_bar_hwnd {
+                    Some(bar) if WindowFromPoint(mouse.pt) == bar => (bar, WM_MOUSEWHEEL),
+                    _ => return false,
+                },
                 _ => return false,
             };
             // Use the same delta and screen coordinate fields as WM_MOUSEWHEEL.
@@ -428,7 +440,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let x = u32::from(mouse.pt.x as u16);
             let y = u32::from(mouse.pt.y as u16);
             PostMessageW(
-                Some(state.hwnd),
+                Some(target_hwnd),
                 target_message,
                 WPARAM(delta),
                 LPARAM(((y << 16) | x) as isize),
@@ -805,6 +817,35 @@ mod tests {
             input.set_popup(None).unwrap();
             drop(input);
             DestroyWindow(hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn bar_hover_tracks_active_bar_hwnd_without_clobbering_sibling_bar() {
+        unsafe {
+            let (host_hwnd, input) = input_window();
+            let (bar1, _) = input_window();
+            let (bar2, _) = input_window();
+            // Restore host_hwnd in STATE after helper calls
+            let mut state = STATE.get();
+            state.hwnd = host_hwnd;
+            STATE.set(state);
+
+            input.set_bar_hovered_hwnd(bar1, true).unwrap();
+            assert_eq!(STATE.get().hovered_bar_hwnd, Some(bar1));
+
+            // Entering bar2 then receiving delayed WM_MOUSELEAVE from bar1 must keep bar2 hovered
+            input.set_bar_hovered_hwnd(bar2, true).unwrap();
+            input.set_bar_hovered_hwnd(bar1, false).unwrap();
+            assert_eq!(STATE.get().hovered_bar_hwnd, Some(bar2));
+
+            input.set_bar_hovered_hwnd(bar2, false).unwrap();
+            assert_eq!(STATE.get().hovered_bar_hwnd, None);
+
+            drop(input);
+            DestroyWindow(bar2).unwrap();
+            DestroyWindow(bar1).unwrap();
+            DestroyWindow(host_hwnd).unwrap();
         }
     }
 }

@@ -355,7 +355,7 @@ function bindingRow(binding, scene, variant) {
 }
 
 const launcherFields = ['show_bar','ctrl_double_tap','orientation','cursor_popup_position','button_size_dip',
-  'grip_size_dip','visible_slots','always_on_top','snap_to_edges','wheel_wrap'];
+  'grip_size_dip','visible_slots','always_on_top','snap_to_edges','wheel_wrap','bar_display_mode'];
 function renderLauncher() {
   const cfg = state.launcher;
   launcherFields.forEach((id) => {
@@ -364,6 +364,8 @@ function renderLauncher() {
     else if (!(invalidLauncher && node.type === 'number')) node.value = cfg[id];
   });
   byId('tray-hint').hidden = cfg.show_bar || cfg.ctrl_double_tap;
+  byId('bar-monitors-band').hidden = !cfg.show_bar;
+  if (cfg.show_bar) renderLauncherMonitors();
   const preview = byId('bar-preview');
   if (!cfg.show_bar) { preview.replaceChildren(el('small', '', '固定バーは非表示です。')); return; }
   const scenes = state.bar_scenes;
@@ -380,6 +382,77 @@ function renderLauncher() {
   bar.setAttribute('role', 'img');
   bar.setAttribute('aria-label', ['固定バー ' + (cfg.orientation === 'vertical' ? '縦向き' : '横向き'), ...scenes.map((s) => s.name), ...(state.overflow ? ['その他のシーン'] : [])].join('、'));
   preview.replaceChildren(bar);
+}
+
+function defaultLauncherMonitorId() {
+  const saved = state.launcher.position?.monitor_id;
+  if (saved && state.monitors.some((m) => m.id === saved)) return saved;
+  if (state.launcher_monitor && state.monitors.some((m) => m.id === state.launcher_monitor)) return state.launcher_monitor;
+  return (state.monitors.find((m) => m.primary) || state.monitors[0])?.id || null;
+}
+
+function renderLauncherMonitors() {
+  const cfg = state.launcher;
+  const mode = cfg.bar_display_mode || 'single';
+  const selectedIds = cfg.bar_monitor_ids || [];
+  const hint = byId('bar-display-hint');
+  const map = byId('launcher-monitor-map');
+  const monitors = state.monitors;
+
+  if (mode === 'selected_monitors' && !selectedIds.length) {
+    hint.textContent = '表示する画面を1つ以上クリックして選んでください。';
+    hint.className = 'notice';
+  } else {
+    hint.className = 'muted';
+    hint.textContent = mode === 'all_monitors'
+      ? '接続されているすべての画面に同じ固定バーを表示します。'
+      : mode === 'selected_monitors'
+        ? 'クリックした画面に固定バーを表示します（複数選択できます）。'
+        : 'ドラッグでどの画面にも移動できます。';
+  }
+
+  if (!monitors.length) {
+    map.replaceChildren(el('small', '', '接続されている画面はありません。'));
+    map.style.height = '';
+    return;
+  }
+
+  const singleMon = defaultLauncherMonitorId();
+  const bounds = monitors.map(({rect}) => rect);
+  const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
+  const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
+  const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
+  const maxWidth = map.clientWidth || 230;
+  const scale = Math.min(maxWidth / width, 96 / height);
+
+  map.replaceChildren(...monitors.map((m) => {
+    const rect = m.rect;
+    const label = '画面 ' + m.number;
+    const primary = m.primary ? '（メイン）' : '';
+    const active = mode === 'all_monitors' ? true
+      : mode === 'selected_monitors' ? selectedIds.includes(m.id)
+        : singleMon === m.id;
+    const item = button(label, () => {
+      if (mode !== 'selected_monitors') return;
+      const next = selectedIds.includes(m.id)
+        ? selectedIds.filter((id) => id !== m.id)
+        : [...selectedIds, m.id];
+      sendLauncher(next);
+    }, {
+      edit: mode === 'selected_monitors',
+      disabled: mode !== 'selected_monitors',
+      aria: label + primary + (m.name ? ' ' + m.name : ''),
+      focus: 'launcher-map:' + m.id,
+    });
+    item.setAttribute('aria-pressed', String(active));
+    item.title = label + primary + (m.name ? ' — ' + m.name : '');
+    item.style.left = (rect.left - minX) * scale + 'px';
+    item.style.top = (rect.top - minY) * scale + 'px';
+    item.style.width = Math.max(1, (rect.right - rect.left) * scale - 3) + 'px';
+    item.style.height = Math.max(1, (rect.bottom - rect.top) * scale - 3) + 'px';
+    return item;
+  }));
+  map.style.height = Math.max(70, height * scale) + 'px';
 }
 
 function renderBehavior() {
@@ -791,7 +864,7 @@ async function closeSettings() {
   } else await act('close', { discard: false });
 }
 
-function sendLauncher() {
+function sendLauncher(overrideMonitors) {
   const controls = launcherFields.map(byId);
   invalidLauncher = controls.some((node) => node.type === 'number' && !node.checkValidity());
   renderFooter();
@@ -799,6 +872,14 @@ function sendLauncher() {
   showMessage();
   const values = Object.fromEntries(controls.map((node) => [node.id, node.type === 'checkbox' ? node.checked
     : node.type === 'number' ? node.valueAsNumber : node.value]));
+  let barMonitorIds = Array.isArray(overrideMonitors)
+    ? overrideMonitors
+    : [...(state.launcher.bar_monitor_ids || [])];
+  if (values.bar_display_mode === 'selected_monitors' && !Array.isArray(overrideMonitors) && !barMonitorIds.length) {
+    const fallback = defaultLauncherMonitorId();
+    if (fallback) barMonitorIds = [fallback];
+  }
+  values.bar_monitor_ids = barMonitorIds;
   void act('launcher', { values });
 }
 
@@ -860,7 +941,7 @@ byId('refresh-bindings').addEventListener('click', () => act('refresh'));
 byId('refresh-monitors').addEventListener('click', () => act('refresh'));
 byId('target').addEventListener('change', (event) => changeTarget(event.target.value));
 byId('scene-target').addEventListener('change', (event) => changeTarget(event.target.value, selected()));
-launcherFields.forEach((id) => byId(id).addEventListener('change', sendLauncher));
+launcherFields.forEach((id) => byId(id).addEventListener('change', () => sendLauncher()));
 ['restore','focus','autostart','verbose'].forEach((id) => byId(id).addEventListener('change', sendBehavior));
 byId('reset-position').addEventListener('click', () => act('reset_position', {}, () => showMessage('保存すると固定バーの位置が初期化されます。', true)));
 byId('new-shortcut').addEventListener('click', () => openShortcut());
@@ -891,6 +972,7 @@ document.addEventListener('keydown', (event) => {
 });
 new ResizeObserver(() => {
   if (!state) return;
+  if (visited === 'launcher' && state.launcher.show_bar) renderLauncherMonitors();
   if (visited === 'behavior') renderMonitors(byId('monitor-map'));
   if (visited === 'scenes' && selected()) renderMonitors(byId('scene-monitor-map'), selected());
 }).observe(content);

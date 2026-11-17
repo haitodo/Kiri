@@ -8,9 +8,19 @@
 //! - When multiple identical monitors yield duplicate target paths (or when `monitorDevicePath` is empty),
 //!   append relative coordinates and resolution as a disambiguating secondary key.
 
-use crate::config::{RectData, SavedPosition};
+use crate::config::{BarDisplayMode, LauncherConfig, RectData, SavedPosition};
 use crate::platform::MonitorInfoData;
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLauncherBar {
+    pub monitor_id: String,
+    pub x: i32,
+    pub y: i32,
+    pub width_px: i32,
+    pub height_px: i32,
+    pub dpi: u32,
+}
 
 /// Convert DIP (Device-Independent Pixels at 96 DPI) to physical pixels for `dpi`.
 #[inline]
@@ -74,6 +84,34 @@ pub fn default_launcher_position_on_monitor(
     (x, y)
 }
 
+/// Compute `(x, y, width_px, height_px)` on a specific monitor from an optional `SavedPosition`.
+pub fn resolve_launcher_position_on_monitor(
+    mon: &MonitorInfoData,
+    saved: Option<&SavedPosition>,
+    launcher_size_for_dpi: &impl Fn(u32) -> (i32, i32),
+    snap_to_edges: bool,
+) -> (i32, i32, i32, i32) {
+    let (w_px, h_px) = launcher_size_for_dpi(mon.dpi);
+    let (x, y) = if let Some(pos) = saved {
+        let avail_w = (mon.work_area.width() - w_px).max(0) as f64;
+        let avail_h = (mon.work_area.height() - h_px).max(0) as f64;
+        let raw_x = mon.work_area.left + (pos.rel_x.clamp(0.0, 1.0) * avail_w).round() as i32;
+        let raw_y = mon.work_area.top + (pos.rel_y.clamp(0.0, 1.0) * avail_h).round() as i32;
+        clamp_and_snap_in_work_area(
+            raw_x,
+            raw_y,
+            w_px,
+            h_px,
+            mon.work_area,
+            mon.dpi,
+            snap_to_edges,
+        )
+    } else {
+        default_launcher_position_on_monitor(mon.work_area, mon.dpi, w_px, h_px)
+    };
+    (x, y, w_px, h_px)
+}
+
 /// Resolve the launcher's screen position `(x, y, monitor_id, dpi)` from `SavedPosition` and connected monitors.
 /// Falls back to the primary monitor if the saved monitor was disconnected (Section 2.2 & AT-13).
 pub fn resolve_launcher_position(
@@ -95,18 +133,10 @@ pub fn resolve_launcher_position(
 
     if let Some(pos) = saved {
         if let Some(mon) = monitors.iter().find(|m| m.monitor_id == pos.monitor_id) {
-            let (w_px, h_px) = launcher_size_for_dpi(mon.dpi);
-            let avail_w = (mon.work_area.width() - w_px).max(0) as f64;
-            let avail_h = (mon.work_area.height() - h_px).max(0) as f64;
-            let raw_x = mon.work_area.left + (pos.rel_x.clamp(0.0, 1.0) * avail_w).round() as i32;
-            let raw_y = mon.work_area.top + (pos.rel_y.clamp(0.0, 1.0) * avail_h).round() as i32;
-            let (x, y) = clamp_and_snap_in_work_area(
-                raw_x,
-                raw_y,
-                w_px,
-                h_px,
-                mon.work_area,
-                mon.dpi,
+            let (x, y, _, _) = resolve_launcher_position_on_monitor(
+                mon,
+                Some(pos),
+                &launcher_size_for_dpi,
                 snap_to_edges,
             );
             return (x, y, mon.monitor_id.clone(), mon.dpi);
@@ -114,15 +144,99 @@ pub fn resolve_launcher_position(
     }
 
     // Fallback to primary monitor when saved is None or saved monitor is disconnected
-    let (w_px, h_px) = launcher_size_for_dpi(primary_mon.dpi);
-    let (x, y) =
-        default_launcher_position_on_monitor(primary_mon.work_area, primary_mon.dpi, w_px, h_px);
+    let (x, y, _, _) =
+        resolve_launcher_position_on_monitor(primary_mon, None, &launcher_size_for_dpi, snap_to_edges);
     (
         x,
         y,
         primary_mon.monitor_id.clone(),
         primary_mon.dpi,
     )
+}
+
+/// Resolve all active launcher bar rectangles according to `LauncherConfig::bar_display_mode`.
+pub fn resolve_launcher_bars(
+    cfg: &LauncherConfig,
+    monitors: &[MonitorInfoData],
+    launcher_size_for_dpi: impl Fn(u32) -> (i32, i32),
+) -> Vec<ResolvedLauncherBar> {
+    if !cfg.show_bar {
+        return Vec::new();
+    }
+
+    if cfg.bar_display_mode == BarDisplayMode::Single || monitors.is_empty() {
+        let (x, y, monitor_id, dpi) = resolve_launcher_position(
+            cfg.position.as_ref(),
+            monitors,
+            &launcher_size_for_dpi,
+            cfg.snap_to_edges,
+        );
+        let (width_px, height_px) = launcher_size_for_dpi(dpi);
+        return vec![ResolvedLauncherBar {
+            monitor_id,
+            x,
+            y,
+            width_px,
+            height_px,
+            dpi,
+        }];
+    }
+
+    let mut target_monitors: Vec<&MonitorInfoData> = match cfg.bar_display_mode {
+        BarDisplayMode::Single => unreachable!(),
+        BarDisplayMode::AllMonitors => monitors.iter().collect(),
+        BarDisplayMode::SelectedMonitors => monitors
+            .iter()
+            .filter(|m| cfg.bar_monitor_ids.iter().any(|id| id == &m.monitor_id))
+            .collect(),
+    };
+
+    // If none of the selected monitors are connected, fall back to the primary monitor.
+    if target_monitors.is_empty() {
+        if let Some(primary) = monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| monitors.first())
+        {
+            target_monitors.push(primary);
+        }
+    }
+
+    target_monitors.sort_by_key(|m| (m.monitor_rect.left, m.monitor_rect.top));
+
+    let template_pos = cfg
+        .position
+        .as_ref()
+        .or_else(|| cfg.positions_by_monitor.values().next());
+
+    target_monitors
+        .into_iter()
+        .map(|mon| {
+            let saved = cfg
+                .positions_by_monitor
+                .get(&mon.monitor_id)
+                .or_else(|| {
+                    cfg.position
+                        .as_ref()
+                        .filter(|p| p.monitor_id == mon.monitor_id)
+                })
+                .or(template_pos);
+            let (x, y, width_px, height_px) = resolve_launcher_position_on_monitor(
+                mon,
+                saved,
+                &launcher_size_for_dpi,
+                cfg.snap_to_edges,
+            );
+            ResolvedLauncherBar {
+                monitor_id: mon.monitor_id.clone(),
+                x,
+                y,
+                width_px,
+                height_px,
+                dpi: mon.dpi,
+            }
+        })
+        .collect()
 }
 
 /// Compute `SavedPosition` from the launcher's current screen top-left `(x, y)` and size `(width_px, height_px)`.
@@ -145,6 +259,40 @@ pub fn compute_saved_position(
         snap_to_edges,
     )?;
     Some(saved)
+}
+
+/// Compute the clamped `(x, y, width_px, height_px)` and `SavedPosition` on a specific monitor.
+pub fn compute_saved_position_on_monitor(
+    x: i32,
+    y: i32,
+    mon: &MonitorInfoData,
+    launcher_size_for_dpi: &impl Fn(u32) -> (i32, i32),
+    snap_to_edges: bool,
+) -> (i32, i32, i32, i32, SavedPosition) {
+    let (w_px, h_px) = launcher_size_for_dpi(mon.dpi);
+    let (clamped_x, clamped_y) = clamp_and_snap_in_work_area(
+        x,
+        y,
+        w_px,
+        h_px,
+        mon.work_area,
+        mon.dpi,
+        snap_to_edges,
+    );
+
+    let avail_w = (mon.work_area.width() - w_px).max(1) as f64;
+    let avail_h = (mon.work_area.height() - h_px).max(1) as f64;
+    let rel_x = ((clamped_x - mon.work_area.left) as f64 / avail_w).clamp(0.0, 1.0);
+    let rel_y = ((clamped_y - mon.work_area.top) as f64 / avail_h).clamp(0.0, 1.0);
+
+    let saved = SavedPosition {
+        monitor_id: mon.monitor_id.clone(),
+        rel_x,
+        rel_y,
+        dpi: mon.dpi,
+    };
+
+    (clamped_x, clamped_y, w_px, h_px, saved)
 }
 
 /// Compute the target monitor, DPI-scaled `(width_px, height_px)`, clamped `(x, y)`, and `SavedPosition`
@@ -172,30 +320,13 @@ pub fn compute_saved_position_with_dpi(
         find_best_monitor_for_rect(&launcher_rect, monitors)?
     };
 
-    let (w_px, h_px) = launcher_size_for_dpi(mon.dpi);
-    let (clamped_x, clamped_y) = clamp_and_snap_in_work_area(
+    Some(compute_saved_position_on_monitor(
         x,
         y,
-        w_px,
-        h_px,
-        mon.work_area,
-        mon.dpi,
+        mon,
+        &launcher_size_for_dpi,
         snap_to_edges,
-    );
-
-    let avail_w = (mon.work_area.width() - w_px).max(1) as f64;
-    let avail_h = (mon.work_area.height() - h_px).max(1) as f64;
-    let rel_x = ((clamped_x - mon.work_area.left) as f64 / avail_w).clamp(0.0, 1.0);
-    let rel_y = ((clamped_y - mon.work_area.top) as f64 / avail_h).clamp(0.0, 1.0);
-
-    let saved = SavedPosition {
-        monitor_id: mon.monitor_id.clone(),
-        rel_x,
-        rel_y,
-        dpi: mon.dpi,
-    };
-
-    Some((clamped_x, clamped_y, w_px, h_px, saved))
+    ))
 }
 
 /// Find the monitor containing `(px, py)`, falling back to the monitor whose `monitor_rect` is closest to `(px, py)`.
@@ -664,5 +795,63 @@ mod tests {
         assert_eq!((rx, ry), (cx2, cy2));
         assert_eq!(rmon, "MON-2K-100");
         assert_eq!(rdpi, 96);
+    }
+
+    #[test]
+    fn test_resolve_launcher_bars_multi_monitor_and_inheritance() {
+        let sys = FakeWindowSystem::new_dual_monitor();
+        let monitors = sys.monitors();
+        let size_fn = |dpi: u32| (dip_to_px(126, dpi), dip_to_px(38, dpi));
+
+        // 1. Disabled show_bar returns no bars
+        let mut cfg = LauncherConfig {
+            show_bar: false,
+            ..LauncherConfig::default()
+        };
+        assert!(resolve_launcher_bars(&cfg, &monitors, size_fn).is_empty());
+
+        // 2. AllMonitors inherits bottom position from primary bar when secondary has no saved entry
+        cfg.show_bar = true;
+        cfg.bar_display_mode = BarDisplayMode::AllMonitors;
+        cfg.position = Some(SavedPosition {
+            monitor_id: "MON-1-PRIMARY".into(),
+            rel_x: 0.5,
+            rel_y: 1.0,
+            dpi: 96,
+        });
+        let bars = resolve_launcher_bars(&cfg, &monitors, size_fn);
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].monitor_id, "MON-1-PRIMARY");
+        assert_eq!(bars[1].monitor_id, "MON-2-TARGET");
+        // Both sit at bottom of their work_area (1040 - 38 = 1002)
+        assert_eq!(bars[0].y, 1002);
+        assert_eq!(bars[1].y, 1002);
+
+        // 3. Per-monitor override takes precedence over inherited template
+        cfg.positions_by_monitor.insert(
+            "MON-2-TARGET".into(),
+            SavedPosition {
+                monitor_id: "MON-2-TARGET".into(),
+                rel_x: 0.0,
+                rel_y: 0.0,
+                dpi: 96,
+            },
+        );
+        let bars2 = resolve_launcher_bars(&cfg, &monitors, size_fn);
+        assert_eq!(bars2[0].y, 1002);
+        assert_eq!(bars2[1].x, 1920);
+        assert_eq!(bars2[1].y, 0);
+
+        // 4. SelectedMonitors shows only chosen monitor, falling back to primary if disconnected
+        cfg.bar_display_mode = BarDisplayMode::SelectedMonitors;
+        cfg.bar_monitor_ids = vec!["MON-2-TARGET".into()];
+        let bars3 = resolve_launcher_bars(&cfg, &monitors, size_fn);
+        assert_eq!(bars3.len(), 1);
+        assert_eq!(bars3[0].monitor_id, "MON-2-TARGET");
+
+        cfg.bar_monitor_ids = vec!["DISCONNECTED-MON".into()];
+        let bars4 = resolve_launcher_bars(&cfg, &monitors, size_fn);
+        assert_eq!(bars4.len(), 1);
+        assert_eq!(bars4[0].monitor_id, "MON-1-PRIMARY");
     }
 }

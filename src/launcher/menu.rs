@@ -15,6 +15,7 @@ pub enum MenuCommand {
     OpenSettings,
     ToggleOrientation,
     ResetPosition,
+    HideBarOnMonitor,
     SaveCurrentLayout,
     RestoreSavedLayout,
     LaunchMissingSceneApps,
@@ -32,6 +33,7 @@ const IDM_EXIT: usize = 2007;
 const IDM_CURSOR_POPUP: usize = 2008;
 const IDM_SHOW_WARNINGS: usize = 2009;
 const IDM_LAUNCH_MISSING_APPS: usize = 2010;
+const IDM_HIDE_THIS_BAR: usize = 2011;
 
 #[cfg(windows)]
 pub fn show_context_menu(
@@ -41,6 +43,7 @@ pub fn show_context_menu(
     current_orientation: Orientation,
     warning_count: usize,
     has_active_scene: bool,
+    can_hide_this_bar: bool,
 ) -> Option<MenuCommand> {
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -67,6 +70,14 @@ pub fn show_context_menu(
         };
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_TOGGLE_ORIENTATION, orient_label);
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_RESET_POSITION, w!("位置をリセット(&P)"));
+        if can_hide_this_bar {
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                IDM_HIDE_THIS_BAR,
+                w!("この画面の固定バーを隠す(&H)"),
+            );
+        }
 
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
         let active_flag = if has_active_scene {
@@ -124,6 +135,7 @@ pub fn show_context_menu(
             IDM_SETTINGS => Some(MenuCommand::OpenSettings),
             IDM_TOGGLE_ORIENTATION => Some(MenuCommand::ToggleOrientation),
             IDM_RESET_POSITION => Some(MenuCommand::ResetPosition),
+            IDM_HIDE_THIS_BAR => Some(MenuCommand::HideBarOnMonitor),
             IDM_SAVE_LAYOUT => Some(MenuCommand::SaveCurrentLayout),
             IDM_RESTORE_LAYOUT => Some(MenuCommand::RestoreSavedLayout),
             IDM_LAUNCH_MISSING_APPS => Some(MenuCommand::LaunchMissingSceneApps),
