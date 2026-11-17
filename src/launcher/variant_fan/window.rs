@@ -1,6 +1,8 @@
 //! Layered `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT` fan overlay rendered via GDI+ + `UpdateLayeredWindow`.
 
-use super::geometry::FanLayout;
+use super::geometry::{
+    FanLayout, PILL_DOT_CX_DIP, PILL_DOT_GAP_DIP, PILL_DOT_RADIUS_DIP, PILL_TEXT_RIGHT_PAD_DIP,
+};
 use crate::config::Scene;
 use crate::launcher::paint::{
     colors, draw_rounded_rect_border_gdiplus, fill_rounded_rect_gdiplus, GdiplusContext,
@@ -22,9 +24,10 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipDeleteStringFormat, GdipDrawArc, GdipDrawEllipse, GdipDrawLine, GdipDrawString,
     GdipFillEllipse, GdipMeasureString, GdipSetPenLineCap197819, GdipSetSmoothingMode,
     GdipSetStringFormatAlign, GdipSetStringFormatFlags, GdipSetStringFormatLineAlign,
-    GdipSetTextRenderingHint, GpBrush, GpFont, GpFontFamily, GpGraphics, GpPen, GpSolidFill,
-    GpStringFormat, LineCapRound, Ok as GpOk, RectF, SmoothingModeAntiAlias, StringAlignmentCenter,
-    StringAlignmentNear, StringFormatFlagsNoWrap, TextRenderingHintAntiAliasGridFit, UnitPixel,
+    GdipSetStringFormatTrimming, GdipSetTextRenderingHint, GpBrush, GpFont, GpFontFamily,
+    GpGraphics, GpPen, GpSolidFill, GpStringFormat, LineCapRound, Ok as GpOk, RectF,
+    SmoothingModeAntiAlias, StringAlignmentCenter, StringAlignmentNear, StringFormatFlagsNoWrap,
+    StringTrimmingEllipsisCharacter, TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -88,12 +91,15 @@ impl FontResources {
             let _ = GdipSetStringFormatFlags(format_left, StringFormatFlagsNoWrap.0);
             let _ = GdipSetStringFormatAlign(format_left, StringAlignmentNear);
             let _ = GdipSetStringFormatLineAlign(format_left, StringAlignmentCenter);
+            let _ = GdipSetStringFormatTrimming(format_left, StringTrimmingEllipsisCharacter);
         }
 
         let mut format_measure: *mut GpStringFormat = std::ptr::null_mut();
         let _ = GdipCreateStringFormat(0, 0, &mut format_measure);
         if !format_measure.is_null() {
             let _ = GdipSetStringFormatFlags(format_measure, StringFormatFlagsNoWrap.0);
+            let _ = GdipSetStringFormatAlign(format_measure, StringAlignmentNear);
+            let _ = GdipSetStringFormatLineAlign(format_measure, StringAlignmentCenter);
         }
 
         Some(Self {
@@ -216,6 +222,11 @@ impl VariantFanWindow {
             let ok = !mem_dc.is_invalid()
                 && GdipCreateFromHDC(mem_dc, &mut graphics) == GpOk
                 && !graphics.is_null();
+            if ok {
+                // Match the rendering hints used in `render` so glyph metrics align accurately.
+                let _ = GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+                let _ = GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAliasGridFit);
+            }
             let widths = scene
                 .variants
                 .iter()
@@ -230,25 +241,38 @@ impl VariantFanWindow {
                     let layout_rect = RectF {
                         X: 0.0,
                         Y: 0.0,
-                        Width: 600.0,
-                        Height: 100.0,
+                        Width: 4096.0,
+                        Height: 256.0,
                     };
-                    let mut bound = RectF::default();
-                    let status = GdipMeasureString(
+                    let mut bound_bold = RectF::default();
+                    let status_bold = GdipMeasureString(
                         graphics,
                         windows::core::PCWSTR(wide.as_ptr()),
                         wide.len() as i32,
                         fonts.font_bold,
                         &layout_rect,
                         fonts.format_measure,
-                        &mut bound,
+                        &mut bound_bold,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                     );
-                    if status == GpOk {
-                        bound.Width.ceil() as i32
-                    } else {
-                        (v.name.chars().count() as i32) * fallback_per_char
+                    let mut bound_reg = RectF::default();
+                    let status_reg = GdipMeasureString(
+                        graphics,
+                        windows::core::PCWSTR(wide.as_ptr()),
+                        wide.len() as i32,
+                        fonts.font_regular,
+                        &layout_rect,
+                        fonts.format_measure,
+                        &mut bound_reg,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                    match (status_bold == GpOk, status_reg == GpOk) {
+                        (true, true) => bound_bold.Width.max(bound_reg.Width).ceil() as i32,
+                        (true, false) => bound_bold.Width.ceil() as i32,
+                        (false, true) => bound_reg.Width.ceil() as i32,
+                        (false, false) => (v.name.chars().count() as i32) * fallback_per_char,
                     }
                 })
                 .collect();
@@ -446,7 +470,7 @@ impl VariantFanWindow {
         let radius = (8.0 * scale).max(5.0);
         let stroke = (1.2 * scale).max(1.0);
         let shadow_off = (2.0 * scale).max(1.5);
-        let dot_r = (3.0 * scale).max(2.2);
+        let dot_r = (PILL_DOT_RADIUS_DIP as f32 * scale).max(2.2);
 
         for item in &layout.items {
             let Some(variant) = scene.variants.get(item.index) else {
@@ -492,7 +516,7 @@ impl VariantFanWindow {
             );
 
             // Preferred indicator dot on left
-            let dot_cx = x + (10.0 * scale);
+            let dot_cx = x + (PILL_DOT_CX_DIP as f32 * scale);
             let dot_cy = y + ph / 2.0;
             let dot_color = if is_preferred {
                 if is_selected {
@@ -508,11 +532,11 @@ impl VariantFanWindow {
             fill_circle(graphics, dot_cx, dot_cy, dot_r, dot_color);
 
             if let Some(ref fonts) = self.fonts {
-                let text_left = dot_cx + dot_r + (6.0 * scale);
+                let text_left = dot_cx + dot_r + (PILL_DOT_GAP_DIP as f32 * scale);
                 let text_rect = RectF {
                     X: text_left,
                     Y: y,
-                    Width: (x + pw - (6.0 * scale) - text_left).max(10.0),
+                    Width: (x + pw - (PILL_TEXT_RIGHT_PAD_DIP as f32 * scale) - text_left).max(10.0),
                     Height: ph,
                 };
                 let wide: Vec<u16> = variant.name.encode_utf16().collect();
@@ -635,5 +659,98 @@ mod tests {
         assert!(win.visible);
         win.hide();
         assert!(!win.visible);
+    }
+
+    #[test]
+    fn variant_labels_fit_without_clipping_in_regular_and_bold() {
+        let mut scene = Scene::default();
+        for name in [
+            "Antigravity",
+            "codex",
+            "Codex",
+            "Claude Code",
+            "Cursor",
+            "日本語構成名",
+            "作業用 (メイン)",
+            "WWWWWWWWWW",
+            "fff",
+            "yyy",
+            "xxx",
+        ] {
+            scene.variants.push(SceneVariant {
+                id: name.into(),
+                name: name.into(),
+            });
+        }
+        let ctx = GdiplusContext::init();
+        let mut win = VariantFanWindow::create(ctx).unwrap();
+        let work = RectData {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let anchor = RectData {
+            left: 1000,
+            top: 1000,
+            right: 1040,
+            bottom: 1040,
+        };
+
+        for dpi in [96u32, 120, 144, 192] {
+            let widths = win.measure_label_widths(&scene, dpi);
+            let layout = FanLayout::compute(anchor, &widths, work, FanAxis::Vertical, dpi);
+            let fonts = win.fonts.as_ref().unwrap();
+            let scale = dpi as f32 / 96.0;
+            let dot_r = (PILL_DOT_RADIUS_DIP as f32 * scale).max(2.2);
+            let left_consumed = (PILL_DOT_CX_DIP as f32 * scale) + dot_r + (PILL_DOT_GAP_DIP as f32 * scale);
+            let right_consumed = PILL_TEXT_RIGHT_PAD_DIP as f32 * scale;
+
+            unsafe {
+                let mem_dc = CreateCompatibleDC(None);
+                let mut graphics: *mut GpGraphics = std::ptr::null_mut();
+                assert_eq!(GdipCreateFromHDC(mem_dc, &mut graphics), GpOk);
+                let _ = GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+                let _ = GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAliasGridFit);
+
+                for (i, v) in scene.variants.iter().enumerate() {
+                    let pw = layout.items[i].rect.width() as f32;
+                    let ph = layout.items[i].rect.height() as f32;
+                    let avail_w = (pw - left_consumed - right_consumed).max(10.0);
+                    let fit_rect = RectF {
+                        X: 0.0,
+                        Y: 0.0,
+                        Width: avail_w,
+                        Height: ph,
+                    };
+                    let wide: Vec<u16> = v.name.encode_utf16().collect();
+                    for (style, font) in [("regular", fonts.font_regular), ("bold", fonts.font_bold)] {
+                        let mut bound = RectF::default();
+                        let mut codepoints_fitted = 0i32;
+                        let status = GdipMeasureString(
+                            graphics,
+                            windows::core::PCWSTR(wide.as_ptr()),
+                            wide.len() as i32,
+                            font,
+                            &fit_rect,
+                            fonts.format_left,
+                            &mut bound,
+                            &mut codepoints_fitted,
+                            std::ptr::null_mut(),
+                        );
+                        assert_eq!(status, GpOk);
+                        assert_eq!(
+                            codepoints_fitted,
+                            wide.len() as i32,
+                            "dpi={dpi} style={style} name={:?} clipped ({codepoints_fitted}/{}) in avail_w={avail_w}",
+                            v.name,
+                            wide.len()
+                        );
+                    }
+                }
+                let _ = GdipDeleteGraphics(graphics);
+                let _ = DeleteDC(mem_dc);
+            }
+        }
     }
 }

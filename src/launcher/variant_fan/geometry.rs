@@ -37,7 +37,18 @@ pub struct FanLayout {
 const PILL_HEIGHT_DIP: i32 = 28;
 const PILL_MIN_WIDTH_DIP: i32 = 60;
 const PILL_MAX_WIDTH_DIP: i32 = 190;
-const PILL_HPAD_DIP: i32 = 24;
+pub(super) const PILL_DOT_CX_DIP: i32 = 10;
+pub(super) const PILL_DOT_RADIUS_DIP: i32 = 3;
+pub(super) const PILL_DOT_GAP_DIP: i32 = 6;
+pub(super) const PILL_TEXT_RIGHT_PAD_DIP: i32 = 6;
+// Keep a small buffer above the painted dot + margins (`25` DIP) so `dip_to_px` rounding
+// and GDI+ glyph overhang never clip the last character when bolded.
+const PILL_HPAD_SAFETY_DIP: i32 = 3;
+const PILL_HPAD_DIP: i32 = PILL_DOT_CX_DIP
+    + PILL_DOT_RADIUS_DIP
+    + PILL_DOT_GAP_DIP
+    + PILL_TEXT_RIGHT_PAD_DIP
+    + PILL_HPAD_SAFETY_DIP;
 const PILL_GAP_DIP: i32 = 6;
 const DEADZONE_RADIUS_DIP: i32 = 18;
 const FAN_RADIUS_DIP: i32 = 76;
