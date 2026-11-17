@@ -8,5 +8,6 @@ pub mod overflow;
 pub mod paint;
 #[cfg(windows)]
 mod shortcuts;
+pub mod topmost_guard;
 pub mod variant_fan;
 pub mod window;

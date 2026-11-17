@@ -25,12 +25,19 @@ use crate::launcher::input::{
 use crate::launcher::menu::{show_context_menu, MenuCommand};
 use crate::launcher::overflow::{OverflowPopup, WM_APP_OVERFLOW_SELECT};
 use crate::launcher::paint::{paint_launcher, GdiThemeCache, PaintState};
+use crate::launcher::topmost_guard::{
+    inspect_topmost_status, raise_launcher_to_topmost, GuardDecision, TopmostGuard,
+    TOPMOST_DEBOUNCE_MS,
+};
 use crate::launcher::variant_fan::{FanAxis, FanOutcome, VariantFanHost, HOLD_OPEN_DELAY_MS};
 use crate::platform::cursor_input::{
     CursorInput, WM_APP_CANCEL_VARIANT_FAN, WM_APP_CURSOR_POPUP_KEY, WM_APP_CURSOR_POPUP_WHEEL,
     WM_APP_DISMISS_CURSOR_POPUP, WM_APP_SHOW_CURSOR_POPUP,
 };
-use crate::platform::hooks::{WinEventHookGuard, WM_APP_WINEVENT};
+use crate::platform::hooks::{
+    take_foreground_change_pending, ForegroundHookGuard, WinEventHookGuard,
+    WM_APP_FOREGROUND_CHANGED, WM_APP_WINEVENT,
+};
 use crate::platform::monitors::{dip_to_px, find_monitor_for_point};
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
 use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
@@ -52,6 +59,7 @@ pub const WM_APP_OPEN_SETTINGS: u32 = 0x8000 + 4; // WM_APP + 4
 const TIMER_VERIFY_SWITCH: usize = 101;
 const TIMER_DISPLAY_DEBOUNCE: usize = 102;
 const TIMER_VARIANT_HOLD: usize = 103;
+const TIMER_TOPMOST_CHECK: usize = 104;
 const HOTKEY_BASE_ID: i32 = 4000;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -84,6 +92,8 @@ pub struct LauncherWindowHost {
     bar_wheel: SceneWheel,
     pub tray: Option<TrayIcon>,
     pub win_event_hook: Option<WinEventHookGuard>,
+    pub foreground_hook: Option<ForegroundHookGuard>,
+    topmost_guard: TopmostGuard,
     pub registered_hotkey_count: usize,
 }
 
@@ -211,6 +221,8 @@ impl LauncherWindowHost {
                 bar_wheel: SceneWheel::default(),
                 tray,
                 win_event_hook,
+                foreground_hook: None,
+                topmost_guard: TopmostGuard::new(),
                 registered_hotkey_count: 0,
             });
 
@@ -320,6 +332,81 @@ impl LauncherWindowHost {
         failed_scenes
     }
 
+    fn sync_foreground_hook(&mut self) {
+        let should_hook = self.app.config.launcher.always_on_top && self.app.config.launcher.show_bar;
+        if should_hook {
+            if self.foreground_hook.is_none() {
+                self.foreground_hook = ForegroundHookGuard::install(self.hwnd);
+            }
+        } else {
+            self.foreground_hook = None;
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                    Some(self.hwnd),
+                    TIMER_TOPMOST_CHECK,
+                );
+            }
+        }
+    }
+
+    fn schedule_topmost_check(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+        if !self.app.config.launcher.always_on_top
+            || !self.app.config.launcher.show_bar
+            || self.topmost_guard.is_paused()
+            || self.drag_state.is_some()
+        {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_TOPMOST_CHECK);
+            let _ = SetTimer(
+                Some(self.hwnd),
+                TIMER_TOPMOST_CHECK,
+                TOPMOST_DEBOUNCE_MS as u32,
+                None,
+            );
+        }
+    }
+
+    fn ensure_topmost_if_needed(&mut self, reset_guard: bool) {
+        if reset_guard {
+            self.topmost_guard.on_user_interaction();
+        }
+        if !self.app.config.launcher.always_on_top
+            || !self.app.config.launcher.show_bar
+            || self.drag_state.is_some()
+        {
+            return;
+        }
+        let status = inspect_topmost_status(self.hwnd, std::process::id());
+        let now_ms = crate::diagnostics::current_unix_ms();
+        match self.topmost_guard.evaluate(now_ms, status) {
+            GuardDecision::NoOp => {}
+            GuardDecision::RaiseToTopmost => {
+                self.applying_bounds = true;
+                let ok = raise_launcher_to_topmost(self.hwnd);
+                self.applying_bounds = false;
+                if ok {
+                    log_info("launcher", "Re-asserted launcher HWND_TOPMOST after obstruction");
+                }
+            }
+            GuardDecision::PausedEntered {
+                blocker_hwnd,
+                blocker_class,
+                conflicts,
+            } => {
+                log_warn(
+                    "launcher",
+                    &format!(
+                        "Paused topmost re-assertion after {conflicts} consecutive conflicts with '{blocker_class}' (hwnd=0x{blocker_hwnd:X})"
+                    ),
+                );
+            }
+        }
+    }
+
     fn apply_launcher_settings(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
 
@@ -343,6 +430,10 @@ impl LauncherWindowHost {
             SW_HIDE
         };
         unsafe { let _ = ShowWindow(self.hwnd, command); }
+        self.sync_foreground_hook();
+        if self.app.config.launcher.show_bar && self.app.config.launcher.always_on_top {
+            self.ensure_topmost_if_needed(true);
+        }
     }
 
     fn toggle_cursor_popup(&mut self) {
@@ -680,6 +771,7 @@ impl LauncherWindowHost {
                     if retry.verification.is_some() {
                         self.schedule_switch_verification();
                     }
+                    self.ensure_topmost_if_needed(true);
                 }
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
@@ -694,6 +786,7 @@ impl LauncherWindowHost {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
+        self.ensure_topmost_if_needed(true);
     }
 
     fn schedule_switch_verification(&self) {
@@ -923,11 +1016,12 @@ unsafe extern "system" fn launcher_wndproc(
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
         SetCursor, SetTimer, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_SIZEALL, MA_NOACTIVATE,
-        WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-        WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP,
-        WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONDOWN,
-        WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WM_WTSSESSION_CHANGE,
+        SWP_NOZORDER, WINDOWPOS, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+        WM_DPICHANGED, WM_ENDSESSION, WM_EXITSIZEMOVE, WM_HOTKEY, WM_LBUTTONDBLCLK,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_NCLBUTTONDBLCLK, WM_NCRBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_POWERBROADCAST,
+        WM_QUERYENDSESSION, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
+        WM_WINDOWPOSCHANGED, WM_WTSSESSION_CHANGE,
     };
 
     // Per Section 7.1: Catch any Rust panic at the FFI boundary to prevent immediate process abort
@@ -1046,6 +1140,7 @@ unsafe extern "system" fn launcher_wndproc(
 
             // Section 2.2: Start custom drag only when clicking on the dedicated grip area
             WM_LBUTTONDOWN => {
+                host.topmost_guard.on_user_interaction();
                 host.hide_tooltip();
                 if host.variant_fan.is_sticky() {
                     let mut cursor_pt = POINT::default();
@@ -1431,6 +1526,23 @@ unsafe extern "system" fn launcher_wndproc(
                 LRESULT(0)
             }
 
+            WM_APP_FOREGROUND_CHANGED => {
+                if take_foreground_change_pending() {
+                    host.schedule_topmost_check();
+                }
+                LRESULT(0)
+            }
+
+            WM_WINDOWPOSCHANGED => {
+                if !host.applying_bounds && host.drag_state.is_none() && lparam.0 != 0 {
+                    let wp = &*(lparam.0 as *const WINDOWPOS);
+                    if (wp.flags.0 & SWP_NOZORDER.0) == 0 {
+                        host.schedule_topmost_check();
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+
             WM_APP_TRAYICON => {
                 let mouse_msg = (lparam.0 & 0xFFFF) as u32;
                 if mouse_msg == WM_LBUTTONUP {
@@ -1567,11 +1679,17 @@ unsafe extern "system" fn launcher_wndproc(
                         if !new_warnings.is_empty() {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
+                        host.ensure_topmost_if_needed(false);
                     }
                     TIMER_DISPLAY_DEBOUNCE => {
                         let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
                         let (x, y, w, h) = host.app.resolve_initial_or_updated_launcher_rect();
                         host.apply_window_bounds(x, y, w, h);
+                        host.topmost_guard.on_user_interaction();
+                    }
+                    TIMER_TOPMOST_CHECK => {
+                        let _ = KillTimer(Some(hwnd), TIMER_TOPMOST_CHECK);
+                        host.ensure_topmost_if_needed(false);
                     }
                     TIMER_VARIANT_HOLD => {
                         let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
