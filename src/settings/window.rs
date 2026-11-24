@@ -27,7 +27,7 @@ use windows::{
     core::{w, Error as WinError, Interface as _, Result as WinResult, HSTRING, PCWSTR, PWSTR},
     Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Win32::Graphics::{
-        Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
+        Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Gdi::*,
     },
     Win32::System::{
@@ -227,6 +227,7 @@ struct SettingsPalette {
     background: COLORREF,
     text: COLORREF,
     dark_title_bar: bool,
+    high_contrast: bool,
 }
 
 impl SettingsPalette {
@@ -249,19 +250,23 @@ impl SettingsPalette {
                 background: COLORREF(GetSysColor(COLOR_WINDOW)),
                 text: COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
                 dark_title_bar: false,
+                high_contrast: true,
             }
         } else if dark {
-            // Match --surface and --text in settings.css. COLORREF stores bytes in BGR order.
+            // Match --bg-chrome (#151517) and --text (#f3f3f6) in settings.css. COLORREF is BGR.
             Self {
-                background: COLORREF(0x31_26_20),
-                text: COLORREF(0xfa_f3_f0),
+                background: COLORREF(0x17_15_15),
+                text: COLORREF(0xf6_f3_f3),
                 dark_title_bar: true,
+                high_contrast: false,
             }
         } else {
+            // Match --bg-chrome (#f2f2f5) and --text (#18181b) in settings.css. COLORREF is BGR.
             Self {
-                background: COLORREF(0xff_ff_ff),
-                text: COLORREF(0x38_25_19),
+                background: COLORREF(0xf5_f2_f2),
+                text: COLORREF(0x1b_18_18),
                 dark_title_bar: false,
+                high_contrast: false,
             }
         }
     }
@@ -288,6 +293,18 @@ impl SettingsPalette {
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             (&dark as *const i32).cast(),
             std::mem::size_of_val(&dark) as u32,
+        );
+        // Blend Windows 11 caption bar seamlessly with the chrome sidebar background.
+        let caption = if self.high_contrast {
+            0xFFFF_FFFFu32 // DWMWA_COLOR_DEFAULT
+        } else {
+            self.background.0
+        };
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            (&caption as *const u32).cast(),
+            std::mem::size_of_val(&caption) as u32,
         );
     }
 
@@ -1080,8 +1097,8 @@ unsafe fn work_area(monitor: HMONITOR) -> Option<RECT> {
 
 unsafe fn window_size(dpi: u32, area: RECT) -> (i32, i32) {
     let mut outer = RECT {
-        right: dip_to_px(960, dpi),
-        bottom: dip_to_px(620, dpi),
+        right: dip_to_px(980, dpi),
+        bottom: dip_to_px(640, dpi),
         ..Default::default()
     };
     let _ = AdjustWindowRectExForDpi(&mut outer, SETTINGS_STYLE, false, WS_EX_APPWINDOW, dpi);

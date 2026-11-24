@@ -39,7 +39,30 @@ const iconPaths = {
   star: 'm12 3 2.8 5.6 6.2.9-4.5 4.4 1 6.2-5.5-2.9-5.5 2.9 1-6.2L3 9.5l6.2-.9z',
   grip: 'M9 7h.01m6 0h.01M9 12h.01m6 0h.01M9 17h.01m6 0h.01',
   more: 'M5 12h.01m7 0h.01m7 0h.01',
+  search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm10 2-4.35-4.35',
+  close: 'M18 6 6 18M6 6l12 12',
+  sparkle: 'm12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z',
+  upload: 'M12 15V4m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2',
+  download: 'M12 4v11m0 0-4-4m4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2',
 };
+
+const searchIndex = [
+  { page: 'scenes', pageLabel: 'シーン', block: 'scenes-select', title: 'シーンの作成・選択', keywords: 'シーン 作成 追加 名前 アイコン 作業 切替' },
+  { page: 'scenes', pageLabel: 'シーン', block: 'scene-target', title: 'シーンごとに切り替える画面', keywords: 'シーン 画面 モニター ディスプレイ 対象 切替' },
+  { page: 'scenes', pageLabel: 'シーン', block: 'scene-variants', title: 'ウィンドウ構成と登録アプリ', keywords: '構成 バリアント ウィンドウ 追加 共通 切替の影響 プレビュー' },
+  { page: 'scenes', pageLabel: 'シーン', block: 'all-bindings', details: 'binding-details', title: '登録済みウィンドウを管理', keywords: '登録済み ウィンドウ 管理 共有 再起動 ルール 候補 常時表示' },
+  { page: 'launcher', pageLabel: 'ランチャー', block: 'launcher-triggers', title: '固定バー・Ctrl の 2 回押し', keywords: '固定バー ctrl 二度押し 2回 呼び出し カーソル トレイ' },
+  { page: 'launcher', pageLabel: 'ランチャー', block: 'launcher-monitors', title: '固定バーを表示する画面', keywords: '固定バー 画面 モニター マルチバー 複数 表示モード' },
+  { page: 'launcher', pageLabel: 'ランチャー', block: 'launcher-appearance', title: '固定バーの向き・開く位置', keywords: '横向き 縦向き 向き ポップアップ カーソル 位置 プレビュー 外観' },
+  { page: 'launcher', pageLabel: 'ランチャー · サイズ・挙動', block: 'launcher-advanced', details: 'launcher-details', title: '固定バーの詳細設定', keywords: 'ボタン 大きさ サイズ つまみ 最大件数 手前 最前面 吸着 スナップ ホイール 一巡 位置 初期化 リセット' },
+  { page: 'behavior', pageLabel: 'ウィンドウの動作', block: 'behavior-monitors', title: '切り替える画面の共通設定', keywords: '共通 画面 モニター 接続 確認 対象 選び方' },
+  { page: 'behavior', pageLabel: 'ウィンドウの動作', block: 'behavior-options', title: '最小化復元・フォーカス・自動起動', keywords: '最小化 再表示 入力 フォーカス 自動起動 サインイン windows スタートアップ' },
+  { page: 'shortcuts', pageLabel: 'ショートカット', block: 'shortcuts-hotkeys', title: 'シーンを切り替えるキー', keywords: 'ホットキー キーボード ショートカット グローバル 切替キー' },
+  { page: 'shortcuts', pageLabel: 'ショートカット', block: 'shortcuts-items', title: 'ランチャーから開く項目', keywords: 'フォルダー ファイル サイト url ショートカット 追加 編集' },
+  { page: 'backup', pageLabel: 'バックアップ・復旧', block: 'backup-recovery', title: 'ウィンドウを復元', keywords: '復元 復旧 最小化 リカバリー 元に戻す' },
+  { page: 'backup', pageLabel: 'バックアップ・復旧', block: 'backup-transfer', title: '設定の書き出し・読み込み', keywords: 'エクスポート インポート 書き出す 読み込む バックアップ 引き継ぎ 保存先 フォルダ' },
+  { page: 'backup', pageLabel: 'バックアップ・復旧', block: 'backup-logs', details: 'log-details', title: '診断ログの詳細記録', keywords: '診断 ログ ウィンドウ名 省略 詳細 デバッグ' },
+];
 
 function icon(name) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -75,7 +98,10 @@ function button(label, action, { css = '', glyph, edit = false, disabled = false
 }
 
 function field(label, control, hint) {
-  return el('label', 'field', el('span', '', label), control, hint ? el('small', '', hint) : null);
+  const wrapped = control instanceof HTMLSelectElement
+    ? el('span', 'select-wrap', control, el('span', 'select-chevron', icon('down')))
+    : control;
+  return el('label', 'field', el('span', 'field-label', label), wrapped, hint ? el('small', '', hint) : null);
 }
 function input(value = '', name = '') {
   const node = el('input');
@@ -100,8 +126,8 @@ function setOptions(node, items, value) {
   node.replaceChildren(...items.map(([id, name]) => new Option(name, id)));
   node.value = value;
 }
-function badge(name, neutral = false) {
-  return el('span', 'icon-box' + (neutral ? ' neutral' : ''), icon(name));
+function badge(name, variant = '') {
+  return el('span', 'icon-box' + (variant ? ' ' + variant : ''), icon(name));
 }
 function appIcon(name) {
   if (/terminal/i.test(name)) return 'terminal';
@@ -112,7 +138,7 @@ function appIcon(name) {
   return 'panel';
 }
 function rowIdentity(app, title, glyph = appIcon(app)) {
-  return el('div', 'inline', badge(glyph, true), el('span', 'identity',
+  return el('div', 'inline', badge(glyph, 'neutral'), el('span', 'identity',
     el('strong', '', app), title ? el('small', '', title) : null));
 }
 
@@ -188,6 +214,7 @@ function redraw() {
   if (!state) return;
   const focusKey = document.activeElement?.dataset.focus;
   sceneId = state.scenes.some((scene) => scene.id === sceneId) ? sceneId : state.scenes[0]?.id;
+  renderNavBadges();
   // Offscreen pages are populated when opened, using the latest settings state.
   switch (visited) {
     case 'scenes': renderScenes(); break;
@@ -204,6 +231,27 @@ function redraw() {
     const control = typeof restore === 'string'
       ? [...root.querySelectorAll('[data-focus]')].find((node) => node.dataset.focus === restore) : restore;
     control?.focus({ preventScroll: true });
+  }
+}
+
+function renderNavBadges() {
+  const scenesBadge = byId('nav-badge-scenes');
+  if (scenesBadge) {
+    scenesBadge.textContent = String(state.scenes.length);
+    scenesBadge.hidden = state.scenes.length === 0;
+  }
+  const launcherBadge = byId('nav-badge-launcher');
+  if (launcherBadge) {
+    const active = state.launcher.show_bar || state.launcher.ctrl_double_tap;
+    launcherBadge.textContent = active ? '有効' : 'トレイ';
+    launcherBadge.className = 'nav-badge ' + (active ? 'good' : 'warn');
+    launcherBadge.hidden = false;
+  }
+  const shortcutsBadge = byId('nav-badge-shortcuts');
+  if (shortcutsBadge) {
+    const total = state.shortcuts.length + state.scenes.filter((s) => s.hotkey).length;
+    shortcutsBadge.textContent = String(total);
+    shortcutsBadge.hidden = total === 0;
   }
 }
 
@@ -263,13 +311,16 @@ function renderScenes() {
     for (const id of binding.scenes) byScene.get(id)?.push(binding);
   }
   byId('scene-list').replaceChildren(...state.scenes.map((scene) => {
-    const selected = scene.id === sceneId;
+    const isSelected = scene.id === sceneId;
     const count = byScene.get(scene.id).length;
     const detail = scene.variants.length ? scene.variants.length + ' 構成' : count + ' ウィンドウ';
     const item = button('', () => { sceneId = scene.id; redraw(); }, { focus: 'scene:' + scene.id });
-    item.setAttribute('aria-pressed', String(selected));
-    item.replaceChildren(badge(scene.icon, !selected), el('span', 'identity', el('strong', '', scene.name), el('small', '', detail)),
-      selected ? el('span', 'check', icon('check')) : el('span'));
+    item.setAttribute('aria-pressed', String(isSelected));
+    item.replaceChildren(...[
+      badge(scene.icon, isSelected ? 'active-scene' : 'neutral'),
+      el('span', 'identity', el('strong', '', scene.name), el('small', '', detail)),
+      isSelected ? el('span', 'check', icon('check')) : null,
+    ].filter(Boolean));
     return item;
   }));
   const scene = selected();
@@ -340,30 +391,66 @@ function bindingRow(binding, scene, variant) {
   const target = scene?.target || state.target;
   const outside = scene && binding.monitor_id && target.monitor_policy !== 'all_monitors'
     && binding.monitor_id !== scene.effective_monitor;
-  const status = [...new Set([
-    ...(!binding.enabled ? ['無効'] : []),
-    ...(binding.always ? ['常に表示'] : []),
-    ...(binding.scenes.length > 1 ? ['他のシーンと共有'] : []),
-    ...(outside ? ['切り替える画面の外'] : []),
-    ...binding.warnings,
-  ])];
+  const tags = [];
+  const seen = new Set();
+  const pushTag = (text, tone = '') => {
+    if (!seen.has(text)) {
+      seen.add(text);
+      tags.push([text, tone]);
+    }
+  };
+  if (!binding.enabled) pushTag('無効', 'warn');
+  if (binding.always) pushTag('常に表示', 'good');
+  if (binding.scenes.length > 1) pushTag('他のシーンと共有');
+  if (outside) pushTag('切り替える画面の外', 'warn');
+  for (const warning of binding.warnings) pushTag(warning, 'warn');
+
   const controls = el('div', 'actions',
-    ...status.map((text) => el('span', 'tag', text)),
+    ...tags.map(([text, tone]) => el('span', 'tag' + (tone ? ' ' + tone : ''), text)),
     button(binding.ambiguous.length ? '候補を確認' : '詳細', () => openBinding(binding), {
-      css: 'quiet', aria: binding.app + ' の詳細', focus: 'binding:' + (scene?.id || '-') + ':' + binding.id,
+      css: binding.ambiguous.length ? 'secondary sm' : 'quiet sm',
+      aria: binding.app + ' の詳細',
+      focus: 'binding:' + (scene?.id || '-') + ':' + binding.id,
     }),
     variant ? button('共通にする', () => act('share_in_scene', { scene: scene.id, id: binding.id }), {
-      css: 'quiet', edit: true, aria: binding.app + ' をどの構成でも使う',
+      css: 'quiet sm', edit: true, aria: binding.app + ' をどの構成でも使う',
     }) : null,
     scene ? button('外す', () => act('remove_from_scene', { scene: scene.id, variant: variant?.id, id: binding.id }, () => {
       const add = byId(!variant && scene.variants.length ? 'add-common-windows' : 'add-windows');
       queueMicrotask(() => add.focus({ preventScroll: true }));
-    }), { css: 'quiet', edit: true, aria: binding.app + ' を' + (variant?.name || scene.name) + 'から外す' }) : null);
+    }), { css: 'quiet sm danger-hover', edit: true, aria: binding.app + ' を' + (variant?.name || scene.name) + 'から外す' }) : null);
   return el('li', 'row labelled-row', rowIdentity(binding.app, description), controls);
 }
 
 const launcherFields = ['show_bar','ctrl_double_tap','orientation','cursor_popup_position','button_size_dip',
   'grip_size_dip','visible_slots','always_on_top','snap_to_edges','wheel_wrap','bar_display_mode'];
+
+function syncVisualChoice(fieldId, value) {
+  document.querySelectorAll('[data-choice-field="' + fieldId + '"]').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(btn.dataset.choiceValue === value));
+  });
+}
+
+function updateSliderFill(range) {
+  const min = Number(range.min);
+  const max = Number(range.max);
+  const val = Number(range.value);
+  const pct = max > min ? ((val - min) / (max - min)) * 100 : 0;
+  range.style.setProperty('--pct', Math.max(0, Math.min(100, pct)) + '%');
+}
+
+function syncSliders() {
+  document.querySelectorAll('[data-range-for]').forEach((range) => {
+    const target = byId(range.dataset.rangeFor);
+    if (!target) return;
+    const val = Number(target.value);
+    if (Number.isFinite(val)) {
+      range.value = String(Math.max(Number(range.min), Math.min(Number(range.max), val)));
+    }
+    updateSliderFill(range);
+  });
+}
+
 function renderLauncher() {
   const cfg = state.launcher;
   launcherFields.forEach((id) => {
@@ -371,6 +458,10 @@ function renderLauncher() {
     if (node.type === 'checkbox') node.checked = cfg[id];
     else if (!(invalidLauncher && node.type === 'number')) node.value = cfg[id];
   });
+  syncVisualChoice('orientation', cfg.orientation);
+  syncVisualChoice('cursor_popup_position', cfg.cursor_popup_position);
+  syncSliders();
+
   byId('tray-hint').hidden = cfg.show_bar || cfg.ctrl_double_tap;
   byId('bar-monitors-band').hidden = !cfg.show_bar;
   if (cfg.show_bar) renderLauncherMonitors();
@@ -421,6 +512,7 @@ function renderLauncherMonitors() {
 
   if (!monitors.length) {
     map.replaceChildren(el('small', '', '接続されている画面はありません。'));
+    map.style.width = '';
     map.style.height = '';
     return;
   }
@@ -430,7 +522,7 @@ function renderLauncherMonitors() {
   const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
   const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
   const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
-  const maxWidth = map.clientWidth || 230;
+  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 24) : (map.clientWidth || 230);
   const scale = Math.min(maxWidth / width, 96 / height);
 
   map.replaceChildren(...monitors.map((m) => {
@@ -456,18 +548,21 @@ function renderLauncherMonitors() {
     item.title = label + primary + (m.name ? ' — ' + m.name : '');
     item.style.left = (rect.left - minX) * scale + 'px';
     item.style.top = (rect.top - minY) * scale + 'px';
-    item.style.width = Math.max(1, (rect.right - rect.left) * scale - 3) + 'px';
-    item.style.height = Math.max(1, (rect.bottom - rect.top) * scale - 3) + 'px';
+    item.style.width = Math.max(1, (rect.right - rect.left) * scale - 4) + 'px';
+    item.style.height = Math.max(1, (rect.bottom - rect.top) * scale - 4) + 'px';
     return item;
   }));
+  map.style.width = Math.max(1, width * scale) + 'px';
   map.style.height = Math.max(70, height * scale) + 'px';
 }
 
 function renderBehavior() {
   const all = state.target.monitor_policy === 'all_monitors';
+  const missing = !all && !state.monitors.some((m) => m.id === state.effective_monitor);
   setOptions(byId('target'), targetOptions(state.target), targetOption(state.target));
-  byId('monitor-hint').textContent = !all && !state.monitors.some((m) => m.id === state.effective_monitor)
-    ? missingMonitor : 'シーンで「共通設定を使う」を選ぶと、この設定が適用されます。';
+  const hint = byId('monitor-hint');
+  hint.textContent = missing ? missingMonitor : 'シーンで「共通設定を使う」を選ぶと、この設定が適用されます。';
+  hint.className = missing ? 'notice' : '';
   byId('setup-next-row').hidden = !setup;
   byId('restore').checked = state.launcher.restore_all_on_switch;
   byId('focus').checked = state.launcher.focus_on_switch;
@@ -482,6 +577,7 @@ function renderMonitors(map, scene) {
   const monitors = state.monitors;
   if (!monitors.length) {
     map.replaceChildren(el('small', '', '接続されている画面はありません。'));
+    map.style.width = '';
     map.style.height = '';
     return;
   }
@@ -489,8 +585,8 @@ function renderMonitors(map, scene) {
   const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
   const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
   const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
-  const maxWidth = map.clientWidth || 230;
-  const scale = Math.min(maxWidth / width, (scene ? 76 : 116) / height);
+  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 24) : (map.clientWidth || 230);
+  const scale = Math.min(maxWidth / width, (scene ? 80 : 112) / height);
   map.replaceChildren(...monitors.map((m) => {
     const rect = m.rect;
     const label = '画面 ' + m.number;
@@ -502,10 +598,11 @@ function renderMonitors(map, scene) {
     item.title = label + primary + (m.name ? ' — ' + m.name : '');
     item.style.left = (rect.left - minX) * scale + 'px';
     item.style.top = (rect.top - minY) * scale + 'px';
-    item.style.width = Math.max(1, (rect.right - rect.left) * scale - 3) + 'px';
-    item.style.height = Math.max(1, (rect.bottom - rect.top) * scale - 3) + 'px';
+    item.style.width = Math.max(1, (rect.right - rect.left) * scale - 4) + 'px';
+    item.style.height = Math.max(1, (rect.bottom - rect.top) * scale - 4) + 'px';
     return item;
   }));
+  map.style.width = Math.max(1, width * scale) + 'px';
   map.style.height = Math.max(70, height * scale) + 'px';
 }
 
@@ -524,19 +621,26 @@ const mods = [[2,'Ctrl'],[1,'Alt'],[4,'Shift'],[8,'Win']];
 function keyName(key) {
   return keys.find(([code]) => code === key)?.[1] || 'キー ' + key.toString(16).toUpperCase();
 }
-function hotkeyLabel(hotkey) {
-  return hotkey ? [...mods.filter(([mask]) => mask & hotkey.mods).map(([, name]) => name), keyName(hotkey.key)].join(' + ') : '未設定';
+function hotkeyBadge(hotkey) {
+  if (!hotkey) return el('span', 'keycap-empty', '未設定');
+  const parts = [...mods.filter(([mask]) => mask & hotkey.mods).map(([, name]) => name), keyName(hotkey.key)];
+  const nodes = [];
+  parts.forEach((part, index) => {
+    if (index > 0) nodes.push(el('span', 'keycap-plus', '+'));
+    nodes.push(el('kbd', 'keycap', part));
+  });
+  return el('span', 'keycap-group', ...nodes);
 }
 function renderShortcuts() {
   byId('hotkeys').replaceChildren(...(state.scenes.length ? state.scenes.map((scene) =>
     el('li', 'row labelled-row', rowIdentity(scene.name, null, scene.icon), el('div', 'actions',
-      el('kbd', 'tag', hotkeyLabel(scene.hotkey)),
-      button('設定', () => openHotkey(scene), { css: 'quiet', edit: true, aria: scene.name + 'に切り替えるキーを設定', focus: 'hk:' + scene.id }))))
+      hotkeyBadge(scene.hotkey),
+      button('設定', () => openHotkey(scene), { css: 'quiet sm', edit: true, aria: scene.name + 'に切り替えるキーを設定', focus: 'hk:' + scene.id }))))
     : [el('li', 'empty', 'シーンを作ると、切替キーを設定できます。')]));
   byId('shortcut-list').replaceChildren(...(state.shortcuts.length ? state.shortcuts.map((item, index) =>
     el('li', 'row labelled-row', rowIdentity(item.name, item.target, item.kind === 'website' ? 'globe' : item.kind),
       el('div', 'actions', el('span', 'tag', kinds.find(([id]) => id === item.kind)?.[1]),
-        button('編集', () => openShortcut(index), { css: 'quiet', edit: true, aria: item.name + ' を編集', focus: 'shortcut:' + index }))))
+        button('編集', () => openShortcut(index), { css: 'quiet sm', edit: true, aria: item.name + ' を編集', focus: 'shortcut:' + index }))))
     : [el('li', 'empty', 'フォルダー、ファイル、サイトをここから追加できます。')]));
 }
 
@@ -586,7 +690,8 @@ function openCreate() {
   if (pending || state.read_only) return;
   const name = input('', 'name');
   name.required = true;
-  openDialog('シーンを作る', '例：開発、調べもの、会議', field('シーン名', name), '作成', () =>
+  name.placeholder = '例：開発、調べもの、会議';
+  openDialog('シーンを作る', '作業ごとに表示するウィンドウをまとめます。', field('シーン名', name), '作成', () =>
     applyDialog('create_scene', { name: name.value }, ({ scene }) => {
       sceneId = scene;
       queueMicrotask(() => byId('add-windows').focus());
@@ -607,7 +712,7 @@ function openSceneDetails() {
   const choose = button('ファイルを選ぶ…', runDialogAction(async () => {
     const result = await request('browse', { kind: 'image' });
     if (result?.path) { path.value = result.path; presets.value = 'custom'; imageField.hidden = false; }
-  }), { edit: true });
+  }), { css: 'secondary sm', edit: true });
   const imageField = el('div', 'stack', field('アイコンのファイル', path), el('div', 'actions', choose));
   imageField.hidden = builtIn;
   presets.addEventListener('change', () => { imageField.hidden = presets.value !== 'custom'; });
@@ -617,10 +722,10 @@ function openSceneDetails() {
     el('p', '', scene.layouts ? scene.layouts + ' 画面分の配置があります。' : '保存された配置はありません。'),
     scene.layouts ? el('div', 'actions', button('保存した配置を削除', () => confirm('保存した配置を削除しますか？',
       'シーンのウィンドウ登録はそのままです。', '配置を削除', () =>
-        applyDialog('delete_layout', { id: scene.id })), { edit: true })) : null);
+        applyDialog('delete_layout', { id: scene.id })), { css: 'secondary sm', edit: true })) : null);
   const remove = el('div', 'actions', button('シーンを削除', () => confirm('「' + scene.name + '」を削除しますか？',
     'このシーンの切替キーと保存した配置も削除されます。ほかのシーンに共有したウィンドウは残ります。', 'シーンを削除',
-    () => applyDialog('delete_scene', { id: scene.id })), { css: 'danger', edit: true }));
+    () => applyDialog('delete_scene', { id: scene.id })), { css: 'danger sm', edit: true }));
   for (const ctrl of [name, presets, pinned, order]) ctrl.disabled = state.read_only;
   openDialog('シーンの詳細設定', '', [field('シーン名', name), field('アイコン', presets), imageField, pin, field('表示の順番', order), layouts, remove],
     '編集に反映', state.read_only ? undefined : () => applyDialog('edit_scene', {
@@ -645,7 +750,7 @@ function openVariantEditor(edit) {
         editedVariants.delete(scene.id);
         queueMicrotask(() => byId('create-variant').focus({ preventScroll: true }));
       }));
-  }, { css: 'danger', edit: true })) : null;
+  }, { css: 'danger sm', edit: true })) : null;
   openDialog(variant ? '構成の設定' : '構成を追加',
     original ? '登録済みのウィンドウは元の構成に引き継ぎます。' : '', [
       ...(original ? [field('元の構成名', original)] : []),
@@ -672,6 +777,7 @@ async function openWindowPicker(common = false) {
     const list = el('div');
     const search = el('input');
     search.type = 'search';
+    search.placeholder = 'アプリ名・タイトル・画面番号で絞り込み…';
     const normalized = (text) => text.normalize('NFKC').toLowerCase().replace(/画面\s*(\d+)/g, '画面$1');
     const rows = [];
     const chosen = [];
@@ -753,7 +859,7 @@ function openBinding(binding) {
   const monitorChoices = [['', '画面を問わない'], ...state.monitors.map((m) => [m.id, '画面 ' + m.number + (m.name ? ' — ' + m.name : '')])];
   if (binding.monitor && !state.monitors.some((m) => m.id === binding.monitor)) monitorChoices.push([binding.monitor, '未接続の画面（現在の設定）']);
   const monitor = select(monitorChoices, binding.monitor || '');
-  const rules = el('details', '', el('summary', '', '再起動後に見分ける条件'), el('div', 'stack',
+  const rules = el('details', '', el('summary', '', el('span', '', '再起動後に見分ける条件'), icon('down')), el('div', 'stack',
     field('ウィンドウ名の条件', type), condition, field('登録したウィンドウを探す画面', monitor),
     el('p', '', '名前には口座番号などが含まれる場合があります。必要な文字だけを設定してください。')));
   const updateRule = () => { condition.hidden = type.value === 'any'; value.required = !condition.hidden; };
@@ -762,14 +868,14 @@ function openBinding(binding) {
   for (const ctrl of [type, value, monitor, isAlways, isEnabled]) ctrl.disabled = readOnly;
   const ambiguity = el('div', 'stack');
   if (binding.ambiguous.length) {
-    ambiguity.append(el('p', 'notice', '一致するウィンドウが複数あります。確認できるまで、この登録は切替で操作しません。'));
+    ambiguity.append(el('p', 'callout warn', '一致するウィンドウが複数あります。確認できるまで、この登録は切替で操作しません。'));
     if (!readOnly) {
-      ambiguity.append(button('対象のウィンドウを選ぶ', () => chooseCandidate(binding), { css: 'quiet' }));
+      ambiguity.append(el('div', 'actions', button('対象のウィンドウを選ぶ', () => chooseCandidate(binding), { css: 'secondary sm' })));
     }
   }
   const remove = el('div', 'actions', button('すべてのシーンから登録を解除', () =>
     confirm('「' + binding.app + '」の登録を解除しますか？', '関連するすべてのシーンから外れます。', '登録を解除',
-      () => applyDialog('delete_binding', { id: binding.id })), { edit: true, css: 'danger' }));
+      () => applyDialog('delete_binding', { id: binding.id })), { edit: true, css: 'danger sm' }));
   openDialog(binding.app + ' の登録', binding.title || 'ウィンドウが見つかりません',
     [ambiguity, scenes, always, enabled, rules, remove], '編集に反映', readOnly ? undefined : () =>
       applyDialog('edit_binding', { id: binding.id, scenes: checks.filter(({box}) => box.checked).map(({id}) => id),
@@ -808,7 +914,7 @@ async function inspect() {
       items.length ? el('ul', 'rows', ...items.map(({ window, reason }) => el('li', '',
         rowIdentity(window.app, [window.title, window.monitor, reason].filter(Boolean).join(' · ')))))
         : el('p', '', '該当なし'));
-    const warnings = result.warnings.map((warning) => el('p', 'notice', warning));
+    const warnings = result.warnings.map((warning) => el('p', 'callout warn', warning));
     const title = variant ? scene.name + ' / ' + variant.name : scene.name;
     openDialog('「' + title + '」に切り替えると', scopeLabel(scene.target || state.target) + 'での切替の見込みです。', [
       ...warnings,
@@ -832,7 +938,7 @@ function openHotkey(scene) {
     scene: scene.id, modifiers: modifiers.reduce((sum, {box,mask}) => sum | (box.checked ? mask : 0), 0),
     key: Number(key.value) || null,
   });
-  const warn = el('p', 'notice', '修飾キーなしでは、ほかのアプリのキー操作と重なる場合があります。');
+  const warn = el('p', 'callout warn', '修飾キーなしでは、ほかのアプリのキー操作と重なる場合があります。');
   const controls = el('div', 'actions', ...modifiers.map(({label}) => label));
   function sync() { const data = values(); warn.hidden = !data.key || Boolean(data.modifiers); }
   controls.addEventListener('change', sync);
@@ -861,13 +967,13 @@ function openShortcut(index) {
   const browse = button('参照…', runDialogAction(async () => {
     const result = await request('browse', { kind: kind.value });
     if (result?.path) target.value = result.path;
-  }));
+  }), { css: 'secondary sm' });
   kind.addEventListener('change', () => { browse.hidden = kind.value === 'website'; });
   browse.hidden = kind.value === 'website';
   const order = current ? select(state.shortcuts.map((_, i) => [String(i), (i + 1) + ' 番目']), String(index)) : null;
   const edit = current ? el('div', 'actions',
     button('削除', () => confirm('ショートカットを削除しますか？', current.name, '削除',
-      () => applyDialog('delete_shortcut', { index })), { css: 'danger' })) : null;
+      () => applyDialog('delete_shortcut', { index })), { css: 'danger sm' })) : null;
   openDialog(current ? 'ショートカットを編集' : 'ショートカットを追加', 'カーソル付近に開くランチャーから呼び出せます。',
     [field('表示名', name), field('種類', kind), field('場所', target, 'フォルダーやファイルのパス、または http://・https:// の URL。'),
       el('div', 'actions', browse), order ? field('表示の順番', order) : null, edit].filter(Boolean),
@@ -904,6 +1010,7 @@ async function closeSettings() {
 function sendLauncher(overrideMonitors) {
   const controls = launcherFields.map(byId);
   invalidLauncher = controls.some((node) => node.type === 'number' && !node.checkValidity());
+  syncSliders();
   renderFooter();
   if (invalidLauncher) { showMessage('固定バーの大きさや表示件数を、項目に表示された範囲で入力してください。'); return; }
   showMessage();
@@ -959,7 +1066,124 @@ function importSettings() {
   } else void load().catch((error) => showMessage(error.message));
 }
 
+function setupSidebarSearch() {
+  const inputNode = byId('settings-search');
+  const clearBtn = byId('settings-search-clear');
+  const navNode = byId('sidebar-nav');
+  const resultsNode = byId('search-results');
+  if (!inputNode || !resultsNode) return;
+
+  const normalize = (text) => text.normalize('NFKC').toLowerCase();
+  const clear = () => {
+    inputNode.value = '';
+    clearBtn.hidden = true;
+    navNode.hidden = false;
+    resultsNode.hidden = true;
+    resultsNode.replaceChildren();
+  };
+
+  const jumpTo = (item) => {
+    clear();
+    go(item.page);
+    if (item.details) {
+      const detailsNode = byId(item.details);
+      if (detailsNode) {
+        detailsNode.open = true;
+        if (item.details === 'binding-details' && state) renderAllBindings();
+      }
+    }
+    const block = byId(item.page)?.querySelector('[data-search-block="' + item.block + '"]');
+    if (block) {
+      block.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      block.classList.remove('search-hit');
+      void block.offsetWidth;
+      block.classList.add('search-hit');
+    }
+  };
+
+  const renderResults = () => {
+    const query = normalize(inputNode.value).trim();
+    clearBtn.hidden = !query;
+    if (!query) {
+      navNode.hidden = false;
+      resultsNode.hidden = true;
+      resultsNode.replaceChildren();
+      return;
+    }
+    navNode.hidden = true;
+    resultsNode.hidden = false;
+    const words = query.split(/\s+/).filter(Boolean);
+    const hits = searchIndex.filter((item) => {
+      const haystack = normalize(item.title + ' ' + item.pageLabel + ' ' + item.keywords);
+      return words.every((w) => haystack.includes(w));
+    });
+    if (!hits.length) {
+      resultsNode.replaceChildren(el('div', 'search-empty', '一致する設定が見つかりません'));
+      return;
+    }
+    resultsNode.replaceChildren(...hits.map((item) => {
+      const btn = el('button', 'search-result-item',
+        el('span', 'search-result-title', item.title),
+        el('span', 'search-result-meta', item.pageLabel));
+      btn.type = 'button';
+      btn.addEventListener('click', () => jumpTo(item));
+      return btn;
+    }));
+  };
+
+  inputNode.addEventListener('input', renderResults);
+  inputNode.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      clear();
+      inputNode.blur();
+    } else if (event.key === 'Enter' && !event.isComposing) {
+      resultsNode.querySelector('.search-result-item')?.click();
+    }
+  });
+  clearBtn.addEventListener('click', () => { clear(); inputNode.focus(); });
+}
+
 document.querySelectorAll('[data-icon]').forEach((node) => node.prepend(icon(node.dataset.icon)));
+document.querySelectorAll('[data-icon-end]').forEach((node) => node.append(icon(node.dataset.iconEnd)));
+setupSidebarSearch();
+
+document.querySelectorAll('[data-choice-field]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const fieldId = btn.dataset.choiceField;
+    const value = btn.dataset.choiceValue;
+    const control = byId(fieldId);
+    if (!control || control.disabled || control.value === value) return;
+    control.value = value;
+    syncVisualChoice(fieldId, value);
+    sendLauncher();
+  });
+});
+
+document.querySelectorAll('[data-range-for]').forEach((range) => {
+  const target = byId(range.dataset.rangeFor);
+  if (!target) return;
+  range.addEventListener('input', () => {
+    target.value = range.value;
+    updateSliderFill(range);
+    if (range.dataset.rangeFor === 'button_size_dip') {
+      const bar = byId('bar-preview')?.querySelector('.bar');
+      if (bar) bar.style.setProperty('--slot', Math.min(49, Math.max(24, Number(range.value))) + 'px');
+    }
+  });
+  range.addEventListener('change', () => {
+    target.value = range.value;
+    updateSliderFill(range);
+    sendLauncher();
+  });
+  target.addEventListener('input', () => {
+    const val = Number(target.value);
+    if (Number.isFinite(val)) {
+      range.value = String(Math.max(Number(range.min), Math.min(Number(range.max), val)));
+      updateSliderFill(range);
+    }
+  });
+});
+
 nav.forEach((node) => node.addEventListener('click', () => go(node.dataset.page)));
 byId('start-setup').addEventListener('click', () => { setup = true; go('behavior'); });
 byId('setup-next').addEventListener('click', () => { setup = false; go('scenes'); byId('create-scene').focus(); });
@@ -1003,6 +1227,7 @@ byId('discard').addEventListener('click', () => {
     applyDialog('discard', {}, () => { invalidLauncher = false; showMessage(); }));
 });
 byId('dialog-cancel').addEventListener('click', () => { if (!pending) dismiss(); });
+byId('dialog-close')?.addEventListener('click', () => { if (!pending) dismiss(); });
 dialog.addEventListener('cancel', (event) => {
   event.preventDefault();
   if (!pending) dismiss();

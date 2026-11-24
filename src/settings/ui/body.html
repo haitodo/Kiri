@@ -1,168 +1,521 @@
 <div class="settings" id="settings" aria-busy="true">
   <aside class="sidebar">
-    <div class="brand" aria-hidden="true"><span class="brand-mark"></span><strong>Kiri</strong><span>設定</span></div>
-    <nav aria-label="設定カテゴリ">
-      <button type="button" data-page="scenes" data-icon="layers" aria-current="page">シーン</button>
-      <button type="button" data-page="launcher" data-icon="panel">ランチャー</button>
-      <button type="button" data-page="behavior" data-icon="monitor">ウィンドウの動作</button>
-      <button type="button" data-page="shortcuts" data-icon="keyboard">ショートカット</button>
-      <button type="button" data-page="backup" data-icon="archive">バックアップ・復旧</button>
-    </nav>
-  </aside>
-  <main id="content" class="content">
-    <section id="scenes" class="page" aria-labelledby="scenes-title">
-      <header class="page-head">
-        <div><h1 id="scenes-title" tabindex="-1">シーン</h1><p>一緒に表示したいウィンドウを、作業ごとにまとめます。</p></div>
-        <button type="button" class="primary" data-edit id="create-scene" data-icon="plus">シーンを作る</button>
-      </header>
-      <div class="guide band" id="first-run" hidden>
-        <div><strong>はじめての設定</strong><p>シーンに開いているウィンドウを追加しましょう。</p></div>
-        <button type="button" id="start-setup" data-edit>共通の画面を選ぶ</button>
+    <div class="sidebar-top">
+      <div class="brand" aria-hidden="true">
+        <span class="brand-mark"></span>
+        <span class="brand-name"><strong>Kiri</strong><span>設定</span></span>
       </div>
-      <div class="scene-list" id="scene-list" role="group" aria-label="編集するシーン"></div>
-      <div class="stack" id="scene-editor" hidden>
-        <div class="row wrap">
-          <h2 id="scene-name"></h2>
-          <div class="actions">
-            <button id="inspect" type="button" class="quiet" data-icon="eye">切替の影響を見る</button>
-            <button id="scene-details" type="button" class="quiet" data-icon="sliders">シーンの詳細設定</button>
+      <div class="search-box">
+        <span class="search-icon" data-icon="search" aria-hidden="true"></span>
+        <input type="search" id="settings-search" placeholder="設定を検索…" aria-label="設定を検索" autocomplete="off">
+        <button type="button" id="settings-search-clear" class="search-clear" aria-label="検索をクリア" hidden data-icon="close"></button>
+      </div>
+    </div>
+    <div class="sidebar-scroll">
+      <nav id="sidebar-nav" aria-label="設定カテゴリ">
+        <div class="nav-group">
+          <div class="nav-group-label">ワークスペース</div>
+          <button type="button" data-page="scenes" data-icon="layers" aria-current="page"><span class="nav-label">シーン</span><span class="nav-badge" id="nav-badge-scenes" hidden></span></button>
+          <button type="button" data-page="launcher" data-icon="panel"><span class="nav-label">ランチャー</span><span class="nav-badge" id="nav-badge-launcher" hidden></span></button>
+          <button type="button" data-page="behavior" data-icon="monitor"><span class="nav-label">ウィンドウの動作</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">カスタマイズ</div>
+          <button type="button" data-page="shortcuts" data-icon="keyboard"><span class="nav-label">ショートカット</span><span class="nav-badge" id="nav-badge-shortcuts" hidden></span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-label">システム</div>
+          <button type="button" data-page="backup" data-icon="archive"><span class="nav-label">バックアップ・復旧</span></button>
+        </div>
+      </nav>
+      <div class="search-results" id="search-results" hidden role="region" aria-label="検索結果"></div>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <div class="panel">
+      <main id="content" class="content">
+        <section id="scenes" class="page" aria-labelledby="scenes-title">
+          <header class="page-head">
+            <div class="page-head-main">
+              <span class="page-icon tone-rose" data-icon="layers" aria-hidden="true"></span>
+              <div class="page-head-copy">
+                <h1 id="scenes-title" tabindex="-1">シーン</h1>
+                <p>一緒に表示したいウィンドウを、作業ごとにまとめます。</p>
+              </div>
+            </div>
+            <button type="button" class="primary" data-edit id="create-scene" data-icon="plus">シーンを作る</button>
+          </header>
+
+          <div class="guide" id="first-run" hidden>
+            <div class="guide-body">
+              <span class="guide-icon" data-icon="sparkle" aria-hidden="true"></span>
+              <div><strong>はじめての設定</strong><p>まずは切り替える画面を選び、シーンにウィンドウを追加しましょう。</p></div>
+            </div>
+            <button type="button" class="secondary" id="start-setup" data-edit>共通の画面を選ぶ</button>
           </div>
-        </div>
-        <div class="columns band monitor-options">
-          <div class="stack">
-            <label class="field">切り替える画面<select id="scene-target" data-edit></select></label>
-            <p class="notice" id="scene-target-hint" hidden></p>
+
+          <div class="section-block" data-search-block="scenes-select">
+            <div class="section-head">
+              <div>
+                <h2>登録済みのシーン</h2>
+                <p>編集するシーンを選択します。</p>
+              </div>
+            </div>
+            <div class="scene-list" id="scene-list" role="group" aria-label="編集するシーン"></div>
           </div>
-          <div class="monitor-map" id="scene-monitor-map" role="group" aria-label="画面の配置"></div>
-        </div>
-        <div class="stack" id="common-windows" hidden>
-          <div class="row wrap">
-            <h3>どの構成でも使うウィンドウ</h3>
-            <button id="add-common-windows" type="button" data-edit data-icon="plus">共通に追加</button>
-          </div>
-          <ul class="rows" id="common-bindings"></ul>
-        </div>
-        <div class="row wrap">
-          <div class="actions variant-tabs" id="variant-tabs" role="tablist" aria-label="ウィンドウ構成" hidden></div>
-          <button id="create-variant" type="button" data-edit data-icon="plus">構成を追加</button>
-        </div>
-        <div class="stack" id="variant-panel">
-          <div class="row wrap">
-            <h3 id="scene-windows"></h3>
-            <div class="actions">
-              <button id="edit-variant" type="button" class="quiet" data-edit data-icon="sliders">構成の設定</button>
-              <button id="add-windows" type="button" data-edit data-icon="plus">ウィンドウを追加</button>
+
+          <div class="section-block stack-lg" id="scene-editor" hidden>
+            <div class="row wrap editor-header">
+              <div class="editor-title-group">
+                <h2 id="scene-name"></h2>
+              </div>
+              <div class="actions">
+                <button id="inspect" type="button" class="subtle" data-icon="eye">切替の影響を見る</button>
+                <button id="scene-details" type="button" class="subtle" data-icon="sliders">シーンの詳細設定</button>
+              </div>
+            </div>
+
+            <div class="surface-card monitor-options" data-search-block="scene-target">
+              <div class="stack">
+                <label class="field">
+                  <span class="field-label">切り替える画面</span>
+                  <span class="select-wrap"><select id="scene-target" data-edit></select><span class="select-chevron" data-icon="down" aria-hidden="true"></span></span>
+                </label>
+                <p class="notice" id="scene-target-hint" hidden></p>
+              </div>
+              <div class="monitor-stage">
+                <div class="monitor-map" id="scene-monitor-map" role="group" aria-label="画面の配置"></div>
+              </div>
+            </div>
+
+            <div class="stack" id="common-windows" hidden>
+              <div class="row wrap">
+                <div class="subhead">
+                  <h3>どの構成でも使うウィンドウ</h3>
+                </div>
+                <button id="add-common-windows" type="button" class="secondary sm" data-edit data-icon="plus">共通に追加</button>
+              </div>
+              <ul class="rows" id="common-bindings"></ul>
+            </div>
+
+            <div class="stack" data-search-block="scene-variants">
+              <div class="row wrap variant-toolbar">
+                <div class="variant-tabs" id="variant-tabs" role="tablist" aria-label="ウィンドウ構成" hidden></div>
+                <button id="create-variant" type="button" class="secondary sm" data-edit data-icon="plus">構成を追加</button>
+              </div>
+              <div class="stack" id="variant-panel">
+                <div class="row wrap">
+                  <h3 id="scene-windows"></h3>
+                  <div class="actions">
+                    <button id="edit-variant" type="button" class="ghost sm" data-edit data-icon="sliders">構成の設定</button>
+                    <button id="add-windows" type="button" class="secondary sm" data-edit data-icon="plus">ウィンドウを追加</button>
+                  </div>
+                </div>
+                <ul class="rows" id="scene-bindings"></ul>
+              </div>
             </div>
           </div>
-          <ul class="rows" id="scene-bindings"></ul>
-        </div>
-      </div>
-      <details id="binding-details">
-        <summary>登録済みウィンドウを管理</summary>
-        <p>複数のシーンでの共有や、再起動後にウィンドウを見分ける条件を設定できます。</p>
-        <div class="row wrap"><h2>ウィンドウの登録</h2><button id="refresh-bindings" type="button" data-icon="refresh">状態を更新</button></div>
-        <ul class="rows" id="all-bindings"></ul>
-      </details>
-    </section>
-    <section id="launcher" class="page" aria-labelledby="launcher-title" hidden>
-      <header class="page-head"><div><h1 id="launcher-title" tabindex="-1">ランチャー</h1><p>Kiri の呼び出し方と、固定バーの見た目を選びます。</p></div></header>
-      <div class="options">
-        <label class="setting"><span><strong>固定バーを表示する</strong><small>画面上にシーンのボタンを表示します。</small></span><input data-edit type="checkbox" id="show_bar"></label>
-        <label class="setting"><span><strong>Ctrl を 2 回押して開く</strong><small>カーソルの近くに開きます。表示中は Ctrl を短く 1 回押して離すと閉じます。</small></span><input data-edit type="checkbox" id="ctrl_double_tap"></label>
-        <p class="notice" id="tray-hint" hidden>どちらもオフの場合は、タスクトレイの Kiri アイコンから開けます。</p>
-      </div>
-      <div class="band stack" id="bar-monitors-band">
-        <div class="columns monitor-options">
-          <div class="stack">
-            <label class="field">固定バーを表示する画面
-              <select data-edit id="bar_display_mode">
-                <option value="single">1つの画面だけ（ドラッグで移動）</option>
-                <option value="selected_monitors">選んだ画面に表示</option>
-                <option value="all_monitors">すべての画面に表示</option>
-              </select>
-            </label>
-            <p class="muted" id="bar-display-hint"></p>
+
+          <div class="section-block" data-search-block="all-bindings">
+            <details class="disclosure" id="binding-details">
+              <summary data-icon-end="down">
+                <span class="disclosure-copy">
+                  <strong>登録済みウィンドウを管理</strong>
+                  <small>複数シーンでの共有や、再起動後に見分ける条件をまとめて編集します。</small>
+                </span>
+              </summary>
+              <div class="disclosure-body stack">
+                <div class="row wrap">
+                  <h3>すべての登録ウィンドウ</h3>
+                  <button id="refresh-bindings" type="button" class="secondary sm" data-icon="refresh">状態を更新</button>
+                </div>
+                <ul class="rows" id="all-bindings"></ul>
+              </div>
+            </details>
           </div>
-          <div class="monitor-map" id="launcher-monitor-map" role="group" aria-label="固定バーを表示する画面"></div>
+        </section>
+
+        <section id="launcher" class="page" aria-labelledby="launcher-title" hidden>
+          <header class="page-head">
+            <div class="page-head-main">
+              <span class="page-icon tone-sky" data-icon="panel" aria-hidden="true"></span>
+              <div class="page-head-copy">
+                <h1 id="launcher-title" tabindex="-1">ランチャー</h1>
+                <p>Kiri の呼び出し方と、固定バーの見た目を選びます。</p>
+              </div>
+            </div>
+          </header>
+
+          <div class="section-block" data-search-block="launcher-triggers">
+            <div class="section-head">
+              <div>
+                <h2>呼び出し方法</h2>
+                <p>作業中いつでもシーンを切り替えられる方法を選びます。</p>
+              </div>
+            </div>
+            <div class="setting-list">
+              <label class="setting">
+                <span class="setting-copy"><strong>固定バーを表示する</strong><small>画面上にシーンのボタンを常時表示します。</small></span>
+                <input class="switch" data-edit type="checkbox" id="show_bar">
+              </label>
+              <label class="setting">
+                <span class="setting-copy"><strong>Ctrl を 2 回押して開く</strong><small>カーソルの近くに開きます。表示中は Ctrl を短く 1 回押して離すと閉じます。</small></span>
+                <input class="switch" data-edit type="checkbox" id="ctrl_double_tap">
+              </label>
+            </div>
+            <p class="callout warn" id="tray-hint" hidden>どちらもオフの場合は、タスクトレイの Kiri アイコンから開けます。</p>
+          </div>
+
+          <div class="section-block" id="bar-monitors-band" data-search-block="launcher-monitors">
+            <div class="section-head">
+              <div>
+                <h2>表示する画面</h2>
+                <p>固定バーをどのモニターに配置するか設定します。</p>
+              </div>
+            </div>
+            <div class="surface-card monitor-options">
+              <div class="stack">
+                <label class="field">
+                  <span class="field-label">表示モード</span>
+                  <span class="select-wrap">
+                    <select data-edit id="bar_display_mode">
+                      <option value="single">1つの画面だけ（ドラッグで移動）</option>
+                      <option value="selected_monitors">選んだ画面に表示</option>
+                      <option value="all_monitors">すべての画面に表示</option>
+                    </select>
+                    <span class="select-chevron" data-icon="down" aria-hidden="true"></span>
+                  </span>
+                </label>
+                <p class="muted" id="bar-display-hint"></p>
+              </div>
+              <div class="monitor-stage">
+                <div class="monitor-map" id="launcher-monitor-map" role="group" aria-label="固定バーを表示する画面"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-block stack-lg" data-search-block="launcher-appearance">
+            <div class="section-head">
+              <div>
+                <h2>レイアウトとプレビュー</h2>
+                <p>固定バーの向きと、カーソル付近のポップアップ配置を選びます。</p>
+              </div>
+            </div>
+
+            <div class="visual-choice-block">
+              <div class="field-head">
+                <strong>固定バーの向き</strong>
+                <small>画面上の配置に合わせて横向きまたは縦向きを選びます。</small>
+              </div>
+              <div class="visual-cards" id="orientation-cards" role="group" aria-label="固定バーの向き">
+                <button type="button" class="visual-card" data-edit data-choice-field="orientation" data-choice-value="horizontal" aria-pressed="false">
+                  <span class="visual-preview" aria-hidden="true">
+                    <span class="mini-screen">
+                      <span class="mini-bar mini-bar-h"><i></i><b></b><b></b><b></b></span>
+                    </span>
+                  </span>
+                  <span class="visual-label">横向き</span>
+                </button>
+                <button type="button" class="visual-card" data-edit data-choice-field="orientation" data-choice-value="vertical" aria-pressed="false">
+                  <span class="visual-preview" aria-hidden="true">
+                    <span class="mini-screen">
+                      <span class="mini-bar mini-bar-v"><i></i><b></b><b></b><b></b></span>
+                    </span>
+                  </span>
+                  <span class="visual-label">縦向き</span>
+                </button>
+              </div>
+              <select data-edit id="orientation" class="visually-hidden" tabindex="-1" aria-hidden="true">
+                <option value="horizontal">横向き</option>
+                <option value="vertical">縦向き</option>
+              </select>
+            </div>
+
+            <div class="visual-choice-block">
+              <div class="field-head">
+                <strong>カーソル付近で開く位置</strong>
+                <small>Ctrl の 2 回押しで開くランチャーの表示位置を選びます。</small>
+              </div>
+              <div class="visual-cards" id="popup-position-cards" role="group" aria-label="カーソル付近で開く位置">
+                <button type="button" class="visual-card" data-edit data-choice-field="cursor_popup_position" data-choice-value="scene_centered" aria-pressed="false">
+                  <span class="visual-preview" aria-hidden="true">
+                    <span class="mini-screen">
+                      <span class="mini-popup mini-popup-center"><b></b><b></b><b></b></span>
+                      <span class="mini-cursor mini-cursor-center"></span>
+                    </span>
+                  </span>
+                  <span class="visual-label">シーンをカーソルに寄せる</span>
+                </button>
+                <button type="button" class="visual-card" data-edit data-choice-field="cursor_popup_position" data-choice-value="beside_cursor" aria-pressed="false">
+                  <span class="visual-preview" aria-hidden="true">
+                    <span class="mini-screen">
+                      <span class="mini-cursor mini-cursor-beside"></span>
+                      <span class="mini-popup mini-popup-beside"><b></b><b></b><b></b></span>
+                    </span>
+                  </span>
+                  <span class="visual-label">カーソルの斜め横に表示</span>
+                </button>
+              </div>
+              <select data-edit id="cursor_popup_position" class="visually-hidden" tabindex="-1" aria-hidden="true">
+                <option value="scene_centered">シーンをカーソルに寄せる</option>
+                <option value="beside_cursor">カーソルの斜め横に表示</option>
+              </select>
+            </div>
+
+            <div class="preview-stage">
+              <div class="preview-stage-head">
+                <span>固定バーのプレビュー</span>
+              </div>
+              <div class="preview-canvas" id="bar-preview"></div>
+            </div>
+          </div>
+
+          <div class="section-block" data-search-block="launcher-advanced">
+            <details class="disclosure" id="launcher-details">
+              <summary data-icon-end="down">
+                <span class="disclosure-copy">
+                  <strong>固定バーの詳細設定</strong>
+                  <small>ボタンサイズ、つまみ幅、表示件数、挙動や位置のリセットを調整します。</small>
+                </span>
+              </summary>
+              <div class="disclosure-body stack-lg">
+                <div class="slider-group">
+                  <div class="slider-setting">
+                    <div class="slider-head">
+                      <label for="button_size_dip"><strong>ボタンの大きさ</strong><small>20〜96 DIP の範囲でボタンのサイズを調整します。</small></label>
+                      <div class="slider-input-wrap">
+                        <input data-edit type="number" id="button_size_dip" min="20" max="96" required>
+                        <span class="unit">px</span>
+                      </div>
+                    </div>
+                    <input data-edit type="range" class="slider" data-range-for="button_size_dip" min="20" max="96" step="1" aria-label="ボタンの大きさ">
+                  </div>
+
+                  <div class="slider-setting">
+                    <div class="slider-head">
+                      <label for="grip_size_dip"><strong>移動用のつまみ</strong><small>8〜48 DIP の範囲でドラッグ用グリップの幅を調整します。</small></label>
+                      <div class="slider-input-wrap">
+                        <input data-edit type="number" id="grip_size_dip" min="8" max="48" required>
+                        <span class="unit">px</span>
+                      </div>
+                    </div>
+                    <input data-edit type="range" class="slider" data-range-for="grip_size_dip" min="8" max="48" step="1" aria-label="移動用のつまみ">
+                  </div>
+
+                  <div class="slider-setting">
+                    <div class="slider-head">
+                      <label for="visible_slots"><strong>固定バーに表示する最大件数</strong><small>1〜12 件の範囲でメインバーに並べるシーン数を指定します。</small></label>
+                      <div class="slider-input-wrap">
+                        <input data-edit type="number" id="visible_slots" min="1" max="12" required>
+                        <span class="unit">件</span>
+                      </div>
+                    </div>
+                    <input data-edit type="range" class="slider" data-range-for="visible_slots" min="1" max="12" step="1" aria-label="固定バーに表示する最大件数">
+                  </div>
+                </div>
+
+                <div class="setting-list">
+                  <label class="setting">
+                    <span class="setting-copy"><strong>常に手前に表示する</strong><small>他のウィンドウより前面に固定バーを維持します。</small></span>
+                    <input class="switch" data-edit type="checkbox" id="always_on_top">
+                  </label>
+                  <label class="setting">
+                    <span class="setting-copy"><strong>画面の端に吸着させる</strong><small>ドラッグ移動時に画面端へスナップします。</small></span>
+                    <input class="switch" data-edit type="checkbox" id="snap_to_edges">
+                  </label>
+                  <label class="setting">
+                    <span class="setting-copy"><strong>ホイールでシーンを一巡する</strong><small>最後のシーンから先頭に戻ります。</small></span>
+                    <input class="switch" data-edit type="checkbox" id="wheel_wrap">
+                  </label>
+                </div>
+
+                <div class="actions">
+                  <button id="reset-position" type="button" class="secondary" data-edit data-icon="restore">固定バーの位置を初期化</button>
+                </div>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <section id="behavior" class="page" aria-labelledby="behavior-title" hidden>
+          <header class="page-head">
+            <div class="page-head-main">
+              <span class="page-icon tone-emerald" data-icon="monitor" aria-hidden="true"></span>
+              <div class="page-head-copy">
+                <h1 id="behavior-title" tabindex="-1">ウィンドウの動作</h1>
+                <p>どの画面で、どのようにウィンドウを切り替えるかを選びます。</p>
+              </div>
+            </div>
+          </header>
+
+          <div class="section-block" data-search-block="behavior-monitors">
+            <div class="section-head">
+              <div>
+                <h2>切り替える画面の共通設定</h2>
+                <p id="monitor-hint">シーンで「共通設定を使う」を選ぶと、この設定が適用されます。</p>
+              </div>
+              <button id="refresh-monitors" type="button" class="subtle sm" data-icon="refresh">接続を確認</button>
+            </div>
+            <div class="surface-card stack">
+              <div class="columns monitor-options">
+                <div class="monitor-stage">
+                  <div class="monitor-map" id="monitor-map" role="group" aria-label="画面の配置"></div>
+                </div>
+                <label class="field">
+                  <span class="field-label">対象の選び方</span>
+                  <span class="select-wrap"><select id="target" data-edit></select><span class="select-chevron" data-icon="down" aria-hidden="true"></span></span>
+                </label>
+              </div>
+              <div class="row" id="setup-next-row" hidden>
+                <button type="button" id="setup-next" class="primary">シーンの設定へ進む</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-block" data-search-block="behavior-options">
+            <div class="section-head">
+              <div>
+                <h2>切替と起動のオプション</h2>
+                <p>ウィンドウの再表示、フォーカス移動、サインイン時の起動を設定します。</p>
+              </div>
+            </div>
+            <div class="setting-list">
+              <label class="setting">
+                <span class="setting-copy"><strong>自分で最小化したウィンドウも表示する</strong><small>切替先のシーンに登録されているウィンドウを再表示します。</small></span>
+                <input class="switch" data-edit id="restore" type="checkbox">
+              </label>
+              <label class="setting">
+                <span class="setting-copy"><strong>切替先のウィンドウに入力を移す</strong><small>切替後、表示されたアプリですぐ入力できます。</small></span>
+                <input class="switch" data-edit id="focus" type="checkbox">
+              </label>
+              <label class="setting">
+                <span class="setting-copy"><strong>Windows へのサインイン時に Kiri を起動する</strong><small>次に Windows にサインインするときから有効になります。</small></span>
+                <input class="switch" data-edit id="autostart" type="checkbox">
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section id="shortcuts" class="page" aria-labelledby="shortcuts-title" hidden>
+          <header class="page-head">
+            <div class="page-head-main">
+              <span class="page-icon tone-amber" data-icon="keyboard" aria-hidden="true"></span>
+              <div class="page-head-copy">
+                <h1 id="shortcuts-title" tabindex="-1">ショートカット</h1>
+                <p>シーンを切り替えるキーと、ランチャーから開く項目を管理します。</p>
+              </div>
+            </div>
+          </header>
+
+          <div class="section-block" data-search-block="shortcuts-hotkeys">
+            <div class="section-head">
+              <div>
+                <h2>シーンを切り替えるキー</h2>
+                <p>Windows 全体でいつでも使えるグローバルショートカットです。</p>
+              </div>
+            </div>
+            <ul class="rows" id="hotkeys"></ul>
+          </div>
+
+          <div class="section-block" data-search-block="shortcuts-items">
+            <div class="section-head">
+              <div>
+                <h2>ランチャーから開く項目</h2>
+                <p>カーソル付近のランチャーからフォルダー、ファイル、サイトを素早く開けます。</p>
+              </div>
+              <button type="button" id="new-shortcut" class="secondary sm" data-edit data-icon="plus">ショートカットを追加</button>
+            </div>
+            <ul class="rows" id="shortcut-list"></ul>
+          </div>
+        </section>
+
+        <section id="backup" class="page" aria-labelledby="backup-title" hidden>
+          <header class="page-head">
+            <div class="page-head-main">
+              <span class="page-icon tone-violet" data-icon="archive" aria-hidden="true"></span>
+              <div class="page-head-copy">
+                <h1 id="backup-title" tabindex="-1">バックアップ・復旧</h1>
+                <p>設定の引き継ぎと、Kiri が最小化したウィンドウの復元ができます。</p>
+              </div>
+            </div>
+          </header>
+
+          <div class="section-block" data-search-block="backup-recovery">
+            <div class="action-card">
+              <div class="action-card-copy">
+                <h2>ウィンドウを復元</h2>
+                <p>Kiri が最小化したウィンドウだけを対象に、元の状態へ戻します。</p>
+              </div>
+              <div class="actions">
+                <button type="button" class="secondary" id="recovery-preview" data-icon="restore">復元できるウィンドウを確認</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-block" data-search-block="backup-transfer">
+            <div class="action-card">
+              <div class="action-card-copy">
+                <h2>設定を引き継ぐ</h2>
+                <p>保存済みの設定をファイルへ書き出せます。別の PC に読み込んだ場合は、対象の画面やアプリの場所を確認してください。</p>
+              </div>
+              <div class="actions">
+                <button type="button" class="secondary" id="export" data-icon="upload">書き出す</button>
+                <button type="button" class="secondary" id="import" data-edit data-icon="download">読み込む</button>
+                <button type="button" class="ghost" id="open-folder" data-icon="folder">保存先を開く</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-block" data-search-block="backup-logs">
+            <details class="disclosure" id="log-details">
+              <summary data-icon-end="down">
+                <span class="disclosure-copy">
+                  <strong>診断ログ</strong>
+                  <small>不具合調査時のログ記録レベルを調整します。</small>
+                </span>
+              </summary>
+              <div class="disclosure-body">
+                <div class="setting-list">
+                  <label class="setting">
+                    <span class="setting-copy"><strong>ウィンドウ名を省略せず記録する</strong><small>ファイル名や口座番号などがログに含まれることがあります。</small></span>
+                    <input class="switch" data-edit id="verbose" type="checkbox">
+                  </label>
+                </div>
+              </div>
+            </details>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <div class="feedback">
+          <div id="status" role="status">読み込み中…</div>
+          <div id="message" role="alert" hidden></div>
         </div>
-      </div>
-      <div class="columns band">
-        <div class="stack">
-          <label class="field">固定バーの向き<select data-edit id="orientation"><option value="horizontal">横向き</option><option value="vertical">縦向き</option></select></label>
-          <label class="field">カーソル付近で開く位置<select data-edit id="cursor_popup_position"><option value="scene_centered">シーンをカーソルに寄せる</option><option value="beside_cursor">カーソルの斜め横に表示</option></select></label>
+        <div class="actions">
+          <button type="button" class="ghost" id="discard" disabled>変更を破棄</button>
+          <button type="button" class="primary" id="save" disabled>変更を保存</button>
         </div>
-        <div class="stack">
-          <h2>固定バーのプレビュー</h2>
-          <div id="bar-preview"></div>
-        </div>
-      </div>
-      <details>
-        <summary>固定バーの詳細設定</summary>
-        <div class="columns">
-          <label class="field">ボタンの大きさ（20〜96）<input data-edit type="number" id="button_size_dip" min="20" max="96" required></label>
-          <label class="field">移動用のつまみ（8〜48）<input data-edit type="number" id="grip_size_dip" min="8" max="48" required></label>
-          <label class="field">固定バーに表示する最大件数（1〜12）<input data-edit type="number" id="visible_slots" min="1" max="12" required></label>
-        </div>
-        <label class="setting"><strong>常に手前に表示する</strong><input data-edit type="checkbox" id="always_on_top"></label>
-        <label class="setting"><strong>画面の端に吸着させる</strong><input data-edit type="checkbox" id="snap_to_edges"></label>
-        <label class="setting"><span><strong>ホイールでシーンを一巡する</strong><small>最後のシーンから先頭に戻ります。</small></span><input data-edit type="checkbox" id="wheel_wrap"></label>
-        <button id="reset-position" type="button" data-edit>固定バーの位置を初期化</button>
-      </details>
-    </section>
-    <section id="behavior" class="page" aria-labelledby="behavior-title" hidden>
-      <header class="page-head"><div><h1 id="behavior-title" tabindex="-1">ウィンドウの動作</h1><p>どの画面で、どのようにウィンドウを切り替えるかを選びます。</p></div></header>
-      <div class="band stack">
-        <div class="row wrap"><h2>切り替える画面の共通設定</h2><button id="refresh-monitors" type="button" class="quiet" data-icon="refresh">接続を確認</button></div>
-        <div class="columns monitor-options">
-          <div class="monitor-map" id="monitor-map" role="group" aria-label="画面の配置"></div>
-          <label class="field">対象の選び方<select id="target" data-edit></select></label>
-        </div>
-        <p id="monitor-hint"></p>
-        <div class="row" id="setup-next-row" hidden><button type="button" id="setup-next" class="primary">シーンの設定へ進む</button></div>
-      </div>
-      <div class="options">
-        <label class="setting"><span><strong>自分で最小化したウィンドウも表示する</strong><small>切替先のシーンに登録されているウィンドウを再表示します。</small></span><input data-edit id="restore" type="checkbox"></label>
-        <label class="setting"><span><strong>切替先のウィンドウに入力を移す</strong><small>切替後、表示されたアプリですぐ入力できます。</small></span><input data-edit id="focus" type="checkbox"></label>
-        <label class="setting"><span><strong>Windows へのサインイン時に Kiri を起動する</strong><small>次に Windows にサインインするときから有効になります。</small></span><input data-edit id="autostart" type="checkbox"></label>
-      </div>
-    </section>
-    <section id="shortcuts" class="page" aria-labelledby="shortcuts-title" hidden>
-      <header class="page-head"><div><h1 id="shortcuts-title" tabindex="-1">ショートカット</h1><p>シーンを切り替えるキーと、ランチャーから開く項目を管理します。</p></div></header>
-      <div class="stack"><h2>シーンを切り替えるキー</h2><ul class="rows" id="hotkeys"></ul></div>
-      <div class="stack">
-        <div class="row wrap"><h2>ランチャーから開く項目</h2><button type="button" id="new-shortcut" data-edit data-icon="plus">ショートカットを追加</button></div>
-        <ul class="rows" id="shortcut-list"></ul>
-      </div>
-    </section>
-    <section id="backup" class="page" aria-labelledby="backup-title" hidden>
-      <header class="page-head"><div><h1 id="backup-title" tabindex="-1">バックアップ・復旧</h1><p>設定の引き継ぎと、Kiri が最小化したウィンドウの復元ができます。</p></div></header>
-      <div class="band stack">
-        <div><h2>ウィンドウを復元</h2><p>Kiri が最小化したウィンドウだけが対象です。</p></div>
-        <div class="actions"><button type="button" id="recovery-preview" data-icon="restore">復元できるウィンドウを確認</button></div>
-      </div>
-      <div class="band stack">
-        <div><h2>設定を引き継ぐ</h2><p>保存済みの設定を書き出せます。別の PC では、対象の画面やアプリの場所を確認してください。</p></div>
-        <div class="actions"><button type="button" id="export">書き出す</button><button type="button" id="import" data-edit>読み込む</button><button type="button" class="quiet" id="open-folder">保存先を開く</button></div>
-      </div>
-      <details>
-        <summary>診断ログ</summary>
-        <label class="setting"><span><strong>ウィンドウ名を省略せず記録する</strong><small>ファイル名や口座番号などがログに含まれることがあります。</small></span><input data-edit id="verbose" type="checkbox"></label>
-      </details>
-    </section>
-  </main>
-  <footer class="footer">
-    <div class="feedback">
-      <div id="status" role="status">読み込み中…</div>
-      <div id="message" role="alert" hidden></div>
+      </footer>
     </div>
-    <div class="actions"><button type="button" class="quiet" id="discard" disabled>変更を破棄</button><button type="button" class="primary" id="save" disabled>変更を保存</button></div>
-  </footer>
+  </div>
 </div>
+
 <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-caption">
   <form id="dialog-form">
-    <header><h2 id="dialog-title"></h2><p id="dialog-caption"></p></header>
+    <header class="dialog-header">
+      <div class="dialog-header-copy">
+        <h2 id="dialog-title"></h2>
+        <p id="dialog-caption"></p>
+      </div>
+      <button type="button" class="dialog-close" id="dialog-close" aria-label="閉じる" data-icon="close"></button>
+    </header>
     <div class="dialog-body stack" id="dialog-body"></div>
     <div class="dialog-error" id="dialog-error" role="alert" hidden></div>
-    <footer class="dialog-footer"><button type="button" id="dialog-cancel">キャンセル</button><button type="submit" class="primary" id="dialog-submit"></button></footer>
+    <footer class="dialog-footer">
+      <button type="button" class="ghost" id="dialog-cancel">キャンセル</button>
+      <button type="submit" class="primary" id="dialog-submit"></button>
+    </footer>
   </form>
 </dialog>
