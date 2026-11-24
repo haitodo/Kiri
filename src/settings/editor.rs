@@ -10,7 +10,7 @@ use crate::platform::WindowInstance;
 use crate::scenes::switch::{format_switch_warnings, preview_scene_switch};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Clone, Copy)]
@@ -791,16 +791,26 @@ impl Editor {
             .map(|row| candidate_key(&row.instance))
             .collect();
         self.refresh(app);
+        let current: HashMap<_, _> = self.vm.candidate_windows
+            .iter()
+            .map(|row| (candidate_key(&row.instance), &row.instance))
+            .collect();
         let mut seen = HashSet::new();
-        keys.iter().filter(|key| seen.insert(*key)).map(|key| {
-            let candidate = self.vm.candidate_windows.iter().find(|row| {
-                previous.contains(key) && candidate_key(&row.instance) == *key
-            }).ok_or("選んだウィンドウが移動したか、閉じられました。一覧を更新して選び直してください。")?;
-            if let Some(reason) = candidate_block_reason(&candidate.instance) {
+        let mut selected = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !seen.insert(key) {
+                continue;
+            }
+            let win = current.get(key)
+                .copied()
+                .filter(|_| previous.contains(key))
+                .ok_or("選んだウィンドウが移動したか、閉じられました。一覧を更新して選び直してください。")?;
+            if let Some(reason) = candidate_block_reason(win) {
                 return Err(reason.into());
             }
-            Ok(candidate.instance.clone())
-        }).collect()
+            selected.push(win.clone());
+        }
+        Ok(selected)
     }
 
     fn ambiguous_candidate(&self, hwnd: u64) -> bool {
@@ -952,6 +962,10 @@ impl Editor {
                 })
             })
             .collect();
+        let ambiguous_hwnds: HashSet<_> = self.vm.binding_rows
+            .iter()
+            .flat_map(|row| row.ambiguous_candidates.iter().map(|win| win.hwnd))
+            .collect();
         let candidates: Vec<_> = self
             .vm
             .candidate_windows
@@ -965,21 +979,25 @@ impl Editor {
                     "monitor_id": row.instance.monitor_id,
                     "binding_id": row.existing_binding_id,
                     "blocked": candidate_block_reason(&row.instance),
-                    "ambiguous": self.ambiguous_candidate(row.instance.hwnd),
+                    "ambiguous": ambiguous_hwnds.contains(&row.instance.hwnd),
                     "warnings": row.warnings.iter().filter_map(warning_label).collect::<Vec<_>>(),
                     "scenes": row.bound_scene_ids,
                 })
             })
             .collect();
+        let live_by_hwnd: HashMap<_, _> = self.vm.candidate_windows
+            .iter()
+            .map(|row| (row.instance.hwnd, &row.instance))
+            .collect();
         let bindings: Vec<_> = config.bindings.iter().zip(&self.vm.binding_rows).filter(|(b, _)| {
             // The disabled install example is not a real user window.
             !(b.id == "example-mt5" && !b.enabled)
         }).map(|(binding, row)| {
-            let live = self.vm.candidate_windows.iter().find(|candidate| Some(candidate.instance.hwnd) == row.live_hwnd);
-            let monitor = live.map(|w| w.instance.monitor_id.as_str())
+            let live = row.live_hwnd.and_then(|hwnd| live_by_hwnd.get(&hwnd).copied());
+            let monitor = live.map(|win| win.monitor_id.as_str())
                 .or(binding.match_rule.monitor_id.as_deref());
             json!({
-                "id": binding.id, "app": live.map_or_else(|| binding_label(binding), |w| app_label(&w.instance)),
+                "id": binding.id, "app": live.map_or_else(|| binding_label(binding), app_label),
                 "title": if row.is_running { row.window_title.as_str() } else { "" },
                 "monitor_label": monitor.map(|id| self.monitor_label(id)),
                 "monitor_id": monitor, "scenes": row.bound_scene_ids,
@@ -1186,6 +1204,46 @@ mod tests {
             Box::new(FakeWindowSystem::new_dual_monitor()),
         );
         (app, folder)
+    }
+
+    #[test]
+    fn adding_multiple_windows_revalidates_the_whole_selection_before_editing() {
+        use crate::settings::tests::make_test_win;
+
+        let (mut app, folder) = sample_app("multi-select");
+        app.config.target.monitor_policy = MonitorPolicy::AllMonitors;
+        app.config.bindings.clear();
+        let first = make_test_win(1, 10, "editor.exe", "Editor", "Code", "MON-2-TARGET");
+        let mut second = make_test_win(2, 20, "browser.exe", "Browser", "Docs", "MON-2-TARGET");
+        let system = |second: &WindowInstance| {
+            let mut sys = FakeWindowSystem::new_dual_monitor();
+            sys.add_window(first.clone());
+            sys.add_window(second.clone());
+            Box::new(sys)
+        };
+        app.sys = system(&second);
+        let mut editor = Editor::new(&app);
+        let first_key = candidate_key(&first);
+        let old_key = candidate_key(&second);
+        second.monitor_id = "MON-1-PRIMARY".into();
+        app.sys = system(&second);
+        let add = |candidates| Command::AddWindows {
+            scene: "code".into(),
+            variant: None,
+            candidates,
+        };
+        assert!(editor.edit(add(vec![first_key.clone(), old_key]), &app).is_err());
+        assert!(editor.vm.config_draft.bindings.is_empty());
+
+        editor.refresh(&app);
+        editor.edit(add(vec![candidate_key(&second), first_key.clone(), first_key]), &app).unwrap();
+        let state = editor.state();
+        let bindings = state["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0]["title"], "Docs");
+        assert_eq!(bindings[1]["title"], "Code");
+        assert!(bindings.iter().all(|binding| binding["scenes"] == json!(["code"])));
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

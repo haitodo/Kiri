@@ -194,6 +194,7 @@ function redraw() {
     case 'launcher': renderLauncher(); break;
     case 'behavior': renderBehavior(); break;
     case 'shortcuts': renderShortcuts(); break;
+    case 'backup': byId('verbose').checked = state.verbose; break;
   }
   renderFooter();
   byId(visited).querySelectorAll('[data-edit]').forEach((node) => { node.disabled = state.read_only; });
@@ -257,9 +258,13 @@ const missingMonitor = '対象の画面が見つかりません。接続を確�
 
 function renderScenes() {
   byId('first-run').hidden = !onboarding || state.read_only;
+  const byScene = new Map(state.scenes.map((scene) => [scene.id, []]));
+  for (const binding of state.bindings) {
+    for (const id of binding.scenes) byScene.get(id)?.push(binding);
+  }
   byId('scene-list').replaceChildren(...state.scenes.map((scene) => {
     const selected = scene.id === sceneId;
-    const count = state.bindings.filter((binding) => binding.scenes.includes(scene.id)).length;
+    const count = byScene.get(scene.id).length;
     const detail = scene.variants.length ? scene.variants.length + ' 構成' : count + ' ウィンドウ';
     const item = button('', () => { sceneId = scene.id; redraw(); }, { focus: 'scene:' + scene.id });
     item.setAttribute('aria-pressed', String(selected));
@@ -270,7 +275,6 @@ function renderScenes() {
   const scene = selected();
   byId('scene-editor').hidden = !scene;
   if (scene) {
-    const bindings = state.bindings.filter((binding) => binding.scenes.includes(scene.id));
     const target = scene.target || state.target;
     byId('scene-name').textContent = scene.name;
     setOptions(byId('scene-target'), [['inherit', '共通設定を使う（' + scopeLabel() + '）'], ...targetOptions(scene.target)], targetOption(scene.target));
@@ -278,8 +282,12 @@ function renderScenes() {
     hint.textContent = missingMonitor;
     hint.hidden = target.monitor_policy === 'all_monitors' || state.monitors.some((m) => m.id === scene.effective_monitor);
     renderMonitors(byId('scene-monitor-map'), scene);
-    renderVariants(scene, bindings);
+    renderVariants(scene, byScene.get(scene.id));
   }
+  if (byId('binding-details').open) renderAllBindings();
+}
+
+function renderAllBindings() {
   byId('all-bindings').replaceChildren(...(state.bindings.length
     ? state.bindings.map((binding) => bindingRow(binding)) : [el('li', 'empty', '登録済みのウィンドウはありません。')]));
 }
@@ -464,7 +472,6 @@ function renderBehavior() {
   byId('restore').checked = state.launcher.restore_all_on_switch;
   byId('focus').checked = state.launcher.focus_on_switch;
   byId('autostart').checked = state.autostart;
-  byId('verbose').checked = state.verbose;
 
   renderMonitors(byId('monitor-map'));
 }
@@ -663,9 +670,12 @@ async function openWindowPicker(common = false) {
     const target = scene.target || state.target;
     const bindings = new Map(state.bindings.map((binding) => [binding.id, binding]));
     const list = el('div');
-    const matches = state.candidates;
+    const search = el('input');
+    search.type = 'search';
+    const normalized = (text) => text.normalize('NFKC').toLowerCase().replace(/画面\s*(\d+)/g, '画面$1');
+    const rows = [];
     const chosen = [];
-    for (const candidate of matches) {
+    for (const candidate of state.candidates) {
       const binding = bindings.get(candidate.binding_id);
       const shared = binding?.common_scenes.includes(scene.id);
       const already = shared || (variant && binding?.variants[scene.id]?.includes(variant.id));
@@ -679,15 +689,42 @@ async function openWindowPicker(common = false) {
       box.value = candidate.key;
       if (!box.disabled) chosen.push(box);
       list.append(label);
+      rows.push({
+        label, monitor: normalized(candidate.monitor),
+        text: normalized([candidate.app, candidate.title, candidate.monitor].join(' ')),
+      });
     }
-    if (!matches.length) list.append(el('p', '', 'ウィンドウが見つかりません。登録したいアプリを開いてから、もう一度お試しください。'));
-    list.addEventListener('change', () => { dialogSubmit.disabled = !chosen.some((box) => box.checked); });
+    const summary = el('p', 'meta');
+    summary.setAttribute('role', 'status');
+    const filter = () => {
+      const words = normalized(search.value).trim().split(/\s+/).filter(Boolean);
+      let visible = 0;
+      for (const row of rows) {
+        row.label.hidden = !words.every((word) =>
+          /^画面\d+$/.test(word) ? row.monitor === word : row.text.includes(word));
+        if (!row.label.hidden) visible++;
+      }
+      summary.textContent = !rows.length ? 'ウィンドウが見つかりません。登録したいアプリを開いてから、もう一度お試しください。'
+        : visible ? '候補 ' + visible + ' 件' : '一致するウィンドウがありません。検索語を変えてください。';
+    };
+    search.addEventListener('input', filter);
+    search.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.isComposing) event.preventDefault();
+    });
+    const updateSelection = () => {
+      const count = chosen.filter((box) => box.checked).length;
+      dialogSubmit.disabled = !count;
+      dialogSubmit.textContent = count ? '選択した ' + count + ' 件を追加' : '選んだウィンドウを追加';
+    };
+    list.addEventListener('change', updateSelection);
     const destination = variant?.name || (common ? 'どの構成でも使うウィンドウ' : '');
     openDialog('開いているウィンドウから追加', [scene.name, destination, scopeLabel(target)].filter(Boolean).join(' ／ '),
-      list, '選んだウィンドウを追加', () => applyDialog('add_windows', {
+      [...(rows.length ? [field('アプリ名・タイトル・画面で検索', search)] : []), summary, list],
+      '選んだウィンドウを追加', () => applyDialog('add_windows', {
         scene: scene.id, variant: variant?.id, candidates: chosen.filter((box) => box.checked).map((box) => box.value),
-      }, () => { onboarding = false; }), { focus: chosen[0] });
-    dialogSubmit.disabled = true;
+      }, () => { onboarding = false; }), { focus: rows.length ? search : undefined });
+    filter();
+    updateSelection();
   } catch (error) { showMessage(error.message); }
 }
 
@@ -883,8 +920,14 @@ function sendLauncher(overrideMonitors) {
   void act('launcher', { values });
 }
 
-function sendBehavior() {
-  void act('behavior', Object.fromEntries(['restore','focus','autostart','verbose'].map((id) => [id, byId(id).checked])));
+function sendBehavior(event) {
+  void act('behavior', {
+    restore: state.launcher.restore_all_on_switch,
+    focus: state.launcher.focus_on_switch,
+    autostart: state.autostart,
+    verbose: state.verbose,
+    [event.target.id]: event.target.checked,
+  });
 }
 
 async function restorePreview() {
@@ -937,6 +980,10 @@ byId('variant-tabs').addEventListener('keydown', (event) => {
 });
 byId('scene-details').addEventListener('click', openSceneDetails);
 byId('inspect').addEventListener('click', inspect);
+byId('binding-details').addEventListener('toggle', (event) => {
+  if (state && event.target.open) renderAllBindings();
+  else byId('all-bindings').replaceChildren();
+});
 byId('refresh-bindings').addEventListener('click', () => act('refresh'));
 byId('refresh-monitors').addEventListener('click', () => act('refresh'));
 byId('target').addEventListener('change', (event) => changeTarget(event.target.value));

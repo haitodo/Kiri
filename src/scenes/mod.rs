@@ -131,6 +131,116 @@ mod tests {
     }
 
     #[test]
+    fn switch_stops_before_window_changes_if_the_pending_journal_cannot_be_written() {
+        let cfg = setup_standard_config();
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        sys.add_window(make_win(
+            20,
+            200,
+            r"C:\Apps\MT5\terminal64.exe",
+            "MetaQuotes::MetaTrader::5.00",
+            "MT5",
+            "MON-2-TARGET",
+        ));
+        sys.add_window(make_win(
+            30,
+            300,
+            r"C:\Apps\VSCode\Code.exe",
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+            "MON-2-TARGET",
+        ));
+        let mut state = SceneStateManager::default();
+        let mut resolver = BindingResolver::new();
+        let path = test_journal_path("pending_retry");
+        let mut recovery = RecoveryManager::new(path.clone());
+        let initial = execute_scene_switch(
+            "code",
+            &cfg,
+            &mut state,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert_eq!(initial.minimized_hwnds, [20]);
+        let saved = std::fs::read(&path).unwrap();
+        let actions = recovery.actions().clone();
+        let command_count = sys.issued_commands.len();
+
+        // A directory at the temporary file path makes the atomic write fail even as administrator.
+        let blocked = path.with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let failed = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert!(!failed.switched);
+        assert_eq!(failed.warnings, [SwitchWarning::RecoveryJournalWriteFailed]);
+        assert!(state.is_already_active("code", None));
+        assert_eq!(sys.issued_commands.len(), command_count);
+        assert_eq!(sys.get_foreground_window(), Some(30));
+        assert_eq!(recovery.actions(), &actions);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+        std::fs::remove_dir(blocked).unwrap();
+        let retried = execute_scene_switch(
+            "trade",
+            &cfg,
+            &mut state,
+            &mut resolver,
+            &mut recovery,
+            &mut sys,
+            None,
+        );
+        assert_eq!(retried.minimized_hwnds, [30]);
+        assert_eq!(retried.restored_hwnds, [20]);
+        let recovered = RecoveryManager::new(path.clone()).check_previous_crash_journal(&sys);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].hwnd, 30);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn switching_shared_windows_leaves_the_journal_untouched() {
+        let cfg = setup_standard_config();
+        let mut sys = FakeWindowSystem::new_dual_monitor();
+        sys.add_window(make_win(
+            40,
+            400,
+            r"C:\Apps\Shared\shared.exe",
+            "SharedClass",
+            "Shared Tool",
+            "MON-2-TARGET",
+        ));
+        let mut state = SceneStateManager::default();
+        let mut resolver = BindingResolver::new();
+        let path = test_journal_path("unchanged");
+        let mut recovery = RecoveryManager::new(path.clone());
+        for scene in ["trade", "code", "trade"] {
+            let outcome = execute_scene_switch(
+                scene,
+                &cfg,
+                &mut state,
+                &mut resolver,
+                &mut recovery,
+                &mut sys,
+                None,
+            );
+            assert!(outcome.switched);
+            let warnings =
+                verify_switch_results(&outcome.verification.unwrap(), &mut recovery, &mut sys);
+            assert!(warnings.is_empty());
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
     fn switching_variants_uses_the_destination_scene_monitor_and_remembers_the_choice() {
         let folder = test_journal_path("variants").with_extension("");
         let mut config = AppConfig::default_initial();

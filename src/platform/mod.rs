@@ -211,7 +211,12 @@ impl std::fmt::Display for PlatformError {
 pub trait WindowSystem {
     /// Enumerate candidate top-level windows on the current virtual desktop in Z-order (0 = top).
     /// Excludes cloaked windows, other virtual desktop windows, owned windows, and Kiri's own windows.
-    fn enumerate_windows(&self) -> Vec<WindowInstance>;
+    fn enumerate_windows(&self) -> Vec<WindowInstance> {
+        self.enumerate_windows_with_monitors(&self.monitors())
+    }
+
+    /// Use the same display snapshot for window attribution and the caller's target checks.
+    fn enumerate_windows_with_monitors(&self, monitors: &[MonitorInfoData]) -> Vec<WindowInstance>;
 
     /// Query the live state of a specific HWND (even if it became invisible after minimizing to system tray).
     fn query_window(&self, hwnd: u64) -> Option<WindowInstance>;

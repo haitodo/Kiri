@@ -27,6 +27,8 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchWarning {
+    /// The recovery journal could not be committed to disk.
+    RecoveryJournalWriteFailed,
     /// Target monitor is not configured (`target.monitor_id` is None).
     TargetMonitorNotConfigured,
     /// Target monitor is currently disconnected.
@@ -336,7 +338,7 @@ fn plan_scene_switch(
     };
 
     // Step 2: Enumerate and re-validate registered windows
-    let all_windows = sys.enumerate_windows();
+    let all_windows = sys.enumerate_windows_with_monitors(&monitors);
     trace.record("target", || {
         json!({
             "monitor": target_mon_id,
@@ -685,7 +687,7 @@ pub fn execute_scene_switch_from(
         already_active,
     };
     let plan = selection.and_then(|(scene, variant)| {
-        plan_scene_switch(
+        let plan = plan_scene_switch(
             scene,
             variant,
             config,
@@ -694,7 +696,14 @@ pub fn execute_scene_switch_from(
             sys,
             launcher_monitor_id,
             context,
-        )
+        )?;
+        for &hwnd in &plan.stale_actions {
+            recovery.invalidate_hwnd(hwnd);
+        }
+        // Commit the write-ahead record before changing any window or the active scene.
+        recovery.record_pending_minimizes(&plan.to_minimize)
+            .map_err(|_| SwitchWarning::RecoveryJournalWriteFailed)?;
+        Ok(plan)
     });
     let SwitchPlan {
         target_mon_id,
@@ -702,8 +711,7 @@ pub fn execute_scene_switch_from(
         mut to_restore,
         mut to_bring_to_front,
         was_noop_same_scene,
-        warnings,
-        stale_actions,
+        mut warnings,
         ..
     } = match plan {
         Ok(plan) => plan,
@@ -722,31 +730,26 @@ pub fn execute_scene_switch_from(
             };
         }
     };
-    let journal_dirty = !stale_actions.is_empty() || !to_minimize.is_empty() || !to_restore.is_empty();
-    for hwnd in stale_actions {
-        recovery.invalidate_hwnd(hwnd);
-    }
-
     // AT-03: Reselecting the active scene can change stacking even without minimizing or restoring.
     if was_noop_same_scene {
+        let warnings = if recovery.persist_journal().is_err() {
+            vec![SwitchWarning::RecoveryJournalWriteFailed]
+        } else {
+            Vec::new()
+        };
         trace.record("finished", || json!({"reason": "already_active"}));
         return SwitchOutcome {
             was_noop_same_scene: true,
             switched: false,
             minimized_hwnds: Vec::new(),
             restored_hwnds: Vec::new(),
-            warnings: Vec::new(),
+            warnings,
             verification: None,
         };
     }
 
     // Sort `to_restore` by recorded Z-order descending (bottom-most window restored first, Section 5.3)
     to_restore.sort_by(|a, b| b.2.cmp(&a.2));
-
-    // Step 6: Write `to_minimize` as `Pending` to write-ahead journal BEFORE issuing OS minimize commands
-    if !to_minimize.is_empty() {
-        recovery.record_pending_minimizes(&to_minimize);
-    }
 
     // Check if the current foreground window is among `to_minimize` (Section 5.4, FR-18, AT-25)
     let foreground_hwnd = sys.get_foreground_window();
@@ -936,8 +939,8 @@ pub fn execute_scene_switch_from(
         });
     }
 
-    if !already_active || journal_dirty {
-        let _ = recovery.persist_journal();
+    if recovery.persist_journal().is_err() {
+        warnings.push(SwitchWarning::RecoveryJournalWriteFailed);
     }
 
     // Step 9: Confirm `state = Active(next)`
@@ -996,7 +999,6 @@ pub fn verify_switch_results(
     sys: &mut dyn WindowSystem,
 ) -> Vec<SwitchWarning> {
     let mut warnings = Vec::new();
-    let mut journal_dirty = false;
     let trace = &pending.trace;
     trace.stacking("verification_before", &pending.trace_targets, sys);
 
@@ -1019,7 +1021,6 @@ pub fn verify_switch_results(
                     ),
                 );
                 recovery.mark_hidden_to_tray(*hwnd);
-                journal_dirty = true;
                 warnings.push(SwitchWarning::HiddenToTrayOnMinimize {
                     binding_id: binding_id.clone(),
                     hwnd: *hwnd,
@@ -1095,8 +1096,8 @@ pub fn verify_switch_results(
         }
     }
 
-    if journal_dirty {
-        let _ = recovery.persist_journal();
+    if recovery.persist_journal().is_err() {
+        warnings.push(SwitchWarning::RecoveryJournalWriteFailed);
     }
 
     trace.stacking("verification_after", &pending.trace_targets, sys);
@@ -1326,6 +1327,9 @@ pub fn format_switch_warnings(
     warnings
         .iter()
         .map(|w| match w {
+            SwitchWarning::RecoveryJournalWriteFailed => {
+                "復旧記録を保存できませんでした。保存先の空き容量とアクセス権を確認してください。".to_string()
+            }
             SwitchWarning::TargetMonitorNotConfigured => {
                 "切り替える画面を設定してください。「シーン」または「ウィンドウの動作」から選べます。".to_string()
             }

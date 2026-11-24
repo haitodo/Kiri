@@ -25,7 +25,7 @@ pub fn capture_scene_layout(
     let work_w = mon.work_area.width().max(1) as f64;
     let work_h = mon.work_area.height().max(1) as f64;
 
-    let all_windows = sys.enumerate_windows();
+    let all_windows = sys.enumerate_windows_with_monitors(&monitors);
     let mut entries = Vec::new();
 
     for binding in &config.bindings {
@@ -118,7 +118,7 @@ pub fn apply_saved_scene_layout(
 
     let work_w = mon.work_area.width().max(1) as f64;
     let work_h = mon.work_area.height().max(1) as f64;
-    let all_windows = sys.enumerate_windows();
+    let all_windows = sys.enumerate_windows_with_monitors(&monitors);
 
     let mut applied = 0;
     for entry in &snapshot.entries {

@@ -71,12 +71,10 @@ impl Win32WindowSystem {
 
 #[cfg(windows)]
 impl WindowSystem for Win32WindowSystem {
-    fn enumerate_windows(&self) -> Vec<WindowInstance> {
+    fn enumerate_windows_with_monitors(&self, monitors: &[MonitorInfoData]) -> Vec<WindowInstance> {
         use windows::core::BOOL;
         use windows::Win32::Foundation::{HWND, LPARAM};
         use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
-
-        let monitors = self.refresh_monitors();
 
         struct EnumCtx<'a> {
             own_pid: u32,
@@ -104,7 +102,7 @@ impl WindowSystem for Win32WindowSystem {
 
         let mut ctx = EnumCtx {
             own_pid: self.own_pid,
-            monitors: &monitors,
+            monitors,
             vdm: &self.vdm,
             pid_cache: HashMap::with_capacity(32),
             results: Vec::with_capacity(32),

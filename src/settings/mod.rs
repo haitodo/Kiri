@@ -77,10 +77,8 @@ impl SettingsViewModel {
     /// Re-enumerate live windows from `sys` and match against `self.config_draft.bindings`.
     pub fn refresh_candidates(&mut self, sys: &dyn WindowSystem) {
         self.monitors = sys.monitors();
-        self.monitors
-            .sort_by_key(|m| (m.monitor_rect.left, m.monitor_rect.top));
         self.candidate_windows = sys
-            .enumerate_windows()
+            .enumerate_windows_with_monitors(&self.monitors)
             .into_iter()
             .map(|win| CandidateWindowRow {
                 instance: win,
@@ -90,6 +88,8 @@ impl SettingsViewModel {
                 always_visible: false,
             })
             .collect();
+        self.monitors
+            .sort_by_key(|m| (m.monitor_rect.left, m.monitor_rect.top));
         self.refresh_annotations();
     }
 
@@ -358,7 +358,6 @@ impl SettingsViewModel {
 
         // If a sibling binding for the same executable on the same monitor currently uses `TitleRuleType::Any`,
         // upgrade its title rule using its live window's title keyword so both windows can be disambiguated after restart.
-        let candidates_snapshot = self.candidate_windows.clone();
         for other in &mut self.config_draft.bindings {
             if other.enabled
                 && other.match_rule.title_rule.rule_type == TitleRuleType::Any
@@ -367,7 +366,7 @@ impl SettingsViewModel {
             {
                 if let Some(other_hwnd) = other.instance_hint.as_ref().and_then(|h| h.last_hwnd) {
                     if other_hwnd != win.hwnd {
-                        if let Some(live_row) = candidates_snapshot
+                        if let Some(live_row) = self.candidate_windows
                             .iter()
                             .find(|r| r.instance.hwnd == other_hwnd)
                         {
@@ -823,7 +822,7 @@ mod tests {
     use crate::platform::fake::FakeWindowSystem;
     use crate::platform::WindowInstance;
 
-    fn make_test_win(
+    pub(super) fn make_test_win(
         hwnd: u64,
         pid: u32,
         exe: &str,

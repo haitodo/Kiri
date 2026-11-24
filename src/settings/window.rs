@@ -216,6 +216,12 @@ pub struct SettingsWindow {
     _apartment: Apartment,
 }
 
+pub(crate) enum LauncherChange {
+    None,
+    SceneState,
+    SavedSettings,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SettingsPalette {
     background: COLORREF,
@@ -841,19 +847,23 @@ impl SettingsWindow {
         }
     }
 
-    /// Handles one request and reports whether the running launcher should reload its saved options.
-    pub(crate) unsafe fn dispatch(hwnd: HWND, owner: HWND, app: &mut AppController) -> bool {
+    /// Report only changes to the running launcher. Editing a settings draft is local to the editor.
+    pub(crate) unsafe fn dispatch(
+        hwnd: HWND,
+        owner: HWND,
+        app: &mut AppController,
+    ) -> LauncherChange {
         let Some(request) = REQUESTS.with_borrow_mut(|requests| {
             let index = requests.iter().position(|(sender, _)| *sender == hwnd)?;
             requests.remove(index).map(|(_, request)| request)
         }) else {
-            return false;
+            return LauncherChange::None;
         };
         if !GetWindow(hwnd, GW_OWNER).is_ok_and(|window| window == owner) {
-            return false;
+            return LauncherChange::None;
         }
         let Some(window) = Self::get(hwnd) else {
-            return false;
+            return LauncherChange::None;
         };
         let Request { id, command } = request;
         match command {
@@ -864,29 +874,29 @@ impl SettingsWindow {
                         .borrow_mut()
                         .get_or_insert_with(|| Editor::new(app));
                 }
-                return false;
+                return LauncherChange::None;
             }
             Command::Rendered { dark } => {
                 window.reveal(dark);
-                return false;
+                return LauncherChange::None;
             }
             Command::StartupFailed => {
                 if window.initializing.get() {
                     log_warn("settings", "Could not render the settings page");
                     window.failed();
                 }
-                return false;
+                return LauncherChange::None;
             }
             Command::Appearance { dark } => {
                 window.apply_appearance(dark);
-                return false;
+                return LauncherChange::None;
             }
             _ => {}
         }
         if window.controller.borrow().is_none()
             || (window.initializing.get() && !matches!(command, Command::Initialize))
         {
-            return false;
+            return LauncherChange::None;
         }
         let read_only = window
             .editor
@@ -907,14 +917,27 @@ impl SettingsWindow {
             } else {
                 window.post(json!({ "kind": "reply", "id": id, "error": "前のファイル選択が終わるまでお待ちください。", "ok": false }));
             }
-            return false;
+            return LauncherChange::None;
         }
-        let mut changed = false;
+        let include_state = !matches!(
+            command,
+            Command::Inspect { .. }
+                | Command::RecoveryPreview
+                | Command::ExportPath(_)
+                | Command::Close { .. }
+        );
+        let mut changed = LauncherChange::None;
         let result = window.request(command, app, &mut changed);
         let reply = match result {
             Ok(extra) => {
-                let state = window.editor.borrow().as_ref().map(Editor::state);
-                json!({ "kind": "reply", "id": id, "extra": extra, "ok": true, "state": state })
+                let mut reply = json!({ "kind": "reply", "id": id, "ok": true });
+                reply["extra"] = extra;
+                if include_state {
+                    if let Some(editor) = window.editor.borrow().as_ref() {
+                        reply["state"] = editor.state();
+                    }
+                }
+                reply
             }
             Err(error) => json!({ "kind": "reply", "id": id, "error": error, "ok": false }),
         };
@@ -926,7 +949,7 @@ impl SettingsWindow {
         &self,
         command: Command,
         app: &mut AppController,
-        changed: &mut bool,
+        changed: &mut LauncherChange,
     ) -> Result<Value, String> {
         use Command::*;
         let mut slot = self.editor.borrow_mut();
@@ -953,7 +976,9 @@ impl SettingsWindow {
                 tray_only_confirmed,
             } => {
                 let (config_changed, warning) = editor.save(app, tray_only_confirmed)?;
-                *changed = config_changed;
+                if config_changed {
+                    *changed = LauncherChange::SavedSettings;
+                }
                 Ok(json!({ "warning": warning }))
             }
             ImportPath(path) => {
@@ -1001,6 +1026,7 @@ impl SettingsWindow {
                     );
                 }
                 let count = app.restore_settings_windows(&current);
+                *changed = LauncherChange::SceneState;
                 editor.refresh(app);
                 Ok(json!({ "restored": count }))
             }

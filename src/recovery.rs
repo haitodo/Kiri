@@ -62,16 +62,17 @@ impl ManagedAction {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RuntimeJournalData {
+pub struct RuntimeJournalData<T = ManagedAction> {
     pub pid: u32,
     pub updated_at_ms: u64,
-    pub actions: Vec<ManagedAction>,
+    pub actions: Vec<T>,
 }
 
 pub struct RecoveryManager {
     journal_path: PathBuf,
     /// Active managed actions keyed by `hwnd`.
     actions: HashMap<u64, ManagedAction>,
+    dirty: bool,
     /// HWNDs for which Kiri itself recently issued a restore command
     /// (so the resulting `EVENT_SYSTEM_MINIMIZEEND` is recognized as ours, not a manual user restore).
     restoring_by_us: HashSet<u64>,
@@ -84,6 +85,7 @@ impl RecoveryManager {
         Self {
             journal_path,
             actions: HashMap::new(),
+            dirty: false,
             restoring_by_us: HashSet::new(),
             startup_crash_candidates: Vec::new(),
         }
@@ -154,6 +156,7 @@ impl RecoveryManager {
         }
 
         if !candidates.is_empty() {
+            self.dirty = true;
             log_warn(
                 "recovery",
                 &format!(
@@ -173,10 +176,17 @@ impl RecoveryManager {
 
     /// Step 6 of `switch_scene`: Record `to_minimize` windows as `Pending` and flush to `runtime-state.json`
     /// BEFORE issuing `ShowWindowAsync` commands.
-    pub fn record_pending_minimizes(&mut self, items: &[(String, WindowInstance)]) {
+    pub fn record_pending_minimizes(
+        &mut self,
+        items: &[(String, WindowInstance)],
+    ) -> Result<(), String> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let was_dirty = self.dirty;
+        let mut previous = Vec::with_capacity(items.len());
         let now = current_unix_ms();
         for (binding_id, win) in items {
-            self.restoring_by_us.remove(&win.hwnd);
             let action = ManagedAction {
                 binding_id: binding_id.clone(),
                 hwnd: win.hwnd,
@@ -190,11 +200,24 @@ impl RecoveryManager {
                 state: ManagedActionState::Pending,
                 updated_at_ms: now,
             };
-            self.actions.insert(win.hwnd, action);
+            previous.push((win.hwnd, self.actions.insert(win.hwnd, action)));
         }
-        if let Err(e) = self.persist_journal() {
-            log_error("recovery", &format!("Failed to write pending journal: {}", e));
+        self.dirty = true;
+        if let Err(error) = self.persist_journal() {
+            for (hwnd, old) in previous.into_iter().rev() {
+                if let Some(old) = old {
+                    self.actions.insert(hwnd, old);
+                } else {
+                    self.actions.remove(&hwnd);
+                }
+            }
+            self.dirty = was_dirty;
+            return Err(error);
         }
+        for (_, win) in items {
+            self.restoring_by_us.remove(&win.hwnd);
+        }
+        Ok(())
     }
 
     /// Transition a `Pending` action to `MinimizedByUs` after `ShowWindowAsync` succeeds.
@@ -202,6 +225,7 @@ impl RecoveryManager {
         if let Some(action) = self.actions.get_mut(&hwnd) {
             action.state = ManagedActionState::MinimizedByUs;
             action.updated_at_ms = current_unix_ms();
+            self.dirty = true;
         }
     }
 
@@ -209,7 +233,9 @@ impl RecoveryManager {
     /// is not treated as an external manual override, and remove it from active minimized set.
     pub fn mark_restoring_by_us(&mut self, hwnd: u64) {
         self.restoring_by_us.insert(hwnd);
-        self.actions.remove(&hwnd);
+        if self.actions.remove(&hwnd).is_some() {
+            self.dirty = true;
+        }
     }
 
     /// Mark an action as `Invalidated` (e.g. user manually restored the window or PID changed).
@@ -218,6 +244,7 @@ impl RecoveryManager {
             if action.state != ManagedActionState::Invalidated {
                 action.state = ManagedActionState::Invalidated;
                 action.updated_at_ms = current_unix_ms();
+                self.dirty = true;
             }
         }
     }
@@ -227,12 +254,12 @@ impl RecoveryManager {
         if let Some(action) = self.actions.get_mut(&hwnd) {
             action.state = ManagedActionState::HiddenToTray;
             action.updated_at_ms = current_unix_ms();
+            self.dirty = true;
         }
     }
 
     /// Process queued `MinimizeEvent`s from `SetWinEventHook` (Section 5.3 & AT-23).
     pub fn process_minimize_events(&mut self, events: &[MinimizeEvent]) {
-        let mut dirty = false;
         for ev in events {
             match ev.kind {
                 MinimizeEventKind::MinimizeEnd => {
@@ -257,7 +284,7 @@ impl RecoveryManager {
                             );
                             action.state = ManagedActionState::Invalidated;
                             action.updated_at_ms = ev.timestamp_ms;
-                            dirty = true;
+                            self.dirty = true;
                         }
                     }
                 }
@@ -267,9 +294,7 @@ impl RecoveryManager {
                 }
             }
         }
-        if dirty {
-            let _ = self.persist_journal();
-        }
+        let _ = self.persist_journal();
     }
 
     /// Restore all windows currently minimized by Kiri (Section 8.1 "Kiriが最小化したウィンドウをすべて復元", AT-15).
@@ -309,9 +334,11 @@ impl RecoveryManager {
                     }
                 } else {
                     self.actions.remove(&action.hwnd);
+                    self.dirty = true;
                 }
             } else {
                 self.actions.remove(&action.hwnd);
+                self.dirty = true;
             }
         }
 
@@ -332,8 +359,19 @@ impl RecoveryManager {
             })).collect()
     }
 
-    /// Flush current `actions` to `runtime-state.json` atomically.
-    pub fn persist_journal(&self) -> Result<(), String> {
+    /// Flush only outstanding changes. A failed write stays dirty for the next flush.
+    pub fn persist_journal(&mut self) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.write_journal().inspect_err(|error| {
+            log_error("recovery", &format!("Failed to write runtime journal: {error}"));
+        })?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn write_journal(&self) -> Result<(), String> {
         if let Some(parent) = self.journal_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create journal dir: {}", e))?;
@@ -342,10 +380,10 @@ impl RecoveryManager {
         let data = RuntimeJournalData {
             pid: std::process::id(),
             updated_at_ms: current_unix_ms(),
-            actions: self.actions.values().cloned().collect(),
+            actions: self.actions.values().collect(),
         };
 
-        let bytes = serde_json::to_vec_pretty(&data)
+        let bytes = serde_json::to_vec(&data)
             .map_err(|e| format!("Failed to serialize runtime journal: {}", e))?;
 
         let tmp_path = self.journal_path.with_extension("json.tmp");
@@ -363,12 +401,15 @@ impl RecoveryManager {
 
     /// Clear `runtime-state.json` on normal exit without restoring windows.
     pub fn clear_journal(&mut self) -> Result<(), String> {
+        if let Err(error) = fs::remove_file(&self.journal_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("Failed to remove runtime-state.json: {error}"));
+            }
+        }
         self.actions.clear();
         self.restoring_by_us.clear();
-        if self.journal_path.exists() {
-            fs::remove_file(&self.journal_path)
-                .map_err(|e| format!("Failed to remove runtime-state.json: {}", e))?;
-        }
+        self.startup_crash_candidates.clear();
+        self.dirty = false;
         Ok(())
     }
 }

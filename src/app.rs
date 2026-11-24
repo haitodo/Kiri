@@ -15,7 +15,7 @@ use crate::platform::monitors::{
     default_launcher_position_on_monitor, resolve_launcher_bars, resolve_launcher_position,
     ResolvedLauncherBar,
 };
-use crate::platform::WindowSystem;
+use crate::platform::{MonitorInfoData, WindowSystem};
 use crate::recovery::{ManagedAction, RecoveryManager};
 use crate::scenes::bindings::BindingResolver;
 use crate::scenes::layouts::{
@@ -120,14 +120,16 @@ impl AppController {
     }
 
     /// Resolve all active launcher bar rectangles according to `bar_display_mode`.
-    pub fn resolve_launcher_bars(&mut self) -> Vec<ResolvedLauncherBar> {
-        let monitors = self.sys.monitors();
+    pub fn resolve_launcher_bars(
+        &mut self,
+        monitors: &[MonitorInfoData],
+    ) -> Vec<ResolvedLauncherBar> {
         let (visible, overflow) = self.config.split_visible_and_overflow();
         let has_overflow = !overflow.is_empty();
-        let launcher_cfg = self.config.launcher.clone();
+        let launcher_cfg = &self.config.launcher;
 
-        let bars = resolve_launcher_bars(&launcher_cfg, &monitors, |d| {
-            let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+        let bars = resolve_launcher_bars(launcher_cfg, monitors, |d| {
+            let l = LauncherLayout::compute(launcher_cfg, &visible, has_overflow, d);
             (l.width_px, l.height_px)
         });
 
@@ -141,9 +143,9 @@ impl AppController {
         } else {
             let (_, _, mon_id, dpi) = resolve_launcher_position(
                 self.config.launcher.position.as_ref(),
-                &monitors,
+                monitors,
                 |d| {
-                    let l = LauncherLayout::compute(&launcher_cfg, &visible, has_overflow, d);
+                    let l = LauncherLayout::compute(launcher_cfg, &visible, has_overflow, d);
                     (l.width_px, l.height_px)
                 },
                 self.config.launcher.snap_to_edges,
@@ -509,7 +511,7 @@ impl AppController {
                     }
                 }
             }
-        } else if !outcome.was_noop_same_scene {
+        } else if !outcome.was_noop_same_scene || !outcome.warnings.is_empty() {
             self.last_warnings = outcome.warnings.clone();
         }
 
@@ -685,31 +687,19 @@ impl AppController {
         (launched, skipped, errors)
     }
 
-    /// Returns true if the currently active scene is in the `⋯` overflow list (Section 2.3).
-    pub fn is_active_scene_in_overflow(&self) -> bool {
-        let Some(active_id) = self.state_mgr.active_scene_id() else {
-            return false;
-        };
-        let (_, overflow) = self.config.split_visible_and_overflow();
-        overflow.iter().any(|s| s.id == active_id)
-    }
-
     /// Normal application shutdown: clear journal without restoring minimized windows.
     pub fn on_normal_shutdown(&mut self) {
-        let _ = self.recovery.clear_journal();
-        log_info(
-            "app",
-            "Normal shutdown completed; cleared journal without restoring windows",
-        );
+        match self.recovery.clear_journal() {
+            Ok(()) => log_info("app", "Cleared runtime journal on normal shutdown"),
+            Err(error) => log_warn("recovery", &error),
+        }
     }
 
     /// OS logoff/shutdown (`WM_ENDSESSION`): do NOT restore windows; flush journal and exit quickly (Section 7.2 & 8.2).
     pub fn on_os_session_end(&mut self) {
-        let _ = self.recovery.persist_journal();
-        log_info(
-            "app",
-            "OS session ending (WM_ENDSESSION); flushed runtime journal without restoring windows",
-        );
+        if self.recovery.persist_journal().is_ok() {
+            log_info("app", "OS session ending with runtime journal up to date");
+        }
     }
 
     fn scene_target(&self, scene_id: &str) -> &TargetConfig {
@@ -788,7 +778,8 @@ mod tests {
         let (mut app, dir) = test_app("multi-bar");
         app.config.launcher.bar_display_mode = BarDisplayMode::AllMonitors;
 
-        let bars = app.resolve_launcher_bars();
+        let monitors = app.sys.monitors();
+        let bars = app.resolve_launcher_bars(&monitors);
         assert_eq!(bars.len(), 2);
 
         // Dragging right bar past left edge of right monitor stays clamped to MON-2-TARGET
@@ -808,7 +799,7 @@ mod tests {
         app.on_bar_drag_end("MON-1-PRIMARY", 500, 1002, 96, Some((520, 1015)))
             .unwrap();
         app.reset_bar_position(Some("MON-2-TARGET"));
-        let bars_after_reset = app.resolve_launcher_bars();
+        let bars_after_reset = app.resolve_launcher_bars(&monitors);
         assert_eq!(bars_after_reset[0].y, 1002);
         assert!(bars_after_reset[1].y < 100);
 
@@ -885,7 +876,8 @@ mod tests {
         );
 
         app.recovery
-            .record_pending_minimizes(&[("binding-1".to_string(), win)]);
+            .record_pending_minimizes(&[("binding-1".to_string(), win)])
+            .unwrap();
         app.sys
             .show_window_async(42, crate::platform::ShowCmd::MinimizeNoActivate)
             .unwrap();

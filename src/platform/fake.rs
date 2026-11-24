@@ -126,7 +126,7 @@ impl FakeWindowSystem {
 }
 
 impl WindowSystem for FakeWindowSystem {
-    fn enumerate_windows(&self) -> Vec<WindowInstance> {
+    fn enumerate_windows_with_monitors(&self, _monitors: &[MonitorInfoData]) -> Vec<WindowInstance> {
         self.windows
             .iter()
             .filter(|w| w.is_visible)

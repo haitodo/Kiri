@@ -49,14 +49,16 @@ use crate::platform::monitors::{
     ResolvedLauncherBar,
 };
 use crate::platform::tray::{TrayIcon, WM_APP_TRAYICON};
+use crate::platform::MonitorInfoData;
 use crate::scenes::manager::SceneState;
 use crate::scenes::switch::{format_switch_warnings, SwitchSource, SwitchWarning};
 use crate::settings::{
-    window::{SettingsWindow, WM_SETTINGS_REQUEST},
+    window::{LauncherChange, SettingsWindow, WM_SETTINGS_REQUEST},
     SettingsPage,
 };
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Controls::{
@@ -79,16 +81,15 @@ const TIMER_TOPMOST_CHECK: usize = 104;
 const HOTKEY_BASE_ID: i32 = 4000;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-#[derive(Debug, Clone, Copy)]
-pub struct LauncherDragState {
-    pub grab_rel_x: f64,
-    pub grab_rel_y: f64,
-    pub start_cursor_x: i32,
-    pub start_cursor_y: i32,
-    pub moved: bool,
+struct LauncherDragState {
+    grab_rel_x: f64,
+    grab_rel_y: f64,
+    start_cursor_x: i32,
+    start_cursor_y: i32,
+    moved: bool,
+    monitors: Vec<MonitorInfoData>,
 }
 
-#[derive(Clone)]
 struct BarSnapshot {
     launcher_cfg: LauncherConfig,
     visible_scenes: Vec<Scene>,
@@ -97,22 +98,23 @@ struct BarSnapshot {
     scene_state: SceneState,
     last_known_scene_id: Option<String>,
     active_in_overflow: bool,
-    has_warnings: bool,
     warning_count: usize,
 }
 
 impl BarSnapshot {
     fn from_app(app: &AppController) -> Self {
         let (visible_scenes, overflow_scenes) = app.config.split_visible_and_overflow();
+        let active_scene = app.state_mgr.active_scene_id();
         Self {
             launcher_cfg: app.config.launcher.clone(),
+            active_in_overflow: overflow_scenes
+                .iter()
+                .any(|s| Some(s.id.as_str()) == active_scene),
             visible_scenes,
             overflow_scenes,
-            active_scene_id: app.state_mgr.active_scene_id().map(str::to_owned),
+            active_scene_id: active_scene.map(str::to_owned),
             scene_state: app.state_mgr.state().clone(),
             last_known_scene_id: app.state_mgr.last_known_scene_id().map(str::to_owned),
-            active_in_overflow: app.is_active_scene_in_overflow(),
-            has_warnings: !app.last_warnings.is_empty(),
             warning_count: app.last_warnings.len(),
         }
     }
@@ -206,6 +208,7 @@ pub struct LauncherBarWindow {
     tooltip_visible: bool,
     tracking_mouse_leave: bool,
     drag_state: Option<LauncherDragState>,
+    sync_after_capture: bool,
     applying_bounds: bool,
     layout: LauncherLayout,
     hovered: HitTarget,
@@ -215,7 +218,7 @@ pub struct LauncherBarWindow {
     variant_fan: VariantFanHost,
     bar_wheel: SceneWheel,
     topmost_guard: TopmostGuard,
-    snapshot: BarSnapshot,
+    snapshot: Rc<BarSnapshot>,
 }
 
 #[cfg(windows)]
@@ -247,7 +250,7 @@ impl LauncherBarWindow {
         host_hwnd: HWND,
         resolved: &ResolvedLauncherBar,
         work_area: RectData,
-        snapshot: BarSnapshot,
+        snapshot: Rc<BarSnapshot>,
     ) -> Result<Box<Self>, String> {
         use std::sync::Once;
         use windows::core::w;
@@ -347,6 +350,7 @@ impl LauncherBarWindow {
                 tooltip_visible: false,
                 tracking_mouse_leave: false,
                 drag_state: None,
+                sync_after_capture: false,
                 applying_bounds: false,
                 layout,
                 hovered: HitTarget::None,
@@ -376,7 +380,7 @@ impl LauncherBarWindow {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: BarSnapshot) {
+    fn apply_snapshot(&mut self, snapshot: Rc<BarSnapshot>) {
         self.snapshot = snapshot;
         self.layout = self.snapshot.compute_layout(self.dpi);
         self.invalidate();
@@ -406,7 +410,9 @@ impl LauncherBarWindow {
         };
 
         self.theme.ensure_dpi(self.dpi);
-        self.layout = self.snapshot.compute_layout(self.dpi);
+        if self.layout.dpi != self.dpi {
+            self.layout = self.snapshot.compute_layout(self.dpi);
+        }
         let z_hwnd = if self.snapshot.launcher_cfg.always_on_top {
             HWND_TOPMOST
         } else {
@@ -425,44 +431,58 @@ impl LauncherBarWindow {
         self.applying_bounds = false;
     }
 
-    fn update_drag_position(
-        &mut self,
-        cursor_x: i32,
-        cursor_y: i32,
-        grab_rel_x: f64,
-        grab_rel_y: f64,
-    ) {
-        let (target_mon_id, target_dpi, target_work_area) =
-            if self.snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single {
-                let monitors = enumerate_connected_monitors();
-                let Some(mon) = find_monitor_for_point(cursor_x, cursor_y, &monitors) else {
-                    return;
-                };
-                (mon.monitor_id.clone(), mon.dpi.max(96), mon.work_area)
-            } else {
-                (self.monitor_id.clone(), self.dpi.max(96), self.work_area)
-            };
+    fn update_drag_position(&mut self, cursor_x: i32, cursor_y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+        };
 
-        self.monitor_id = target_mon_id;
-        self.dpi = target_dpi;
-        self.work_area = target_work_area;
-        self.theme.ensure_dpi(target_dpi);
-        self.layout = self.snapshot.compute_layout(target_dpi);
+        let Some(drag) = &mut self.drag_state else {
+            return;
+        };
+        if !drag.moved
+            && (cursor_x - drag.start_cursor_x).abs() <= 1
+            && (cursor_y - drag.start_cursor_y).abs() <= 1
+        {
+            return;
+        }
+        drag.moved = true;
+        if self.snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single {
+            let Some(mon) = find_monitor_for_point(cursor_x, cursor_y, &drag.monitors) else {
+                return;
+            };
+            if self.monitor_id != mon.monitor_id {
+                self.monitor_id.clone_from(&mon.monitor_id);
+            }
+            self.dpi = mon.dpi.max(96);
+            self.work_area = mon.work_area;
+        }
+        let resize = self.layout.dpi != self.dpi;
+        if resize {
+            self.layout = self.snapshot.compute_layout(self.dpi);
+        }
 
         let w = self.layout.width_px;
         let h = self.layout.height_px;
-        let raw_x = cursor_x - (grab_rel_x * w as f64).round() as i32;
-        let raw_y = cursor_y - (grab_rel_y * h as f64).round() as i32;
+        let raw_x = cursor_x - (drag.grab_rel_x * w as f64).round() as i32;
+        let raw_y = cursor_y - (drag.grab_rel_y * h as f64).round() as i32;
         let (x, y) = clamp_and_snap_in_work_area(
             raw_x,
             raw_y,
             w,
             h,
-            target_work_area,
-            target_dpi,
+            self.work_area,
+            self.dpi,
             self.snapshot.launcher_cfg.snap_to_edges,
         );
-        self.apply_window_bounds(x, y, w, h);
+        if resize {
+            self.apply_window_bounds(x, y, w, h);
+        } else {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
     }
 
     fn schedule_topmost_check(&self) {
@@ -585,7 +605,7 @@ impl LauncherBarWindow {
                 }
             }
             HitTarget::Grip => {
-                if !self.snapshot.has_warnings {
+                if self.snapshot.warning_count == 0 {
                     Some("Kiri (ドラッグ移動 / Wクリックでリセット)".to_string())
                 } else {
                     Some(format!(
@@ -780,9 +800,9 @@ impl LauncherWindowHost {
     }
 
     fn sync_bars(&mut self) {
-        let desired = self.app.resolve_launcher_bars();
         let monitors = self.app.sys.monitors();
-        let snapshot = BarSnapshot::from_app(&self.app);
+        let desired = self.app.resolve_launcher_bars(&monitors);
+        let snapshot = Rc::new(BarSnapshot::from_app(&self.app));
 
         let work_area_for = |monitor_id: &str| {
             monitors
@@ -802,25 +822,17 @@ impl LauncherWindowHost {
 
         for target in desired {
             let work_area = work_area_for(&target.monitor_id);
-            if let Some(pos) = existing
+            let existing_index = existing
                 .iter()
                 .position(|b| b.monitor_id == target.monitor_id)
-            {
+                .or_else(|| {
+                    // Reuse the single bar when its monitor changes or disconnects.
+                    (existing.len() == 1 && snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single)
+                        .then_some(0)
+                });
+            if let Some(pos) = existing_index {
                 let mut bar = existing.remove(pos);
-                bar.dpi = target.dpi.max(96);
-                bar.work_area = work_area;
-                bar.apply_snapshot(snapshot.clone());
-                bar.apply_window_bounds(target.x, target.y, target.width_px, target.height_px);
-                if snapshot.launcher_cfg.always_on_top {
-                    bar.ensure_topmost_if_needed(true);
-                }
-                next_bars.push(bar);
-            } else if existing.len() == 1
-                && snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single
-            {
-                // Single-bar mode moved to a different monitor (e.g. primary fallback on disconnect)
-                let mut bar = existing.remove(0);
-                bar.monitor_id = target.monitor_id.clone();
+                bar.monitor_id = target.monitor_id;
                 bar.dpi = target.dpi.max(96);
                 bar.work_area = work_area;
                 bar.apply_snapshot(snapshot.clone());
@@ -853,7 +865,10 @@ impl LauncherWindowHost {
     }
 
     fn refresh_all_bars_snapshot(&mut self) {
-        let snapshot = BarSnapshot::from_app(&self.app);
+        if self.bars.is_empty() {
+            return;
+        }
+        let snapshot = Rc::new(BarSnapshot::from_app(&self.app));
         for bar in &mut self.bars {
             bar.apply_snapshot(snapshot.clone());
         }
@@ -869,6 +884,31 @@ impl LauncherWindowHost {
 
     fn any_bar_dragging(&self) -> bool {
         self.bars.iter().any(|b| b.drag_state.is_some())
+    }
+
+    fn update_display_layout(&mut self) {
+        if !self.any_bar_dragging() {
+            self.sync_bars();
+            for bar in &mut self.bars {
+                bar.topmost_guard.on_user_interaction();
+            }
+            return;
+        }
+
+        // Keep the captured HWND under the pointer. Reconcile all bars after capture ends.
+        let monitors = self.app.sys.monitors();
+        for bar in &mut self.bars {
+            let Some(drag) = &mut bar.drag_state else {
+                continue;
+            };
+            if bar.snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single {
+                drag.monitors.clone_from(&monitors);
+            } else if let Some(mon) = monitors.iter().find(|m| m.monitor_id == bar.monitor_id) {
+                bar.work_area = mon.work_area;
+                bar.dpi = mon.dpi.max(96);
+            }
+            bar.sync_after_capture = true;
+        }
     }
 
     fn dialog_owner_hwnd(&self, preferred_bar_hwnd: Option<usize>) -> HWND {
@@ -1103,7 +1143,7 @@ impl LauncherWindowHost {
             MessageBoxW, IDYES, MB_ICONINFORMATION, MB_TOPMOST, MB_YESNO,
         };
 
-        let outcome =
+        let mut outcome =
             self.app
                 .switch_to_scene_from_monitor(scene_id, variant, source, source_monitor_id);
 
@@ -1128,25 +1168,28 @@ impl LauncherWindowHost {
                 if ans == IDYES && !self.app.launcher_monitor_id.is_empty() {
                     self.app.config.target.monitor_id = Some(self.app.launcher_monitor_id.clone());
                     let _ = self.app.config_mgr.save(&self.app.config);
-                    let retry = self.app.switch_to_scene_from_monitor(
+                    outcome = self.app.switch_to_scene_from_monitor(
                         scene_id,
                         variant,
                         source,
                         source_monitor_id,
                     );
-                    if retry.verification.is_some() {
-                        self.schedule_switch_verification();
-                    }
-                    for bar in &mut self.bars {
-                        bar.ensure_topmost_if_needed(true);
-                    }
+                } else {
+                    self.refresh_all_bars_snapshot();
+                    return;
                 }
             }
-            self.refresh_all_bars_snapshot();
-            return;
         }
 
-        if !outcome.was_noop_same_scene {
+        if outcome.warnings.contains(&SwitchWarning::RecoveryJournalWriteFailed) {
+            let title = if outcome.switched || outcome.was_noop_same_scene {
+                "復旧記録を更新できませんでした"
+            } else {
+                "シーンを切り替えられませんでした"
+            };
+            self.notify_tray(title, "復旧記録の保存先の空き容量とアクセス権を確認してください。", true);
+        }
+        if !outcome.was_noop_same_scene || !outcome.warnings.is_empty() {
             if outcome.verification.is_some() {
                 self.schedule_switch_verification();
             }
@@ -1381,7 +1424,7 @@ impl LauncherWindowHost {
     }
 
     fn drain_and_handle_bar_events(&mut self) {
-        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+        use windows::Win32::UI::WindowsAndMessaging::SetTimer;
 
         let events: Vec<BarEvent> = BAR_EVENTS.with_borrow_mut(|q| q.drain(..).collect());
         for event in events {
@@ -1496,11 +1539,8 @@ impl LauncherWindowHost {
                     self.hide_cursor_popup();
                 }
                 BarEvent::DisplayOrDpiChanged => {
-                    if !self.any_bar_dragging() {
-                        unsafe {
-                            let _ = KillTimer(Some(self.hwnd), TIMER_DISPLAY_DEBOUNCE);
-                            let _ = SetTimer(Some(self.hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
-                        }
+                    unsafe {
+                        let _ = SetTimer(Some(self.hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
                     }
                 }
             }
@@ -1519,7 +1559,8 @@ unsafe extern "system" fn host_wndproc(
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, GetCursorPos, GetWindowLongPtrW, KillTimer, SetTimer, GWLP_USERDATA,
         WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP,
-        WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE,
+        SPI_SETWORKAREA, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE,
+        WM_TIMER, WM_WTSSESSION_CHANGE,
     };
 
     let result = std::panic::catch_unwind(|| {
@@ -1667,15 +1708,17 @@ unsafe extern "system" fn host_wndproc(
 
             WM_SETTINGS_REQUEST => {
                 let settings = HWND(wparam.0 as *mut _);
-                if SettingsWindow::dispatch(settings, hwnd, &mut host.app) {
-                    host.hide_cursor_popup();
-                    host.hide_other_bar_popups(None);
-                    host.sync_bars();
-                    let failed = host.register_configured_hotkeys();
-                    SettingsWindow::show_hotkey_conflicts(settings, &failed);
-                    host.apply_runtime_settings();
-                } else {
-                    host.refresh_all_bars_snapshot();
+                match SettingsWindow::dispatch(settings, hwnd, &mut host.app) {
+                    LauncherChange::SavedSettings => {
+                        host.hide_cursor_popup();
+                        host.hide_other_bar_popups(None);
+                        host.sync_bars();
+                        let failed = host.register_configured_hotkeys();
+                        SettingsWindow::show_hotkey_conflicts(settings, &failed);
+                        host.apply_runtime_settings();
+                    }
+                    LauncherChange::SceneState => host.refresh_all_bars_snapshot(),
+                    LauncherChange::None => {}
                 }
                 LRESULT(0)
             }
@@ -1697,10 +1740,11 @@ unsafe extern "system" fn host_wndproc(
                 if msg == WM_WTSSESSION_CHANGE || msg == WM_POWERBROADCAST {
                     host.cursor_input.reset_gesture();
                 }
-                if !host.any_bar_dragging() {
-                    let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
-                    let _ = SetTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
-                }
+                let _ = SetTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
+                LRESULT(0)
+            }
+            WM_SETTINGCHANGE if wparam.0 == SPI_SETWORKAREA.0 as usize => {
+                let _ = SetTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE, 200, None);
                 LRESULT(0)
             }
 
@@ -1718,10 +1762,7 @@ unsafe extern "system" fn host_wndproc(
                     }
                     TIMER_DISPLAY_DEBOUNCE => {
                         let _ = KillTimer(Some(hwnd), TIMER_DISPLAY_DEBOUNCE);
-                        host.sync_bars();
-                        for bar in &mut host.bars {
-                            bar.topmost_guard.on_user_interaction();
-                        }
+                        host.update_display_layout();
                     }
                     _ => {}
                 }
@@ -1926,8 +1967,12 @@ unsafe extern "system" fn bar_wndproc(
                                 start_cursor_x: cursor_pt.x,
                                 start_cursor_y: cursor_pt.y,
                                 moved: false,
+                                monitors: if bar.snapshot.launcher_cfg.bar_display_mode == BarDisplayMode::Single {
+                                    enumerate_connected_monitors()
+                                } else {
+                                    Vec::new()
+                                },
                             });
-                            let _ = KillTimer(Some(bar.host_hwnd), TIMER_DISPLAY_DEBOUNCE);
                             let _ = SetCapture(hwnd);
                         }
                     }
@@ -2021,23 +2066,10 @@ unsafe extern "system" fn bar_wndproc(
                     }
                     return LRESULT(0);
                 }
-                if let Some(mut drag) = bar.drag_state {
+                if bar.drag_state.is_some() {
                     let mut cursor_pt = POINT::default();
                     if GetCursorPos(&mut cursor_pt).is_ok() {
-                        if !drag.moved
-                            && (cursor_pt.x - drag.start_cursor_x).abs() <= 1
-                            && (cursor_pt.y - drag.start_cursor_y).abs() <= 1
-                        {
-                            return LRESULT(0);
-                        }
-                        drag.moved = true;
-                        bar.drag_state = Some(drag);
-                        bar.update_drag_position(
-                            cursor_pt.x,
-                            cursor_pt.y,
-                            drag.grab_rel_x,
-                            drag.grab_rel_y,
-                        );
+                        bar.update_drag_position(cursor_pt.x, cursor_pt.y);
                     }
                     return LRESULT(0);
                 }
@@ -2132,6 +2164,9 @@ unsafe extern "system" fn bar_wndproc(
             }
 
             WM_CAPTURECHANGED => {
+                if std::mem::take(&mut bar.sync_after_capture) {
+                    push_bar_event(bar.host_hwnd, BarEvent::DisplayOrDpiChanged);
+                }
                 if bar.variant_fan.is_active() {
                     let _ = KillTimer(Some(hwnd), TIMER_VARIANT_HOLD);
                     let _ = bar.variant_fan.cancel();
@@ -2386,7 +2421,7 @@ unsafe extern "system" fn bar_wndproc(
 
             WM_DPICHANGED => {
                 bar.cancel_bar_variant_fan();
-                if bar.drag_state.is_none() && !bar.applying_bounds {
+                if !bar.applying_bounds {
                     push_bar_event(bar.host_hwnd, BarEvent::DisplayOrDpiChanged);
                 }
                 LRESULT(0)
@@ -2431,7 +2466,7 @@ unsafe extern "system" fn bar_wndproc(
                     active_in_overflow: bar.snapshot.active_in_overflow,
                     hovered: &bar.hovered,
                     pressed: &bar.pressed,
-                    has_warnings: bar.snapshot.has_warnings,
+                    has_warnings: bar.snapshot.warning_count > 0,
                 };
                 paint_launcher(hdc, &mut bar.theme, &paint_state);
                 let _ = EndPaint(hwnd, &ps);
@@ -2450,5 +2485,88 @@ unsafe extern "system" fn bar_wndproc(
             log_error("wndproc", "Caught panic across FFI boundary in bar_wndproc");
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::platform::fake::FakeWindowSystem;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    #[test]
+    fn drag_reuses_the_layout_until_crossing_to_a_different_dpi() {
+        let mut config = AppConfig::default_initial();
+        config.launcher.always_on_top = false;
+        let (visible_scenes, overflow_scenes) = config.split_visible_and_overflow();
+        let snapshot = Rc::new(BarSnapshot {
+            launcher_cfg: config.launcher,
+            visible_scenes,
+            overflow_scenes,
+            active_scene_id: None,
+            scene_state: SceneState::Unknown,
+            last_known_scene_id: None,
+            active_in_overflow: false,
+            warning_count: 0,
+        });
+        // Keep the native HWND offscreen while simulating two displays with different DPI.
+        let mut monitors = FakeWindowSystem::new_dual_monitor().monitors;
+        for mon in &mut monitors {
+            mon.monitor_rect.top -= 12000;
+            mon.monitor_rect.bottom -= 12000;
+            mon.work_area.top -= 12000;
+            mon.work_area.bottom -= 12000;
+        }
+        monitors[1].dpi = 144;
+        let initial_layout = snapshot.compute_layout(96);
+        let resolved = ResolvedLauncherBar {
+            monitor_id: monitors[0].monitor_id.clone(),
+            x: 100,
+            y: -11900,
+            width_px: initial_layout.width_px,
+            height_px: initial_layout.height_px,
+            dpi: 96,
+        };
+        let second_id = monitors[1].monitor_id.clone();
+        let mut bar = LauncherBarWindow::create_and_show(
+            HWND::default(),
+            &resolved,
+            monitors[0].work_area,
+            snapshot,
+        )
+        .unwrap();
+        bar.drag_state = Some(LauncherDragState {
+            grab_rel_x: 0.5,
+            grab_rel_y: 0.5,
+            start_cursor_x: 100,
+            start_cursor_y: -11900,
+            moved: false,
+            monitors,
+        });
+        assert!(!bar.layout.scene_buttons.is_empty());
+        let buttons = bar.layout.scene_buttons.as_ptr();
+        for x in 200..230 {
+            bar.update_drag_position(x, -11900);
+            assert_eq!(bar.layout.scene_buttons.as_ptr(), buttons);
+        }
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(bar.hwnd, &mut rect).unwrap() };
+        assert_eq!(
+            rect.left,
+            229 - (0.5 * resolved.width_px as f64).round() as i32
+        );
+        assert_eq!(rect.right - rect.left, resolved.width_px);
+
+        bar.update_drag_position(2500, -11900);
+        unsafe { GetWindowRect(bar.hwnd, &mut rect).unwrap() };
+        assert_eq!(bar.monitor_id, second_id);
+        assert_eq!(bar.layout.dpi, 144);
+        assert_eq!(rect.right - rect.left, bar.layout.width_px);
+        assert!(bar.layout.width_px > resolved.width_px);
+        bar.update_drag_position(300, -11900);
+        assert_eq!(bar.monitor_id, resolved.monitor_id);
+        assert_eq!(bar.layout.width_px, resolved.width_px);
     }
 }
