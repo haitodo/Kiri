@@ -25,7 +25,13 @@ impl TrayIcon {
         use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 
         let taskbar_created_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-        let custom_hicon = crate::launcher::paint::create_kiri_hicon(32).unwrap_or_default();
+        let icon_px = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+            )
+        };
+        let icon_px = if icon_px > 0 { icon_px } else { 32 };
+        let custom_hicon = crate::launcher::paint::create_kiri_hicon(icon_px).unwrap_or_default();
         let mut tray = Self {
             owner_hwnd,
             custom_hicon,

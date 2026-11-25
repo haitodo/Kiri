@@ -733,9 +733,17 @@ impl LauncherWindowHost {
         unsafe {
             let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
             REGISTER_HOST_ONCE.call_once(|| {
+                let icon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(
+                    Some(hinstance.into()),
+                    windows::core::PCWSTR(
+                        crate::launcher::paint::KIRI_APP_ICON_RESOURCE_ID as usize as *const u16,
+                    ),
+                )
+                .unwrap_or_default();
                 let wc = WNDCLASSW {
                     lpfnWndProc: Some(host_wndproc),
                     hInstance: hinstance.into(),
+                    hIcon: icon,
                     lpszClassName: class_name,
                     ..Default::default()
                 };

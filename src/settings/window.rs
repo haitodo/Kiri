@@ -38,7 +38,7 @@ use windows::{
     Win32::UI::Shell::SHCreateMemStream,
     Win32::UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+        HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, GetSystemMetricsForDpi},
         Shell::ShellExecuteW,
         WindowsAndMessaging::*,
     },
@@ -63,6 +63,7 @@ const PAGE: &str = concat!(
     "</script></body></html>",
 );
 const LOCAL_DOCUMENT: &str = "https://settings.kiri.invalid/";
+const LOCAL_BRAND_ICON: &str = "https://settings.kiri.invalid/icon.png";
 
 thread_local! {
     // The message carries only the sender HWND; only our WebView callbacks enqueue requests.
@@ -204,7 +205,8 @@ pub struct SettingsWindow {
     hwnd: HWND,
     loading_label: HWND,
     retry: HWND,
-    icon: HICON,
+    icon_small: Cell<HICON>,
+    icon_big: Cell<HICON>,
     editor: RefCell<Option<Editor>>,
     page: Cell<SettingsPage>,
     palette: Cell<SettingsPalette>,
@@ -214,6 +216,26 @@ pub struct SettingsWindow {
     opened_at: Cell<Instant>,
     file_pending: Cell<bool>,
     _apartment: Apartment,
+}
+
+unsafe fn create_and_apply_window_icons(hwnd: HWND, dpi: u32) -> (HICON, HICON) {
+    let small_px = GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(dip_to_px(16, dpi));
+    let big_px = GetSystemMetricsForDpi(SM_CXICON, dpi).max(dip_to_px(32, dpi));
+    let icon_small = crate::launcher::paint::create_kiri_hicon(small_px).unwrap_or_default();
+    let icon_big = crate::launcher::paint::create_kiri_hicon(big_px).unwrap_or_default();
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETICON,
+        Some(WPARAM(ICON_SMALL as usize)),
+        Some(LPARAM(icon_small.0 as isize)),
+    );
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETICON,
+        Some(WPARAM(ICON_BIG as usize)),
+        Some(LPARAM(icon_big.0 as isize)),
+    );
+    (icon_small, icon_big)
 }
 
 pub(crate) enum LauncherChange {
@@ -358,9 +380,15 @@ impl SettingsWindow {
             let class = w!("KiriSettingsWindowClass");
             static REGISTERED: OnceLock<bool> = OnceLock::new();
             if !*REGISTERED.get_or_init(|| {
+                let class_icon = LoadIconW(
+                    Some(instance.into()),
+                    PCWSTR(crate::launcher::paint::KIRI_APP_ICON_RESOURCE_ID as usize as *const u16),
+                )
+                .unwrap_or_default();
                 RegisterClassW(&WNDCLASSW {
                     lpfnWndProc: Some(window_proc),
                     hInstance: instance.into(),
+                    hIcon: class_icon,
                     hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                     lpszClassName: class,
                     ..Default::default()
@@ -375,7 +403,8 @@ impl SettingsWindow {
                 right: 1024,
                 bottom: 768,
             });
-            let (width, height) = window_size(GetDpiForWindow(owner).max(96), area);
+            let dpi = GetDpiForWindow(owner).max(96);
+            let (width, height) = window_size(dpi, area);
             let hwnd = CreateWindowExW(
                 WS_EX_APPWINDOW,
                 class,
@@ -429,19 +458,8 @@ impl SettingsWindow {
                     Some(LPARAM(1)),
                 );
             }
-            let icon = crate::launcher::paint::create_kiri_hicon(32).unwrap_or_default();
-            let _ = SendMessageW(
-                hwnd,
-                WM_SETICON,
-                Some(WPARAM(ICON_SMALL as usize)),
-                Some(LPARAM(icon.0 as isize)),
-            );
-            let _ = SendMessageW(
-                hwnd,
-                WM_SETICON,
-                Some(WPARAM(ICON_BIG as usize)),
-                Some(LPARAM(icon.0 as isize)),
-            );
+            let window_dpi = GetDpiForWindow(hwnd).max(dpi);
+            let (icon_small, icon_big) = create_and_apply_window_icons(hwnd, window_dpi);
             let rounding = 2u32; // DWMWCP_ROUND
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -455,7 +473,8 @@ impl SettingsWindow {
                 hwnd,
                 loading_label,
                 retry,
-                icon,
+                icon_small: Cell::new(icon_small),
+                icon_big: Cell::new(icon_big),
                 editor: RefCell::new(None),
                 page: Cell::new(page),
                 palette: Cell::new(palette),
@@ -649,7 +668,8 @@ impl SettingsWindow {
                 };
                 let mut uri = PWSTR::null();
                 args.Request()?.Uri(&mut uri)?;
-                let response = if CoTaskMemPWSTR::from(uri).to_string() == LOCAL_DOCUMENT {
+                let uri = CoTaskMemPWSTR::from(uri).to_string();
+                let response = if uri == LOCAL_DOCUMENT {
                     let stream = SHCreateMemStream(Some(PAGE.as_bytes()))
                         .ok_or_else(WinError::from_thread)?;
                     environment.CreateWebResourceResponse(
@@ -659,6 +679,15 @@ impl SettingsWindow {
                         w!(
                             "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store"
                         ),
+                    )?
+                } else if uri == LOCAL_BRAND_ICON {
+                    let stream = SHCreateMemStream(Some(crate::launcher::paint::kiri_brand_png_bytes()))
+                        .ok_or_else(WinError::from_thread)?;
+                    environment.CreateWebResourceResponse(
+                        &stream,
+                        200,
+                        w!("OK"),
+                        w!("Content-Type: image/png\r\nCache-Control: no-store"),
                     )?
                 } else {
                     environment.CreateWebResourceResponse(
@@ -1158,6 +1187,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     let y = suggested.top.clamp(area.top, area.bottom - h);
                     let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
                 }
+                let (icon_small, icon_big) = create_and_apply_window_icons(hwnd, dpi);
+                let old_small = window.icon_small.replace(icon_small);
+                let old_big = window.icon_big.replace(icon_big);
+                if !old_small.0.is_null() {
+                    let _ = DestroyIcon(old_small);
+                }
+                if !old_big.0.is_null() {
+                    let _ = DestroyIcon(old_big);
+                }
                 window.layout();
             }
             WM_CLOSE => {
@@ -1185,8 +1223,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some(controller) = window.controller.borrow_mut().take() {
                     let _ = controller.Close();
                 }
-                if !window.icon.0.is_null() {
-                    let _ = DestroyIcon(window.icon);
+                let icon_small = window.icon_small.get();
+                if !icon_small.0.is_null() {
+                    let _ = DestroyIcon(icon_small);
+                }
+                let icon_big = window.icon_big.get();
+                if !icon_big.0.is_null() {
+                    let _ = DestroyIcon(icon_big);
                 }
                 drop(window);
                 return DefWindowProcW(hwnd, msg, wp, lp);

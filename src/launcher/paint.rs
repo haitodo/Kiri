@@ -55,23 +55,31 @@ use windows::Win32::Graphics::Gdi::{
 #[cfg(windows)]
 use windows::Win32::Graphics::GdiPlus::{
     DashCapRound, FillModeAlternate, GdipAddPathArc, GdipClosePathFigure,
-    GdipCreateBitmapFromHICON, GdipCreateBitmapFromScan0, GdipCreateFromHDC,
-    GdipCreateHICONFromBitmap, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill,
-    GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDisposeImage,
-    GdipDrawEllipse, GdipDrawImageRect, GdipDrawLine, GdipDrawPath, GdipDrawRectangle,
-    GdipFillEllipse, GdipFillPath, GdipGetImageGraphicsContext, GdipGraphicsClear,
-    GdipLoadImageFromFile, GdipSetInterpolationMode, GdipSetPenLineCap197819, GdipSetPenLineJoin,
-    GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush,
-    GpGraphics, GpImage, GpPath, GpPen, GpSolidFill, InterpolationModeHighQualityBicubic,
-    LineCapRound, LineJoinRound, Ok as GpOk, SmoothingModeAntiAlias, UnitPixel,
+    GdipCreateBitmapFromHICON, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1,
+    GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+    GdipDisposeImage, GdipDrawEllipse, GdipDrawImageRect, GdipDrawLine, GdipDrawPath,
+    GdipDrawRectangle, GdipFillEllipse, GdipFillPath, GdipLoadImageFromFile,
+    GdipSetInterpolationMode, GdipSetPenLineCap197819, GdipSetPenLineJoin, GdipSetSmoothingMode,
+    GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics, GpImage,
+    GpPath, GpPen, GpSolidFill, InterpolationModeHighQualityBicubic, LineCapRound, LineJoinRound,
+    Ok as GpOk, SmoothingModeAntiAlias, UnitPixel,
 };
 
 #[cfg(windows)]
-const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, LoadImageW, HICON, IMAGE_ICON, LR_LOADFROMFILE,
+    CreateIconFromResourceEx, DestroyIcon, LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LR_LOADFROMFILE,
 };
+
+/// Resource ID of the embedded application icon (`RT_GROUP_ICON`) linked via `build.rs`.
+pub const KIRI_APP_ICON_RESOURCE_ID: u16 = 1;
+
+#[cfg(windows)]
+const KIRI_ICON_ICO: &[u8] = include_bytes!("../../logo/icon.ico");
 
 #[cfg(windows)]
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -810,102 +818,106 @@ pub unsafe fn draw_builtin_icon_gdiplus(
     let _ = GdipDeletePen(pen);
 }
 
-/// Generates a crisp, DPI-sized custom Kiri application icon (`HICON`) using GDI+.
+#[cfg(windows)]
+fn parse_ico_entries(ico: &[u8]) -> impl Iterator<Item = (i32, i32, &'static [u8])> + '_ {
+    let count = if ico.len() >= 6
+        && u16::from_le_bytes([ico[0], ico[1]]) == 0
+        && u16::from_le_bytes([ico[2], ico[3]]) == 1
+    {
+        u16::from_le_bytes([ico[4], ico[5]]) as usize
+    } else {
+        0
+    };
+    let dir_len = 6 + count * 16;
+    let valid_count = if ico.len() >= dir_len { count } else { 0 };
+    (0..valid_count).filter_map(move |idx| {
+        let entry = &ico[6 + idx * 16..6 + (idx + 1) * 16];
+        let w = if entry[0] == 0 { 256 } else { entry[0] as i32 };
+        let h = if entry[1] == 0 { 256 } else { entry[1] as i32 };
+        let bytes_in_res = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+        let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+        let end = offset.checked_add(bytes_in_res)?;
+        let payload = KIRI_ICON_ICO.get(offset..end)?;
+        Some((w, h, payload))
+    })
+}
+
+#[cfg(windows)]
+fn select_ico_payload(ico: &[u8], target_px: i32) -> Option<&'static [u8]> {
+    let mut best_ge: Option<(i32, &'static [u8])> = None;
+    let mut best_lt: Option<(i32, &'static [u8])> = None;
+    for (w, _h, payload) in parse_ico_entries(ico) {
+        if w == target_px {
+            return Some(payload);
+        }
+        if w > target_px {
+            if best_ge.is_none_or(|(bw, _)| w < bw) {
+                best_ge = Some((w, payload));
+            }
+        } else if best_lt.is_none_or(|(bw, _)| w > bw) {
+            best_lt = Some((w, payload));
+        }
+    }
+    best_ge.or(best_lt).map(|(_, payload)| payload)
+}
+
+#[cfg(windows)]
+fn create_hicon_from_ico_bytes(ico: &[u8], size_px: i32) -> Option<HICON> {
+    let payload = select_ico_payload(ico, size_px)?;
+    unsafe {
+        let hicon = CreateIconFromResourceEx(
+            payload,
+            true,
+            0x0003_0000,
+            size_px,
+            size_px,
+            LR_DEFAULTCOLOR,
+        )
+        .ok()?;
+        (!hicon.0.is_null()).then_some(hicon)
+    }
+}
+
+/// Returns Kiri's embedded PNG brand icon bytes (used by the Settings UI sidebar).
+#[cfg(windows)]
+pub fn kiri_brand_png_bytes() -> &'static [u8] {
+    const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+    let mut best: Option<(i32, &'static [u8])> = None;
+    for (w, _h, payload) in parse_ico_entries(KIRI_ICON_ICO) {
+        if payload.starts_with(PNG_MAGIC) {
+            if w == 128 {
+                return payload;
+            }
+            if best.is_none_or(|(bw, _)| w > bw) {
+                best = Some((w, payload));
+            }
+        }
+    }
+    best.map(|(_, payload)| payload).unwrap_or(&[])
+}
+
+/// Loads Kiri's application icon (`HICON`) at the requested pixel size from the bundled icon asset.
 /// Caller owns the returned `HICON` and must call `DestroyIcon` when done.
 #[cfg(windows)]
 pub fn create_kiri_hicon(size_px: i32) -> Option<HICON> {
-    let size = size_px.clamp(16, 128);
-    // Ensure GDI+ is initialized for callers outside LauncherWindowHost
-    let _ctx = GdiplusContext::init();
+    let size = size_px.clamp(16, 256);
     unsafe {
-        let mut bitmap: *mut GpBitmap = std::ptr::null_mut();
-        if GdipCreateBitmapFromScan0(
-            size,
-            size,
-            0,
-            PIXEL_FORMAT_32BPP_PARGB,
-            None,
-            &mut bitmap,
-        ) != GpOk
-            || bitmap.is_null()
-        {
-            return None;
-        }
-
-        let mut graphics: *mut GpGraphics = std::ptr::null_mut();
-        if GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut graphics) == GpOk
-            && !graphics.is_null()
-        {
-            let _ = GdipGraphicsClear(graphics, 0x00000000);
-            let _ = GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
-
-            let s = size as f32;
-            let pad = (s * 0.06).max(1.0);
-            let rect_s = s - pad * 2.0;
-            let r = (s * 0.22).max(2.5);
-
-            // Dark slate rounded square base + crisp accent border
-            fill_rounded_rect_gdiplus(graphics, pad, pad, rect_s, rect_s, r, 0xFF181A1F);
-            draw_rounded_rect_border_gdiplus(
-                graphics,
-                pad,
-                pad,
-                rect_s,
-                rect_s,
-                r,
-                colors::BTN_ACTIVE_BORDER_ARGB,
-                (s * 0.075).max(1.2),
-            );
-
-            // Inner layered workspace cards: left slate tile + active blue tile
-            let t_w = rect_s * 0.32;
-            let t_h = rect_s * 0.56;
-            let gap = rect_s * 0.09;
-            let start_x = s / 2.0 - t_w - gap / 2.0;
-            let start_y = (s - t_h) / 2.0;
-            let t_r = (s * 0.09).max(1.5);
-
-            fill_rounded_rect_gdiplus(
-                graphics,
-                start_x,
-                start_y,
-                t_w,
-                t_h * 0.45,
-                t_r,
-                0xFF7B93B8,
-            );
-            fill_rounded_rect_gdiplus(
-                graphics,
-                start_x,
-                start_y + t_h * 0.55,
-                t_w,
-                t_h * 0.45,
-                t_r,
-                0xFF4C94F6,
-            );
-            fill_rounded_rect_gdiplus(
-                graphics,
-                start_x + t_w + gap,
-                start_y,
-                t_w,
-                t_h,
-                t_r,
-                0xFFEAF2FF,
-            );
-
-            let _ = GdipDeleteGraphics(graphics);
-        }
-
-        let mut hicon = HICON::default();
-        let status = GdipCreateHICONFromBitmap(bitmap, &mut hicon);
-        let _ = GdipDisposeImage(bitmap as *mut GpImage);
-
-        if status == GpOk && !hicon.0.is_null() {
-            Some(hicon)
-        } else {
-            None
+        if let Ok(module) = GetModuleHandleW(None) {
+            if let Ok(handle) = LoadImageW(
+                Some(module.into()),
+                PCWSTR(KIRI_APP_ICON_RESOURCE_ID as usize as *const u16),
+                IMAGE_ICON,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            ) {
+                if !handle.is_invalid() && !handle.0.is_null() {
+                    return Some(HICON(handle.0));
+                }
+            }
         }
     }
+    create_hicon_from_ico_bytes(KIRI_ICON_ICO, size)
 }
 
 #[cfg(windows)]
@@ -1033,9 +1045,13 @@ mod tests {
 
             let _ = DeleteDC(hdc);
 
-            let hicon = create_kiri_hicon(32).expect("create_kiri_hicon should succeed");
-            assert!(!hicon.0.is_null());
-            let _ = DestroyIcon(hicon);
+            for size in [16, 20, 24, 32, 40, 48, 64, 128, 256] {
+                let hicon = create_kiri_hicon(size).expect("create_kiri_hicon should succeed");
+                assert!(!hicon.0.is_null(), "icon size {size} should be non-null");
+                let _ = DestroyIcon(hicon);
+            }
+            let png = kiri_brand_png_bytes();
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         }
     }
 }
