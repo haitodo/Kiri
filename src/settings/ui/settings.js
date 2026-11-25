@@ -522,8 +522,8 @@ function renderLauncherMonitors() {
   const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
   const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
   const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
-  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 24) : (map.clientWidth || 230);
-  const scale = Math.min(maxWidth / width, 96 / height);
+  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 16) : (map.clientWidth || 210);
+  const scale = Math.min(maxWidth / width, 80 / height);
 
   map.replaceChildren(...monitors.map((m) => {
     const rect = m.rect;
@@ -553,7 +553,7 @@ function renderLauncherMonitors() {
     return item;
   }));
   map.style.width = Math.max(1, width * scale) + 'px';
-  map.style.height = Math.max(70, height * scale) + 'px';
+  map.style.height = Math.max(58, height * scale) + 'px';
 }
 
 function renderBehavior() {
@@ -585,8 +585,8 @@ function renderMonitors(map, scene) {
   const minX = Math.min(...bounds.map((r) => r.left)), minY = Math.min(...bounds.map((r) => r.top));
   const width = Math.max(1, Math.max(...bounds.map((r) => r.right)) - minX);
   const height = Math.max(1, Math.max(...bounds.map((r) => r.bottom)) - minY);
-  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 24) : (map.clientWidth || 230);
-  const scale = Math.min(maxWidth / width, (scene ? 80 : 112) / height);
+  const maxWidth = map.parentElement?.clientWidth ? Math.max(120, map.parentElement.clientWidth - 16) : (map.clientWidth || 210);
+  const scale = Math.min(maxWidth / width, (scene ? 68 : 92) / height);
   map.replaceChildren(...monitors.map((m) => {
     const rect = m.rect;
     const label = '画面 ' + m.number;
@@ -603,7 +603,7 @@ function renderMonitors(map, scene) {
     return item;
   }));
   map.style.width = Math.max(1, width * scale) + 'px';
-  map.style.height = Math.max(70, height * scale) + 'px';
+  map.style.height = Math.max(58, height * scale) + 'px';
 }
 
 const kinds = [['folder','フォルダー'],['file','ファイル'],['website','サイト']];
